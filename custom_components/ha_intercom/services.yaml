@@ -1,0 +1,52 @@
+# HA Intercom Services
+
+broadcast:
+  name: Broadcast
+  description: Send audio or TTS message to rooms
+  fields:
+    target:
+      name: Target
+      description: Room name or "all" for broadcast
+      required: false
+      default: "all"
+      example: "kitchen"
+      selector:
+        text:
+    message:
+      name: Message
+      description: Text message to speak via TTS
+      required: false
+      example: "Dinner is ready!"
+      selector:
+        text:
+
+call:
+  name: Call
+  description: Initiate a two-way call between rooms
+  fields:
+    from_room:
+      name: From Room
+      description: Source room
+      required: true
+      example: "kitchen"
+      selector:
+        text:
+    to_room:
+      name: To Room
+      description: Destination room
+      required: true
+      example: "bedroom"
+      selector:
+        text:
+
+hangup:
+  name: Hangup
+  description: End an active call
+  fields:
+    room:
+      name: Room
+      description: Room to hang up
+      required: true
+      example: "kitchen"
+      selector:
+        text:

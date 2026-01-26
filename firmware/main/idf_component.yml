@@ -1,0 +1,12 @@
+## IDF Component Manager manifest file
+## https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/tools/idf-component-manager.html
+
+dependencies:
+  # Opus codec for audio compression
+  78/esp-opus: "^1.0.5"
+
+  # JSON parsing
+  espressif/cjson: "^1.0.0"
+
+  # LED strip for WS2812 onboard RGB LED
+  espressif/led_strip: "^2.5.0"

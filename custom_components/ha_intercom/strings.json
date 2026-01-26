@@ -1,0 +1,39 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Intercom",
+        "description": "This will start discovering intercom devices on your network. Make sure your ESP32-S3 devices are powered on and connected to the same network.",
+        "data": {}
+      }
+    },
+    "abort": {
+      "already_configured": "HA Intercom is already configured"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      }
+    },
+    "select": {
+      "target": {
+        "name": "Default Target"
+      },
+      "room": {
+        "name": "Room"
+      }
+    },
+    "number": {
+      "volume": {
+        "name": "Volume"
+      }
+    },
+    "switch": {
+      "mute": {
+        "name": "Mute"
+      }
+    }
+  }
+}

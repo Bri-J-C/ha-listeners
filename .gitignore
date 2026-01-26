@@ -1,0 +1,25 @@
+# Build artifacts
+firmware/.pio/
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/dependencies.lock
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets - don't commit credentials
+*.env
+secrets.yaml
+
+# OS
+.DS_Store
+Thumbs.db

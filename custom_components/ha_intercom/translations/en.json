@@ -1,0 +1,79 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "HA Intercom",
+        "description": "This will start discovering intercom devices on your network. Make sure your ESP32-S3 devices are powered on and connected to the same network.",
+        "data": {}
+      }
+    },
+    "abort": {
+      "already_configured": "HA Intercom is already configured"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      }
+    },
+    "select": {
+      "target": {
+        "name": "Default Target"
+      },
+      "room": {
+        "name": "Room"
+      }
+    },
+    "number": {
+      "volume": {
+        "name": "Volume"
+      }
+    },
+    "switch": {
+      "mute": {
+        "name": "Mute"
+      }
+    }
+  },
+  "services": {
+    "broadcast": {
+      "name": "Broadcast",
+      "description": "Send audio or TTS message to rooms",
+      "fields": {
+        "target": {
+          "name": "Target",
+          "description": "Room name or 'all' for broadcast"
+        },
+        "message": {
+          "name": "Message",
+          "description": "Text message to speak via TTS"
+        }
+      }
+    },
+    "call": {
+      "name": "Call",
+      "description": "Initiate a two-way call between rooms",
+      "fields": {
+        "from_room": {
+          "name": "From Room",
+          "description": "Source room"
+        },
+        "to_room": {
+          "name": "To Room",
+          "description": "Destination room"
+        }
+      }
+    },
+    "hangup": {
+      "name": "Hangup",
+      "description": "End an active call",
+      "fields": {
+        "room": {
+          "name": "Room",
+          "description": "Room to hang up"
+        }
+      }
+    }
+  }
+}

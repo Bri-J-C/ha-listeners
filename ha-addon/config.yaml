@@ -1,0 +1,32 @@
+name: "Intercom Hub"
+description: "Multicast intercom hub for HA - enables TTS announcements to ESP32 intercoms"
+version: "1.2.0"
+slug: "intercom_hub"
+arch:
+  - amd64
+  - aarch64
+  - armv7
+init: false
+host_network: true
+audio: true
+startup: application
+options:
+  mqtt_host: "core-mosquitto"
+  mqtt_port: 1883
+  mqtt_user: ""
+  mqtt_password: ""
+  device_name: "Intercom Hub"
+  multicast_group: "224.0.0.100"
+  multicast_port: 5005
+  piper_host: "core-piper"
+  piper_port: 10200
+schema:
+  mqtt_host: str
+  mqtt_port: int
+  mqtt_user: str?
+  mqtt_password: str?
+  device_name: str
+  multicast_group: str
+  multicast_port: int
+  piper_host: str
+  piper_port: int
