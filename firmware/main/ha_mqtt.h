@@ -26,6 +26,7 @@ typedef enum {
     HA_CMD_VOLUME,
     HA_CMD_MUTE,
     HA_CMD_LED,
+    HA_CMD_TARGET,
 } ha_cmd_t;
 
 // Callback for HA commands (cmd type, value)
@@ -78,5 +79,17 @@ void ha_mqtt_publish_led(void);
  * Check if MQTT is connected.
  */
 bool ha_mqtt_is_connected(void);
+
+/**
+ * Get the IP address of the current target room.
+ * Returns NULL if target is "All Rooms" (use multicast).
+ * Returns NULL if target room not found (falls back to multicast).
+ */
+const char* ha_mqtt_get_target_ip(void);
+
+/**
+ * Get the current target room name.
+ */
+const char* ha_mqtt_get_target_name(void);
 
 #endif // HA_MQTT_H

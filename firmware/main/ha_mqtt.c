@@ -11,6 +11,7 @@
 #include "settings.h"
 #include "audio_output.h"
 #include "button.h"
+#include "network.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
 #include "cJSON.h"
@@ -26,6 +27,19 @@ static char device_id_str[20] = {0};
 static char unique_id[32] = {0};
 static ha_state_t current_state = HA_STATE_IDLE;
 
+// Discovered devices for room selector
+#define MAX_DISCOVERED_DEVICES 10
+typedef struct {
+    char room[32];
+    char ip[16];
+    char id[32];
+    bool active;
+} discovered_device_t;
+
+static discovered_device_t discovered_devices[MAX_DISCOVERED_DEVICES];
+static int discovered_count = 0;
+static char current_target[32] = "All Rooms";  // Default target
+
 // Topic buffers
 static char base_topic[48];
 static char availability_topic[64];
@@ -36,12 +50,18 @@ static char mute_state_topic[64];
 static char mute_cmd_topic[64];
 static char led_state_topic[64];
 static char led_cmd_topic[64];
+static char device_info_topic[64];
+static char target_state_topic[64];
+static char target_cmd_topic[64];
+static const char *device_discovery_topic = "intercom/devices/+/info";
 
 // Callback for settings changes from HA
 static ha_mqtt_callback_t user_callback = NULL;
 
 static void publish_discovery(void);
 static void publish_all_states(void);
+static void publish_target(void);
+static void publish_target_discovery(void);
 
 /**
  * Create device info JSON object (shared by all entities).
@@ -235,7 +255,8 @@ static void publish_discovery(void)
     publish_volume_discovery();
     publish_mute_discovery();
     publish_led_discovery();
-    ESP_LOGI(TAG, "Published HA discovery (sensor, volume, mute, led)");
+    publish_target_discovery();
+    ESP_LOGI(TAG, "Published HA discovery (sensor, volume, mute, led, target)");
 }
 
 /**
@@ -304,6 +325,148 @@ static void publish_all_states(void)
     publish_volume();
     publish_mute();
     publish_led();
+    publish_target();
+}
+
+/**
+ * Publish device info for hub discovery.
+ * This allows the hub add-on to discover all intercom devices.
+ */
+static void publish_device_info(void)
+{
+    if (!mqtt_connected) return;
+
+    const settings_t *cfg = settings_get();
+    char ip_str[16];
+    network_get_ip(ip_str);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "room", cfg->room_name);
+    cJSON_AddStringToObject(root, "ip", ip_str);
+    cJSON_AddStringToObject(root, "id", unique_id);
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload) {
+        esp_mqtt_client_publish(mqtt_client, device_info_topic, payload, 0, 1, true);
+        ESP_LOGI(TAG, "Published device info: room=%s ip=%s", cfg->room_name, ip_str);
+        free(payload);
+    }
+    cJSON_Delete(root);
+}
+
+/**
+ * Publish current target state.
+ */
+static void publish_target(void)
+{
+    if (!mqtt_connected) return;
+    esp_mqtt_client_publish(mqtt_client, target_state_topic, current_target, 0, 0, true);
+}
+
+/**
+ * Publish target select discovery with current options.
+ */
+static void publish_target_discovery(void)
+{
+    const settings_t *cfg = settings_get();
+    char discovery_topic[128];
+    snprintf(discovery_topic, sizeof(discovery_topic),
+             "homeassistant/select/%s_target/config", unique_id);
+
+    cJSON *root = cJSON_CreateObject();
+
+    cJSON_AddStringToObject(root, "name", "Target");
+
+    char uid[48];
+    snprintf(uid, sizeof(uid), "%s_target", unique_id);
+    cJSON_AddStringToObject(root, "unique_id", uid);
+    cJSON_AddStringToObject(root, "object_id", uid);
+
+    cJSON_AddStringToObject(root, "state_topic", target_state_topic);
+    cJSON_AddStringToObject(root, "command_topic", target_cmd_topic);
+    cJSON_AddStringToObject(root, "availability_topic", availability_topic);
+    cJSON_AddStringToObject(root, "icon", "mdi:target");
+    cJSON_AddBoolToObject(root, "has_entity_name", true);
+
+    // Build options array: "All Rooms" + discovered rooms (excluding self)
+    cJSON *options = cJSON_CreateArray();
+    cJSON_AddItemToArray(options, cJSON_CreateString("All Rooms"));
+
+    for (int i = 0; i < discovered_count; i++) {
+        if (discovered_devices[i].active) {
+            // Don't add ourselves as a target option
+            if (strcmp(discovered_devices[i].id, unique_id) != 0) {
+                cJSON_AddItemToArray(options, cJSON_CreateString(discovered_devices[i].room));
+            }
+        }
+    }
+    cJSON_AddItemToObject(root, "options", options);
+
+    cJSON_AddItemToObject(root, "device", create_device_info());
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload) {
+        esp_mqtt_client_publish(mqtt_client, discovery_topic, payload, 0, 1, true);
+        free(payload);
+    }
+    cJSON_Delete(root);
+
+    ESP_LOGI(TAG, "Published target select discovery (%d devices)", discovered_count);
+}
+
+/**
+ * Handle discovered device info from other intercoms.
+ */
+static void handle_device_info(const char *payload)
+{
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) return;
+
+    cJSON *room_json = cJSON_GetObjectItem(root, "room");
+    cJSON *ip_json = cJSON_GetObjectItem(root, "ip");
+    cJSON *id_json = cJSON_GetObjectItem(root, "id");
+
+    if (!room_json || !ip_json || !id_json) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *room = room_json->valuestring;
+    const char *ip = ip_json->valuestring;
+    const char *id = id_json->valuestring;
+
+    // Check if we already know this device
+    int existing_idx = -1;
+    for (int i = 0; i < discovered_count; i++) {
+        if (strcmp(discovered_devices[i].id, id) == 0) {
+            existing_idx = i;
+            break;
+        }
+    }
+
+    bool is_new = (existing_idx < 0);
+
+    if (existing_idx >= 0) {
+        // Update existing device
+        strncpy(discovered_devices[existing_idx].room, room, sizeof(discovered_devices[0].room) - 1);
+        strncpy(discovered_devices[existing_idx].ip, ip, sizeof(discovered_devices[0].ip) - 1);
+        discovered_devices[existing_idx].active = true;
+    } else if (discovered_count < MAX_DISCOVERED_DEVICES) {
+        // Add new device
+        strncpy(discovered_devices[discovered_count].room, room, sizeof(discovered_devices[0].room) - 1);
+        strncpy(discovered_devices[discovered_count].ip, ip, sizeof(discovered_devices[0].ip) - 1);
+        strncpy(discovered_devices[discovered_count].id, id, sizeof(discovered_devices[0].id) - 1);
+        discovered_devices[discovered_count].active = true;
+        discovered_count++;
+        ESP_LOGI(TAG, "Discovered device: %s (%s) at %s", room, id, ip);
+    }
+
+    cJSON_Delete(root);
+
+    // Re-publish target select discovery if new device found
+    if (is_new && mqtt_connected) {
+        publish_target_discovery();
+    }
 }
 
 /**
@@ -313,7 +476,7 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
 {
     // Null-terminate topic and data for easier handling
     char topic[128] = {0};
-    char data[64] = {0};
+    char data[256] = {0};  // Larger buffer for device info JSON
 
     size_t topic_len = event->topic_len < sizeof(topic) - 1 ? event->topic_len : sizeof(topic) - 1;
     size_t data_len = event->data_len < sizeof(data) - 1 ? event->data_len : sizeof(data) - 1;
@@ -321,7 +484,13 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
     memcpy(topic, event->topic, topic_len);
     memcpy(data, event->data, data_len);
 
-    ESP_LOGI(TAG, "MQTT cmd: %s = %s", topic, data);
+    // Check if this is device info (don't log these to reduce spam)
+    bool is_device_info = (strncmp(topic, "intercom/devices/", 17) == 0 &&
+                           strstr(topic, "/info") != NULL);
+
+    if (!is_device_info) {
+        ESP_LOGI(TAG, "MQTT cmd: %s = %s", topic, data);
+    }
 
     // Volume command
     if (strcmp(topic, volume_cmd_topic) == 0) {
@@ -365,6 +534,21 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
             user_callback(HA_CMD_LED, enabled ? 1 : 0);
         }
     }
+    // Target command
+    else if (strcmp(topic, target_cmd_topic) == 0) {
+        strncpy(current_target, data, sizeof(current_target) - 1);
+        current_target[sizeof(current_target) - 1] = '\0';
+        publish_target();
+        ESP_LOGI(TAG, "Target set to: %s", current_target);
+
+        if (user_callback) {
+            user_callback(HA_CMD_TARGET, 0);
+        }
+    }
+    // Device info from other intercoms
+    else if (is_device_info) {
+        handle_device_info(data);
+    }
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
@@ -387,10 +571,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             esp_mqtt_client_subscribe(mqtt_client, volume_cmd_topic, 0);
             esp_mqtt_client_subscribe(mqtt_client, mute_cmd_topic, 0);
             esp_mqtt_client_subscribe(mqtt_client, led_cmd_topic, 0);
-            ESP_LOGI(TAG, "Subscribed to command topics");
+            esp_mqtt_client_subscribe(mqtt_client, target_cmd_topic, 0);
+
+            // Subscribe to device discovery to learn about other intercoms
+            esp_mqtt_client_subscribe(mqtt_client, device_discovery_topic, 0);
+            ESP_LOGI(TAG, "Subscribed to command topics and device discovery");
 
             // Publish current states
             publish_all_states();
+
+            // Publish device info for hub discovery
+            publish_device_info();
             break;
 
         case MQTT_EVENT_DISCONNECTED:
@@ -432,6 +623,12 @@ esp_err_t ha_mqtt_init(const uint8_t *device_id)
     snprintf(mute_cmd_topic, sizeof(mute_cmd_topic), "%s/mute/set", base_topic);
     snprintf(led_state_topic, sizeof(led_state_topic), "%s/led", base_topic);
     snprintf(led_cmd_topic, sizeof(led_cmd_topic), "%s/led/set", base_topic);
+    snprintf(device_info_topic, sizeof(device_info_topic), "intercom/devices/%s/info", unique_id);
+    snprintf(target_state_topic, sizeof(target_state_topic), "%s/target", base_topic);
+    snprintf(target_cmd_topic, sizeof(target_cmd_topic), "%s/target/set", base_topic);
+
+    // Initialize current target
+    strcpy(current_target, "All Rooms");
 
     ESP_LOGI(TAG, "HA MQTT initialized: id=%s", unique_id);
     return ESP_OK;
@@ -523,4 +720,29 @@ void ha_mqtt_publish_led(void)
 bool ha_mqtt_is_connected(void)
 {
     return mqtt_connected;
+}
+
+const char* ha_mqtt_get_target_ip(void)
+{
+    // If target is "All Rooms", return NULL for multicast
+    if (strcmp(current_target, "All Rooms") == 0) {
+        return NULL;
+    }
+
+    // Find device by room name
+    for (int i = 0; i < discovered_count; i++) {
+        if (discovered_devices[i].active &&
+            strcmp(discovered_devices[i].room, current_target) == 0) {
+            return discovered_devices[i].ip;
+        }
+    }
+
+    // Target not found, fall back to multicast
+    ESP_LOGW(TAG, "Target '%s' not found, using multicast", current_target);
+    return NULL;
+}
+
+const char* ha_mqtt_get_target_name(void)
+{
+    return current_target;
 }

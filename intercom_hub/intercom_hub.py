@@ -71,16 +71,27 @@ MUTE_CMD_TOPIC = f"{BASE_TOPIC}/mute/set"
 # Notify specific topics
 NOTIFY_CMD_TOPIC = f"{BASE_TOPIC}/notify"
 
+# Target selector topics
+TARGET_STATE_TOPIC = f"{BASE_TOPIC}/target"
+TARGET_CMD_TOPIC = f"{BASE_TOPIC}/target/set"
+
+# Device discovery topic
+DEVICE_INFO_TOPIC = "intercom/devices/+/info"
+
 # State
 current_volume = 100
 is_muted = False
 current_state = "idle"
+current_target = "All Rooms"  # Default target
 sequence_num = 0
 mqtt_client = None
 tx_socket = None
 rx_socket = None
 last_rx_time = 0
 rx_timeout = 0.5  # seconds before going back to idle
+
+# Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.168.1.50"}}
+discovered_devices = {}
 
 
 def create_tx_socket():
@@ -109,8 +120,13 @@ def create_rx_socket():
     return sock
 
 
-def send_audio_packet(opus_data):
-    """Send an audio packet via multicast."""
+def send_audio_packet(opus_data, target_ip=None):
+    """Send an audio packet via multicast or unicast.
+
+    Args:
+        opus_data: Opus encoded audio frame
+        target_ip: If None, send multicast. Otherwise send unicast to this IP.
+    """
     global sequence_num, tx_socket
 
     if tx_socket is None:
@@ -121,9 +137,32 @@ def send_audio_packet(opus_data):
     sequence_num += 1
 
     try:
-        tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
+        if target_ip:
+            # Unicast to specific device
+            tx_socket.sendto(packet, (target_ip, MULTICAST_PORT))
+        else:
+            # Multicast to all devices
+            tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
     except Exception as e:
-        print(f"Error sending multicast: {e}")
+        mode = f"unicast to {target_ip}" if target_ip else "multicast"
+        print(f"Error sending {mode}: {e}")
+
+
+def get_target_ip():
+    """Get the IP address for the current target, or None for multicast."""
+    global current_target, discovered_devices
+
+    if current_target == "All Rooms":
+        return None
+
+    # Find device by room name
+    for device_id, info in discovered_devices.items():
+        if info.get("room") == current_target:
+            return info.get("ip")
+
+    # Target not found, fall back to multicast
+    print(f"Warning: Target '{current_target}' not found, using multicast")
+    return None
 
 
 def receive_thread():
@@ -278,13 +317,17 @@ def fetch_and_convert_audio(url):
 
 
 def encode_and_broadcast(pcm_data):
-    """Encode PCM to Opus and broadcast via multicast."""
+    """Encode PCM to Opus and send via multicast or unicast based on target."""
     global current_state
 
     if len(pcm_data) == 0:
         return
 
-    print(f"Broadcasting {len(pcm_data)} bytes of audio...")
+    # Get target IP (None = multicast to all)
+    target_ip = get_target_ip()
+    target_desc = f"to {current_target}" if target_ip else "to all rooms"
+
+    print(f"Sending {len(pcm_data)} bytes of audio {target_desc}...")
     current_state = "transmitting"
     publish_state()
 
@@ -306,7 +349,7 @@ def encode_and_broadcast(pcm_data):
         # Send 10 silence frames first (200ms) to let ESP32 stabilize
         print("Sending lead-in silence...")
         for _ in range(10):
-            send_audio_packet(silence_opus)
+            send_audio_packet(silence_opus, target_ip)
             frame_count += 1
             # Sleep until the next frame should be sent
             next_frame_time = start_time + (frame_count * frame_interval)
@@ -324,8 +367,8 @@ def encode_and_broadcast(pcm_data):
             # Encode frame to Opus
             opus_data = encoder.encode(frame, FRAME_SIZE)
 
-            # Send via multicast
-            send_audio_packet(opus_data)
+            # Send via multicast or unicast
+            send_audio_packet(opus_data, target_ip)
             frame_count += 1
 
             # Sleep until the next frame should be sent (precise timing)
@@ -339,14 +382,14 @@ def encode_and_broadcast(pcm_data):
         # Send trailing silence (400ms) to flush ESP32 DMA buffers
         print("Sending trail-out silence...")
         for _ in range(20):
-            send_audio_packet(silence_opus)
+            send_audio_packet(silence_opus, target_ip)
             frame_count += 1
             next_frame_time = start_time + (frame_count * frame_interval)
             sleep_time = next_frame_time - time.monotonic()
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        print(f"Broadcast complete ({offset // frame_bytes} frames)")
+        print(f"Send complete ({offset // frame_bytes} frames) {target_desc}")
 
     except Exception as e:
         print(f"Error encoding audio: {e}")
@@ -394,7 +437,7 @@ def publish_discovery():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.2.0"
+        "sw_version": "1.3.0"
     }
 
     # Notify entity - send text (TTS) or URL to broadcast
@@ -481,6 +524,9 @@ def publish_discovery():
         retain=True
     )
 
+    # Target room select - will be updated when devices are discovered
+    update_target_select_options()
+
     print("Published HA discovery configs")
 
 
@@ -502,6 +548,63 @@ def publish_mute():
         mqtt_client.publish(MUTE_STATE_TOPIC, "ON" if is_muted else "OFF", retain=True)
 
 
+def publish_target():
+    """Publish current target."""
+    if mqtt_client and mqtt_client.is_connected():
+        mqtt_client.publish(TARGET_STATE_TOPIC, current_target, retain=True)
+
+
+def get_target_options():
+    """Get list of target options for the select entity."""
+    options = ["All Rooms"]
+    # Add discovered rooms (sorted alphabetically)
+    rooms = sorted(set(d["room"] for d in discovered_devices.values()))
+    options.extend(rooms)
+    return options
+
+
+def update_target_select_options():
+    """Re-publish target select discovery with updated options."""
+    if not mqtt_client or not mqtt_client.is_connected():
+        return
+
+    device_info = {
+        "identifiers": [DEVICE_ID_STR],
+        "name": DEVICE_NAME,
+        "model": "Intercom Hub",
+        "manufacturer": "guywithacomputer",
+        "sw_version": "1.3.0"
+    }
+
+    options = get_target_options()
+
+    # Target room select
+    target_config = {
+        "name": "Target",
+        "unique_id": f"{UNIQUE_ID}_target",
+        "object_id": f"{UNIQUE_ID}_target",
+        "device": device_info,
+        "state_topic": TARGET_STATE_TOPIC,
+        "command_topic": TARGET_CMD_TOPIC,
+        "availability_topic": AVAILABILITY_TOPIC,
+        "options": options,
+        "icon": "mdi:target",
+        "has_entity_name": True
+    }
+
+    mqtt_client.publish(
+        f"homeassistant/select/{UNIQUE_ID}_target/config",
+        json.dumps(target_config),
+        retain=True
+    )
+
+    # Ensure current target is still valid
+    global current_target
+    if current_target not in options:
+        current_target = "All Rooms"
+        publish_target()
+
+
 def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     """Handle MQTT connection."""
     print(f"Connected to MQTT broker (rc={reason_code})")
@@ -510,6 +613,11 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     client.subscribe(VOLUME_CMD_TOPIC)
     client.subscribe(MUTE_CMD_TOPIC)
     client.subscribe(NOTIFY_CMD_TOPIC)
+    client.subscribe(TARGET_CMD_TOPIC)
+
+    # Subscribe to device info for discovery
+    client.subscribe(DEVICE_INFO_TOPIC)
+    print(f"Subscribed to device discovery: {DEVICE_INFO_TOPIC}")
 
     # Publish discovery
     publish_discovery()
@@ -521,16 +629,19 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     publish_state()
     publish_volume()
     publish_mute()
+    publish_target()
 
 
 def on_mqtt_message(client, userdata, msg):
     """Handle MQTT messages."""
-    global current_volume, is_muted
+    global current_volume, is_muted, current_target, discovered_devices
 
     topic = msg.topic
     payload = msg.payload.decode('utf-8')
 
-    print(f"MQTT: {topic} = {payload}")
+    # Don't log device info spam
+    if not topic.startswith("intercom/devices/"):
+        print(f"MQTT: {topic} = {payload}")
 
     if topic == VOLUME_CMD_TOPIC:
         try:
@@ -543,6 +654,32 @@ def on_mqtt_message(client, userdata, msg):
     elif topic == MUTE_CMD_TOPIC:
         is_muted = (payload.upper() == "ON")
         publish_mute()
+
+    elif topic == TARGET_CMD_TOPIC:
+        # Target room selection
+        current_target = payload
+        publish_target()
+        print(f"Target set to: {current_target}")
+
+    elif topic.startswith("intercom/devices/") and topic.endswith("/info"):
+        # Device info from ESP32 intercoms
+        try:
+            data = json.loads(payload)
+            device_id = data.get("id", "")
+            room = data.get("room", "Unknown")
+            ip = data.get("ip", "")
+
+            if device_id and ip:
+                old_devices = set(discovered_devices.keys())
+                discovered_devices[device_id] = {"room": room, "ip": ip}
+
+                # If new device, update the select options
+                if device_id not in old_devices:
+                    print(f"Discovered device: {room} ({device_id}) at {ip}")
+                    update_target_select_options()
+
+        except json.JSONDecodeError:
+            pass
 
     elif topic == NOTIFY_CMD_TOPIC:
         # Notify service sends message - can be text (TTS) or URL
@@ -570,7 +707,7 @@ def main():
     global mqtt_client, tx_socket, rx_socket
 
     print("=" * 50)
-    print("Intercom Hub v1.2.0")
+    print("Intercom Hub v1.3.0")
     print(f"Device ID: {DEVICE_ID_STR}")
     print(f"Unique ID: {UNIQUE_ID}")
     print("=" * 50)

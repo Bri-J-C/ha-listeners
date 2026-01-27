@@ -179,7 +179,14 @@ static void audio_tx_task(void *arg)
         // Build and send packet
         packet->sequence = htonl(tx_sequence++);
         memcpy(packet->opus_data, opus_buffer, opus_len);
-        network_send_multicast(packet, HEADER_LENGTH + opus_len);
+
+        // Send to target (unicast) or all rooms (multicast)
+        const char *target_ip = ha_mqtt_get_target_ip();
+        if (target_ip) {
+            network_send_unicast(packet, HEADER_LENGTH + opus_len, target_ip);
+        } else {
+            network_send_multicast(packet, HEADER_LENGTH + opus_len);
+        }
     }
 
     ESP_LOGI(TAG, "Audio TX task stopped");
@@ -322,7 +329,8 @@ void app_main(void)
         if (transmitting != was_transmitting) {
             was_transmitting = transmitting;
             if (transmitting) {
-                ESP_LOGI(TAG, "TX started");
+                const char *target = ha_mqtt_get_target_name();
+                ESP_LOGI(TAG, "TX started -> %s", target);
             } else {
                 ESP_LOGI(TAG, "TX stopped");
             }
