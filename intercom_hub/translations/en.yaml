@@ -1,0 +1,28 @@
+configuration:
+  mqtt_host:
+    name: MQTT Broker Host
+    description: Hostname of the MQTT broker (usually "core-mosquitto" for the Mosquitto add-on)
+  mqtt_port:
+    name: MQTT Broker Port
+    description: Port number for the MQTT broker (default 1883)
+  mqtt_user:
+    name: MQTT Username
+    description: Username for MQTT authentication
+  mqtt_password:
+    name: MQTT Password
+    description: Password for MQTT authentication
+  device_name:
+    name: Device Name
+    description: Display name for this hub in Home Assistant
+  multicast_group:
+    name: Multicast Group
+    description: UDP multicast address for broadcasting audio (must match ESP32 firmware)
+  multicast_port:
+    name: Multicast Port
+    description: UDP port for audio packets (must match ESP32 firmware)
+  piper_host:
+    name: Piper TTS Host
+    description: Hostname of the Piper TTS add-on (usually "core-piper")
+  piper_port:
+    name: Piper TTS Port
+    description: Port number for Piper TTS (default 10200)

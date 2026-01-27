@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.4] - 2026-01-26
+
+### Added
+- Icon and logo for add-on store
+- Translations file for config option labels/descriptions
+- MIT License
+
 ## [1.3.3] - 2026-01-26
 
 ### Fixed
