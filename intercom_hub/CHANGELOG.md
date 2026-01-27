@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.3.6] - 2026-01-26
+
+### Added
+- ESP32 device info and firmware link in documentation
+
 ## [1.3.5] - 2026-01-26
 
 ### Changed

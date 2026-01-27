@@ -75,6 +75,18 @@ automation:
 - Mosquitto broker (or compatible MQTT broker)
 - Piper TTS add-on (for text-to-speech)
 
+## ESP32 Intercom Devices
+
+This add-on works with ESP32-S3 based intercom satellites. Each device acts as a room station with push-to-talk functionality.
+
+**Hardware required per room (~$16):**
+- ESP32-S3-DevKitC-1 (has built-in button and RGB LED)
+- INMP441 I2S Microphone
+- MAX98357A I2S Amplifier + Speaker
+
+**Build instructions and firmware:**
+[View the ESP32 firmware on GitHub](https://github.com/Bri-J-C/ha-intercom/tree/main/firmware)
+
 ## Technical Details
 
 - Uses UDP multicast (224.0.0.100:5005) to broadcast audio
