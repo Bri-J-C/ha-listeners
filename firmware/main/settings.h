@@ -93,4 +93,11 @@ esp_err_t settings_set_mute(bool muted);
  */
 esp_err_t settings_set_led_enabled(bool enabled);
 
+/**
+ * Check and save pending settings to NVS.
+ * Call this periodically from main loop (e.g., every 100ms).
+ * Settings are only written after a delay to batch rapid changes.
+ */
+void settings_save_if_needed(void);
+
 #endif // SETTINGS_H

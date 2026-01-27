@@ -4,10 +4,11 @@ A Home Assistant add-on that acts as a multicast intercom node, enabling TTS ann
 
 ## Features
 
-- Appears as a **media_player** in Home Assistant
+- Appears as a **notify** entity in Home Assistant
 - Broadcasts TTS/audio to all ESP32 intercoms via UDP multicast
-- Same controls as ESP32 devices (volume, mute, status)
-- Works with HA's built-in TTS services and Assist
+- Discover and route to individual ESP32 devices
+- Volume and mute controls via MQTT entities
+- Works with Piper TTS for text-to-speech
 
 ## Installation
 
@@ -43,22 +44,18 @@ multicast_port: 5005           # Must match ESP32 firmware
 ### TTS Announcements
 
 ```yaml
-service: tts.speak
-target:
-  entity_id: media_player.intercom_hub
+service: notify.intercom_hub
 data:
   message: "Dinner is ready!"
 ```
 
-### Play Audio File
+### Broadcast to Specific Room
 
 ```yaml
-service: media_player.play_media
-target:
-  entity_id: media_player.intercom_hub
+service: notify.intercom_hub
 data:
-  media_content_id: "/local/doorbell.mp3"
-  media_content_type: "music"
+  message: "Come to the kitchen!"
+  target: "living_room"  # Optional: specific room or "all" for broadcast
 ```
 
 ### Automations
@@ -71,9 +68,7 @@ automation:
         entity_id: binary_sensor.doorbell
         to: "on"
     action:
-      - service: tts.speak
-        target:
-          entity_id: media_player.intercom_hub
+      - service: notify.intercom_hub
         data:
           message: "Someone is at the door"
 ```
@@ -82,10 +77,11 @@ automation:
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| `media_player.intercom_hub` | Media Player | Main player for TTS/audio |
+| `notify.intercom_hub` | Notify | Send TTS announcements |
 | `sensor.intercom_hub_state` | Sensor | idle/transmitting |
 | `number.intercom_hub_volume` | Number | Volume 0-100% |
 | `switch.intercom_hub_mute` | Switch | Mute toggle |
+| `select.intercom_hub_target` | Select | Target room selector |
 
 ## Requirements
 
@@ -101,4 +97,4 @@ automation:
 
 ## Version
 
-1.0.0 by guywithacomputer
+1.3.0

@@ -368,7 +368,6 @@ static void publish_target(void)
  */
 static void publish_target_discovery(void)
 {
-    const settings_t *cfg = settings_get();
     char discovery_topic[128];
     snprintf(discovery_topic, sizeof(discovery_topic),
              "homeassistant/select/%s_target/config", unique_id);
@@ -414,26 +413,47 @@ static void publish_target_discovery(void)
     ESP_LOGI(TAG, "Published target select discovery (%d devices)", discovered_count);
 }
 
+// Flag for deferred target discovery update
+static bool target_discovery_pending = false;
+
+/**
+ * Simple JSON string extractor (avoids cJSON allocation in MQTT handler).
+ * Extracts value for "key":"value" pattern.
+ */
+static bool extract_json_string(const char *json, const char *key, char *out, size_t out_len)
+{
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+
+    const char *start = strstr(json, pattern);
+    if (!start) return false;
+
+    start += strlen(pattern);
+    const char *end = strchr(start, '"');
+    if (!end) return false;
+
+    size_t len = end - start;
+    if (len >= out_len) len = out_len - 1;
+
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
+}
+
 /**
  * Handle discovered device info from other intercoms.
+ * Uses simple string parsing to avoid cJSON memory allocation.
  */
 static void handle_device_info(const char *payload)
 {
-    cJSON *root = cJSON_Parse(payload);
-    if (!root) return;
+    char room[32] = {0};
+    char ip[16] = {0};
+    char id[32] = {0};
 
-    cJSON *room_json = cJSON_GetObjectItem(root, "room");
-    cJSON *ip_json = cJSON_GetObjectItem(root, "ip");
-    cJSON *id_json = cJSON_GetObjectItem(root, "id");
-
-    if (!room_json || !ip_json || !id_json) {
-        cJSON_Delete(root);
-        return;
-    }
-
-    const char *room = room_json->valuestring;
-    const char *ip = ip_json->valuestring;
-    const char *id = id_json->valuestring;
+    // Simple JSON parsing without cJSON
+    if (!extract_json_string(payload, "room", room, sizeof(room))) return;
+    if (!extract_json_string(payload, "ip", ip, sizeof(ip))) return;
+    if (!extract_json_string(payload, "id", id, sizeof(id))) return;
 
     // Check if we already know this device
     int existing_idx = -1;
@@ -444,10 +464,8 @@ static void handle_device_info(const char *payload)
         }
     }
 
-    bool is_new = (existing_idx < 0);
-
     if (existing_idx >= 0) {
-        // Update existing device
+        // Update existing device (no need to republish discovery)
         strncpy(discovered_devices[existing_idx].room, room, sizeof(discovered_devices[0].room) - 1);
         strncpy(discovered_devices[existing_idx].ip, ip, sizeof(discovered_devices[0].ip) - 1);
         discovered_devices[existing_idx].active = true;
@@ -459,13 +477,9 @@ static void handle_device_info(const char *payload)
         discovered_devices[discovered_count].active = true;
         discovered_count++;
         ESP_LOGI(TAG, "Discovered device: %s (%s) at %s", room, id, ip);
-    }
 
-    cJSON_Delete(root);
-
-    // Re-publish target select discovery if new device found
-    if (is_new && mqtt_connected) {
-        publish_target_discovery();
+        // Defer target discovery update to main loop (avoid cJSON in MQTT handler)
+        target_discovery_pending = true;
     }
 }
 
@@ -720,6 +734,15 @@ void ha_mqtt_publish_led(void)
 bool ha_mqtt_is_connected(void)
 {
     return mqtt_connected;
+}
+
+void ha_mqtt_process(void)
+{
+    // Handle deferred target discovery update (avoids cJSON in MQTT handler)
+    if (target_discovery_pending && mqtt_connected) {
+        target_discovery_pending = false;
+        publish_target_discovery();
+    }
 }
 
 const char* ha_mqtt_get_target_ip(void)

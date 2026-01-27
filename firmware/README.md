@@ -1,17 +1,15 @@
 # HA Intercom ESP32-S3 Firmware
 
-ESP-IDF based firmware for the intercom satellite.
+PlatformIO-based firmware for the intercom satellite.
 
 ## Hardware Requirements
 
 **Minimum:**
-- ESP32-S3-DevKitC-1 or similar (~$8)
+- ESP32-S3-DevKitC-1 or similar (~$8) - has built-in BOOT button and RGB LED
 - INMP441 I2S MEMS Microphone (~$3)
 - MAX98357A I2S Amplifier + Speaker (~$5)
-- Push button (~$0.50)
-- LED (~$0.50)
 
-**Total: ~$17**
+**Total: ~$16**
 
 ## Wiring
 
@@ -36,67 +34,61 @@ ESP-IDF based firmware for the intercom satellite.
 | GAIN      | NC or GND (15dB) |
 | SD        | NC (always on) |
 
-### Button & LED
-| Component | ESP32-S3 |
-|-----------|----------|
-| Button    | GPIO0 (BOOT button) |
-| LED       | GPIO48 (onboard RGB) |
+### Button & LED (Built-in on DevKitC-1)
+| Component | ESP32-S3 | Notes |
+|-----------|----------|-------|
+| Button    | GPIO0    | Built-in BOOT button |
+| LED       | GPIO48   | Built-in WS2812 RGB LED |
+
+No external button or LED required - the DevKitC-1 has these built-in.
 
 ## Building
 
 ### Prerequisites
 
-1. Install ESP-IDF v5.x:
+1. Install [PlatformIO](https://platformio.org/install):
    ```bash
-   # Follow: https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/get-started/
-   ```
-
-2. Set up environment:
-   ```bash
-   . $HOME/esp/esp-idf/export.sh
+   pip install platformio
    ```
 
 ### Configure
 
-1. Set your WiFi credentials in `main/main.c`:
-   ```c
-   #define WIFI_SSID       "your_wifi_ssid"
-   #define WIFI_PASSWORD   "your_wifi_password"
-   ```
+WiFi and MQTT are configured via the web interface after first boot.
+The device starts in AP mode if no WiFi is configured.
 
-   Or use menuconfig:
-   ```bash
-   idf.py menuconfig
-   ```
-
-2. (Optional) Adjust GPIO pins in header files if your wiring differs.
+(Optional) Set default WiFi credentials in `main/main.c` for development:
+```c
+#define DEFAULT_WIFI_SSID       "your_wifi_ssid"
+#define DEFAULT_WIFI_PASSWORD   "your_wifi_password"
+```
 
 ### Build & Flash
 
 ```bash
 cd firmware
 
-# Set target
-idf.py set-target esp32s3
-
 # Build
-idf.py build
+pio run
 
 # Flash (connect ESP32-S3 via USB)
-idf.py -p /dev/ttyUSB0 flash
+pio run -t upload
 
 # Monitor logs
-idf.py -p /dev/ttyUSB0 monitor
+pio device monitor
 ```
+
+Or use VS Code with the PlatformIO extension for a graphical interface.
 
 ## Usage
 
-1. **Power on** - LED turns red while connecting to WiFi
-2. **Connected** - LED turns solid green
-3. **Press button** - Start talking (LED blinks blue)
-4. **Release button** - Stop talking
+1. **Power on** - LED blinks red while connecting to WiFi
+2. **Connected (idle)** - LED dim white
+3. **Press button** - Start talking (LED green)
+4. **Release button** - Stop talking (LED returns to white)
 5. **Hold button 2s** - Broadcast to all rooms (instead of default target)
-6. **Receiving audio** - LED solid blue
+6. **Receiving audio** - LED blue
+7. **Muted** - LED red
+8. **Error** - LED blinking red
 
 ## Troubleshooting
 
@@ -115,9 +107,10 @@ idf.py -p /dev/ttyUSB0 monitor
 - Monitor serial output for errors
 
 ### Device not discovered by HA
-- Ensure HA integration is installed
+- Ensure Intercom Hub add-on is installed
+- Check MQTT broker is running (Mosquitto add-on)
+- Verify MQTT settings in web config match HA's broker
 - Check both devices on same network
-- Verify UDP port 5004 not blocked
 
 ## Pin Configuration
 

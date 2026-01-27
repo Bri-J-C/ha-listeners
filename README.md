@@ -21,12 +21,12 @@ Inspired by [PTTDroid](https://f-droid.org/en/packages/ro.ui.pttdroid/)'s simple
 ┌─────────────────────────────────────────────────────────────┐
 │                     HOME ASSISTANT                           │
 │  ┌────────────────────────────────────────────────────────┐ │
-│  │              ha_intercom integration                    │ │
-│  │  • Device discovery         • TTS bridge (Piper)       │ │
+│  │              Intercom Hub Add-on                        │ │
+│  │  • MQTT device discovery    • TTS bridge (Piper)       │ │
 │  │  • Room routing             • Services & automations   │ │
 │  └────────────────────────┬───────────────────────────────┘ │
 └───────────────────────────┼─────────────────────────────────┘
-                            │ UDP Control (port 5004)
+                            │ MQTT (discovery & control)
         ┌───────────────────┼───────────────────┐
         ▼                   ▼                   ▼
   ┌───────────┐       ┌───────────┐       ┌───────────┐
@@ -68,11 +68,10 @@ python tools/ptt_client.py --name bedroom
 
 ### 2. ESP32-S3 Hardware
 
-**Required components (~$17 total):**
-- ESP32-S3-DevKitC-1 (~$8)
+**Required components (~$16 total):**
+- ESP32-S3-DevKitC-1 (~$8) - has built-in BOOT button and RGB LED
 - INMP441 I2S Microphone (~$3)
 - MAX98357A I2S Amp + Speaker (~$5)
-- Push button + LED (~$1)
 
 See `firmware/README.md` for wiring and flashing instructions.
 
@@ -115,11 +114,11 @@ Click the button at the top of this README, or:
 - Sample rate: 16000 Hz
 - Channels: 1 (mono)
 - Frame size: 20ms (320 samples)
-- Codec: Opus @ 24kbps
+- Codec: Opus @ 12kbps (VBR, voice mode)
 
-### Discovery (UDP port 5004)
+### Discovery
 
-Devices announce themselves every 30 seconds. HA responds with configuration.
+Devices register via MQTT and appear automatically in Home Assistant.
 
 ## License
 

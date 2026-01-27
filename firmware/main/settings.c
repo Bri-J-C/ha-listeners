@@ -8,6 +8,8 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "settings";
@@ -30,6 +32,11 @@ static settings_t current_settings = {
 };
 
 static nvs_handle_t settings_nvs = 0;
+
+// Deferred save mechanism to avoid blocking on rapid changes
+static bool save_pending = false;
+static uint32_t last_change_time = 0;
+#define SAVE_DELAY_MS 2000  // Wait 2 seconds after last change before saving
 
 esp_err_t settings_init(void)
 {
@@ -175,15 +182,11 @@ esp_err_t settings_set_volume(uint8_t volume)
     if (volume > 100) volume = 100;
     current_settings.volume = volume;
 
-    esp_err_t ret = nvs_set_u8(settings_nvs, "volume", volume);
-    if (ret != ESP_OK) return ret;
+    // Mark for deferred save (don't block on rapid volume changes)
+    save_pending = true;
+    last_change_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-    ret = nvs_commit(settings_nvs);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Volume saved: %d", volume);
-    }
-
-    return ret;
+    return ESP_OK;
 }
 
 bool settings_is_configured(void)
@@ -271,28 +274,43 @@ esp_err_t settings_set_mute(bool muted)
 {
     current_settings.muted = muted;
 
-    esp_err_t ret = nvs_set_u8(settings_nvs, "muted", muted ? 1 : 0);
-    if (ret != ESP_OK) return ret;
+    // Mark for deferred save
+    save_pending = true;
+    last_change_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    ESP_LOGI(TAG, "Mute %s", muted ? "enabled" : "disabled");
 
-    ret = nvs_commit(settings_nvs);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Mute %s", muted ? "enabled" : "disabled");
-    }
-
-    return ret;
+    return ESP_OK;
 }
 
 esp_err_t settings_set_led_enabled(bool enabled)
 {
     current_settings.led_enabled = enabled;
 
-    esp_err_t ret = nvs_set_u8(settings_nvs, "led_en", enabled ? 1 : 0);
-    if (ret != ESP_OK) return ret;
+    // Mark for deferred save
+    save_pending = true;
+    last_change_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    ESP_LOGI(TAG, "LED %s", enabled ? "enabled" : "disabled");
 
-    ret = nvs_commit(settings_nvs);
+    return ESP_OK;
+}
+
+void settings_save_if_needed(void)
+{
+    if (!save_pending) return;
+
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if ((now - last_change_time) < SAVE_DELAY_MS) return;
+
+    // Enough time has passed, save all settings
+    save_pending = false;
+
+    nvs_set_u8(settings_nvs, "volume", current_settings.volume);
+    nvs_set_u8(settings_nvs, "muted", current_settings.muted ? 1 : 0);
+    nvs_set_u8(settings_nvs, "led_en", current_settings.led_enabled ? 1 : 0);
+
+    esp_err_t ret = nvs_commit(settings_nvs);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "LED %s", enabled ? "enabled" : "disabled");
+        ESP_LOGI(TAG, "Settings saved (volume=%d, muted=%d, led=%d)",
+                 current_settings.volume, current_settings.muted, current_settings.led_enabled);
     }
-
-    return ret;
 }

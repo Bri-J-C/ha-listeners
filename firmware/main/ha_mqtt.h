@@ -92,4 +92,10 @@ const char* ha_mqtt_get_target_ip(void);
  */
 const char* ha_mqtt_get_target_name(void);
 
+/**
+ * Process deferred MQTT operations.
+ * Call this periodically from main loop.
+ */
+void ha_mqtt_process(void);
+
 #endif // HA_MQTT_H

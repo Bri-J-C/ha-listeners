@@ -348,6 +348,12 @@ void app_main(void)
             }
         }
 
+        // Save any pending settings to NVS (debounced)
+        settings_save_if_needed();
+
+        // Process deferred MQTT operations
+        ha_mqtt_process();
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
