@@ -29,7 +29,7 @@
 static const char *TAG = "main";
 
 // Fallback WiFi credentials (used if no settings saved)
-#define DEFAULT_WIFI_SSID       "wifi"
+#define DEFAULT_WIFI_SSID       "your_wifi_ssid"
 #define DEFAULT_WIFI_PASSWORD   "your_wifi_password"
 
 // Application state
