@@ -105,7 +105,7 @@ static const char* get_current_ssid(void)
         return s->wifi_ssid;
     }
     // Return the fallback SSID that was used
-    return "wifi";  // Must match DEFAULT_WIFI_SSID in main.c
+    return "your_wifi_ssid";  // Must match DEFAULT_WIFI_SSID in main.c
 }
 
 // URL decode helper
