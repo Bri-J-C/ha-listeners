@@ -48,25 +48,7 @@ Inspired by [PTTDroid](https://f-droid.org/en/packages/ro.ui.pttdroid/)'s simple
 
 ## Quick Start
 
-### 1. Python Test Client
-
-Test the protocol without hardware:
-
-```bash
-# Install dependencies
-sudo apt install libopus-dev python3-pip
-pip install -r tools/requirements.txt
-
-# Terminal 1: Start first client
-python tools/ptt_client.py --name kitchen
-
-# Terminal 2: Start second client
-python tools/ptt_client.py --name bedroom
-
-# Press Enter to toggle PTT, 'q' to quit
-```
-
-### 2. ESP32-S3 Hardware
+### 1. ESP32-S3 Hardware
 
 **Required components (~$16 total):**
 - ESP32-S3-DevKitC-1 (~$8) - has built-in BOOT button and RGB LED
@@ -79,7 +61,7 @@ python tools/ptt_client.py --name bedroom
 
 See `firmware/README.md` for wiring instructions.
 
-### 3. Home Assistant Add-on
+### 2. Home Assistant Add-on
 
 **Option A: One-click install**
 
