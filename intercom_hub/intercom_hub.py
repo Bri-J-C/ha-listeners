@@ -91,6 +91,9 @@ last_rx_time = 0
 rx_timeout = 0.5  # seconds before going back to idle
 channel_wait_timeout = 5.0  # max seconds to wait for channel before sending
 
+# Transmission lock - prevent concurrent transmissions
+tx_lock = threading.Lock()
+
 # Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.168.1.50"}}
 discovered_devices = {}
 
@@ -361,89 +364,101 @@ def fetch_and_convert_audio(url):
 
 
 def encode_and_broadcast(pcm_data):
-    """Encode PCM to Opus and send via multicast or unicast based on target."""
+    """Encode PCM to Opus and send via multicast or unicast based on target.
+
+    Uses two-phase approach for consistent timing:
+    1. Pre-encode all frames (variable time, doesn't affect playback)
+    2. Send with precise timing (busy-wait for accuracy)
+    """
     global current_state
 
     if len(pcm_data) == 0:
         return
 
-    # Wait for channel to be free (first-to-talk collision avoidance)
-    wait_for_channel()
-
-    # Get target IP (None = multicast to all)
-    target_ip = get_target_ip()
-    target_desc = f"to {current_target}" if target_ip else "to all rooms"
-
-    print(f"Sending {len(pcm_data)} bytes of audio {target_desc}...")
-    current_state = "transmitting"
-    publish_state()
+    # Prevent concurrent transmissions
+    if not tx_lock.acquire(blocking=False):
+        print("Warning: Transmission already in progress, skipping")
+        return
 
     try:
-        # Create Opus encoder
+        # Wait for channel to be free (first-to-talk collision avoidance)
+        wait_for_channel()
+
+        # Get target IP (None = multicast to all)
+        target_ip = get_target_ip()
+        target_desc = f"to {current_target}" if target_ip else "to all rooms"
+
+        frame_bytes = FRAME_SIZE * 2  # 16-bit samples = 640 bytes per frame
+        audio_frames = len(pcm_data) // frame_bytes
+        print(f"Encoding {audio_frames} frames of audio...")
+
+        # === PHASE 1: PRE-ENCODE ALL FRAMES ===
+        # This separates encoding time from transmission timing
         encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
         encoder.bitrate = OPUS_BITRATE
 
-        # Create silence frame for padding
-        silence_pcm = bytes(FRAME_SIZE * 2)  # 640 bytes of silence
+        encoded_frames = []
+
+        # Create and encode silence for lead-in/trail-out
+        silence_pcm = bytes(frame_bytes)
         silence_opus = encoder.encode(silence_pcm, FRAME_SIZE)
 
-        # Use precise timing - calculate when each frame SHOULD be sent
-        # This prevents timing drift over long transmissions
-        frame_interval = FRAME_DURATION_MS / 1000.0  # 0.02 seconds
-        start_time = time.monotonic()
-        frame_count = 0
-
-        # Send 10 silence frames first (200ms) to let ESP32 stabilize
-        print("Sending lead-in silence...")
+        # Lead-in silence (200ms = 10 frames) - lets ESP32 jitter buffer fill
         for _ in range(10):
-            send_audio_packet(silence_opus, target_ip)
-            frame_count += 1
-            # Sleep until the next frame should be sent
-            next_frame_time = start_time + (frame_count * frame_interval)
-            sleep_time = next_frame_time - time.monotonic()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            encoded_frames.append(silence_opus)
 
-        # Process actual audio in 20ms frames (320 samples = 640 bytes)
-        frame_bytes = FRAME_SIZE * 2  # 16-bit samples
+        # Encode actual audio frames
         offset = 0
-
         while offset + frame_bytes <= len(pcm_data):
             frame = pcm_data[offset:offset + frame_bytes]
-
-            # Encode frame to Opus
             opus_data = encoder.encode(frame, FRAME_SIZE)
-
-            # Send via multicast or unicast
-            send_audio_packet(opus_data, target_ip)
-            frame_count += 1
-
-            # Sleep until the next frame should be sent (precise timing)
-            next_frame_time = start_time + (frame_count * frame_interval)
-            sleep_time = next_frame_time - time.monotonic()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
+            encoded_frames.append(opus_data)
             offset += frame_bytes
 
-        # Send trailing silence (400ms) to flush ESP32 DMA buffers
-        print("Sending trail-out silence...")
+        # Trail-out silence (400ms = 20 frames) - flush ESP32 DMA buffers
         for _ in range(20):
-            send_audio_packet(silence_opus, target_ip)
-            frame_count += 1
-            next_frame_time = start_time + (frame_count * frame_interval)
-            sleep_time = next_frame_time - time.monotonic()
+            encoded_frames.append(silence_opus)
+
+        # === PHASE 2: SEND WITH PRECISE TIMING ===
+        print(f"Sending {len(encoded_frames)} frames {target_desc}...")
+        current_state = "transmitting"
+        publish_state()
+
+        frame_interval = FRAME_DURATION_MS / 1000.0  # 0.02 seconds
+        start_time = time.monotonic()
+
+        for i, opus_data in enumerate(encoded_frames):
+            # Send packet immediately
+            send_audio_packet(opus_data, target_ip)
+
+            # Calculate target time for next frame
+            next_frame_time = start_time + ((i + 1) * frame_interval)
+
+            # Coarse sleep (to within 3ms of target)
+            now = time.monotonic()
+            sleep_time = next_frame_time - now - 0.003
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-        print(f"Send complete ({offset // frame_bytes} frames) {target_desc}")
+            # Fine-grained busy-wait for precise timing
+            # This burns CPU but gives <1ms accuracy
+            while time.monotonic() < next_frame_time:
+                pass
+
+        elapsed = time.monotonic() - start_time
+        expected = len(encoded_frames) * frame_interval
+        drift_ms = (elapsed - expected) * 1000
+        print(f"Send complete: {len(encoded_frames)} frames in {elapsed:.2f}s (drift: {drift_ms:+.1f}ms)")
 
     except Exception as e:
-        print(f"Error encoding audio: {e}")
+        print(f"Error encoding/sending audio: {e}")
+        import traceback
+        traceback.print_exc()
 
     finally:
         current_state = "idle"
         publish_state()
+        tx_lock.release()
 
 
 def play_media(url):
@@ -484,7 +499,7 @@ def publish_discovery():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.4.0"
+        "sw_version": "1.5.0"
     }
 
     # Notify entity - send text (TTS) or URL to broadcast
@@ -620,7 +635,7 @@ def update_target_select_options():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.4.0"
+        "sw_version": "1.5.0"
     }
 
     options = get_target_options()
@@ -754,7 +769,7 @@ def main():
     global mqtt_client, tx_socket, rx_socket
 
     print("=" * 50)
-    print("Intercom Hub v1.4.0")
+    print("Intercom Hub v1.5.0")
     print(f"Device ID: {DEVICE_ID_STR}")
     print(f"Unique ID: {UNIQUE_ID}")
     print("=" * 50)
