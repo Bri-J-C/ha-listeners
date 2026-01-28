@@ -121,15 +121,15 @@
 
         .status-connected .status-dot { background: var(--success); box-shadow: 0 0 8px var(--success); }
         .status-disconnected .status-dot { background: var(--error); box-shadow: 0 0 8px var(--error); }
-        .status-transmitting .status-dot { background: var(--warning); box-shadow: 0 0 8px var(--warning); animation: pulse 0.5s ease-in-out infinite; }
-        .status-receiving .status-dot { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); animation: pulse 0.5s ease-in-out infinite; }
+        .status-transmitting .status-dot { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); animation: pulse 0.5s ease-in-out infinite; }
+        .status-receiving .status-dot { background: var(--success); box-shadow: 0 0 8px var(--success); animation: pulse 0.5s ease-in-out infinite; }
         .status-idle .status-dot { background: var(--success); box-shadow: 0 0 8px var(--success); }
 
-        .status-connected { color: var(--success); }
+        .status-connected { color: var(--text); }
         .status-disconnected { color: var(--error); }
-        .status-transmitting { color: var(--warning); }
-        .status-receiving { color: var(--cyan); }
-        .status-idle { color: var(--success); }
+        .status-transmitting { color: var(--cyan); }
+        .status-receiving { color: var(--success); }
+        .status-idle { color: var(--text); }
 
         .target-select {
             width: 100%;
@@ -195,17 +195,6 @@
         }
 
         .ptt-button.transmitting .ptt-icon {
-            color: var(--success);
-            filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.6));
-            animation: pulse-green 1.5s ease-in-out infinite;
-        }
-
-        @keyframes pulse-green {
-            0%, 100% { filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.6)); }
-            50% { filter: drop-shadow(0 0 40px rgba(16, 185, 129, 0.8)); }
-        }
-
-        .ptt-button.receiving .ptt-icon {
             color: var(--cyan);
             filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.6));
             animation: pulse-cyan 1.5s ease-in-out infinite;
@@ -214,6 +203,17 @@
         @keyframes pulse-cyan {
             0%, 100% { filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.6)); }
             50% { filter: drop-shadow(0 0 40px rgba(0, 212, 255, 0.8)); }
+        }
+
+        .ptt-button.receiving .ptt-icon {
+            color: var(--success);
+            filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.6));
+            animation: pulse-green 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse-green {
+            0%, 100% { filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.6)); }
+            50% { filter: drop-shadow(0 0 40px rgba(16, 185, 129, 0.8)); }
         }
 
         .ptt-button.busy .ptt-icon {
@@ -389,7 +389,7 @@
             Release to stop
         </p>
 
-        <p class="version">v1.8.3</p>
+        <p class="version">v1.8.4</p>
     </div>
 
     <script src="ptt-v6.js"></script>

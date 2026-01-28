@@ -118,7 +118,7 @@ channel_wait_timeout = 5.0  # max seconds to wait for channel before sending
 # Transmission lock - prevent concurrent transmissions
 tx_lock = threading.Lock()
 
-# Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.1.8.3.50"}}
+# Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.1.8.4.50"}}
 discovered_devices = {}
 
 # Web PTT state
@@ -551,7 +551,7 @@ def publish_discovery():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.8.3"
+        "sw_version": "1.8.4"
     }
 
     # Notify entity - send text (TTS) or URL to broadcast
@@ -722,7 +722,7 @@ def update_target_select_options():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.8.3"
+        "sw_version": "1.8.4"
     }
 
     options = get_target_options()
@@ -1128,7 +1128,7 @@ def main():
     global mqtt_client, tx_socket, rx_socket
 
     log.info("=" * 50)
-    log.info("Intercom Hub v1.8.3")
+    log.info("Intercom Hub v1.8.4")
     log.info(f"Device ID: {DEVICE_ID_STR}")
     log.info(f"Unique ID: {UNIQUE_ID}")
     log.info(f"Log level: {LOG_LEVEL}")

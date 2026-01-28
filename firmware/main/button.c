@@ -188,11 +188,11 @@ void button_set_led_state(led_state_t state)
             break;
 
         case LED_STATE_TRANSMITTING:
-            set_led_rgb(0, 64, 0);     // Green when transmitting
+            set_led_rgb(0, 64, 64);    // Cyan when transmitting
             break;
 
         case LED_STATE_RECEIVING:
-            set_led_rgb(0, 0, 64);     // Blue when receiving
+            set_led_rgb(0, 64, 0);     // Green when receiving
             break;
 
         case LED_STATE_MUTED:
