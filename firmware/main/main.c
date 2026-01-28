@@ -25,6 +25,7 @@
 #include "settings.h"
 #include "webserver.h"
 #include "ha_mqtt.h"
+#include "diagnostics.h"
 
 static const char *TAG = "main";
 
@@ -242,6 +243,9 @@ static void on_config_received(const device_config_t *config)
  */
 void app_main(void)
 {
+    // Initialize diagnostics first to capture all logs
+    ESP_ERROR_CHECK(diagnostics_init());
+
     ESP_LOGI(TAG, "HA Intercom starting...");
     ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
 

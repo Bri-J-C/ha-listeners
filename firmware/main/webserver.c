@@ -6,6 +6,7 @@
 
 #include "webserver.h"
 #include "settings.h"
+#include "diagnostics.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
@@ -45,7 +46,8 @@ static const char *HTML_PAGE =
 "<strong>Room:</strong> %s<br>"
 "<strong>IP:</strong> %s<br>"
 "<strong>MQTT:</strong> %s<br>"
-"<strong>Version:</strong> 1.2.0 by guywithacomputer"
+"<strong>Version:</strong> 1.3.0 by guywithacomputer<br>"
+"<a href='/diagnostics'>View Diagnostics &amp; Logs</a>"
 "</div>"
 "<form action='/save' method='POST'>"
 "<h3>WiFi Settings</h3>"
@@ -88,6 +90,33 @@ static const char *HTML_OTA_OK =
 "<meta http-equiv='refresh' content='10;url=/'>"
 "<title>Update OK</title></head><body>"
 "<h1>Firmware Updated!</h1><p>Rebooting in 10 seconds...</p>"
+"</body></html>";
+
+static const char *HTML_DIAG_HEADER =
+"<!DOCTYPE html><html><head>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<meta http-equiv='refresh' content='5'>"
+"<title>Diagnostics</title>"
+"<style>"
+"body{font-family:sans-serif;max-width:800px;margin:20px auto;padding:0 10px;background:#f0f0f0;}"
+"h1{color:#333;font-size:24px;}"
+".card{background:white;padding:15px;border-radius:8px;margin:10px 0;box-shadow:0 2px 4px rgba(0,0,0,0.1);}"
+".stat{display:inline-block;margin:10px 20px 10px 0;}"
+".stat-value{font-size:24px;font-weight:bold;color:#007bff;}"
+".stat-label{font-size:12px;color:#666;}"
+".warn{color:#ffc107;}.error{color:#dc3545;}.ok{color:#28a745;}"
+"a{color:#007bff;}"
+".reset-reason{padding:8px 12px;border-radius:4px;display:inline-block;margin:5px 0;}"
+".reset-power{background:#e7f3ff;color:#0056b3;}"
+".reset-sw{background:#fff3cd;color:#856404;}"
+".reset-crash{background:#f8d7da;color:#721c24;}"
+".reset-wdt{background:#f8d7da;color:#721c24;}"
+"</style></head><body>"
+"<h1>Diagnostics</h1>"
+"<p><a href='/'>&#8592; Back to Settings</a></p>";
+
+static const char *HTML_DIAG_FOOTER =
+"<p style='color:#888;font-size:12px;'>Auto-refresh every 5 seconds</p>"
 "</body></html>";
 
 // Get IP address string
@@ -374,6 +403,92 @@ static esp_err_t ota_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// GET /diagnostics - system diagnostics page
+static esp_err_t diagnostics_handler(httpd_req_t *req)
+{
+    const char *reset_reason = diagnostics_get_reset_reason();
+    uint32_t uptime = diagnostics_get_uptime();
+    uint32_t heap = esp_get_free_heap_size();
+    uint32_t min_heap = esp_get_minimum_free_heap_size();
+
+    // Determine reset reason CSS class
+    const char *reset_class = "reset-power";
+    if (strstr(reset_reason, "Crash") || strstr(reset_reason, "Panic")) {
+        reset_class = "reset-crash";
+    } else if (strstr(reset_reason, "watchdog") || strstr(reset_reason, "Watchdog")) {
+        reset_class = "reset-wdt";
+    } else if (strstr(reset_reason, "Software") || strstr(reset_reason, "Brownout")) {
+        reset_class = "reset-sw";
+    }
+
+    // Get logs HTML
+    char *logs_html = diagnostics_get_logs_html();
+
+    // Calculate buffer size
+    size_t buf_size = 4096 + (logs_html ? strlen(logs_html) : 0);
+    char *html = malloc(buf_size);
+    if (!html) {
+        if (logs_html) free(logs_html);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Format uptime
+    uint32_t days = uptime / 86400;
+    uint32_t hours = (uptime % 86400) / 3600;
+    uint32_t mins = (uptime % 3600) / 60;
+    uint32_t secs = uptime % 60;
+
+    // Build page
+    int len = snprintf(html, buf_size,
+        "%s"
+        "<div class='card'>"
+        "<h3>System Status</h3>"
+        "<div class='stat'><div class='stat-value'>%lud %luh %lum %lus</div><div class='stat-label'>Uptime</div></div>"
+        "<div class='stat'><div class='stat-value'>%lu</div><div class='stat-label'>Free Heap (bytes)</div></div>"
+        "<div class='stat'><div class='stat-value'>%lu</div><div class='stat-label'>Min Heap (bytes)</div></div>"
+        "</div>"
+        "<div class='card'>"
+        "<h3>Last Reset</h3>"
+        "<span class='reset-reason %s'>%s</span>"
+        "</div>"
+        "<div class='card'>"
+        "<h3>Recent Logs</h3>"
+        "%s"
+        "</div>"
+        "%s",
+        HTML_DIAG_HEADER,
+        days, hours, mins, secs,
+        heap, min_heap,
+        reset_class, reset_reason,
+        logs_html ? logs_html : "<p>No logs available</p>",
+        HTML_DIAG_FOOTER);
+
+    if (logs_html) free(logs_html);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, len);
+    free(html);
+
+    return ESP_OK;
+}
+
+// GET /diagnostics/json - diagnostics as JSON
+static esp_err_t diagnostics_json_handler(httpd_req_t *req)
+{
+    char *json = diagnostics_get_json();
+    if (!json) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free(json);
+
+    return ESP_OK;
+}
+
 esp_err_t webserver_start(void)
 {
     if (server) {
@@ -396,11 +511,15 @@ esp_err_t webserver_start(void)
     httpd_uri_t save = {.uri = "/save", .method = HTTP_POST, .handler = save_handler};
     httpd_uri_t reset = {.uri = "/reset", .method = HTTP_POST, .handler = reset_handler};
     httpd_uri_t ota = {.uri = "/update", .method = HTTP_POST, .handler = ota_handler};
+    httpd_uri_t diag = {.uri = "/diagnostics", .method = HTTP_GET, .handler = diagnostics_handler};
+    httpd_uri_t diag_json = {.uri = "/diagnostics/json", .method = HTTP_GET, .handler = diagnostics_json_handler};
 
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &save);
     httpd_register_uri_handler(server, &reset);
     httpd_register_uri_handler(server, &ota);
+    httpd_register_uri_handler(server, &diag);
+    httpd_register_uri_handler(server, &diag_json);
 
     ESP_LOGI(TAG, "Web server started");
     return ESP_OK;

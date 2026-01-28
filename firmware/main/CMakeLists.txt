@@ -10,6 +10,7 @@ idf_component_register(
         "settings.c"
         "webserver.c"
         "ha_mqtt.c"
+        "diagnostics.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -18,6 +19,7 @@ idf_component_register(
         esp_netif
         nvs_flash
         esp_event
+        esp_timer
         lwip
         json
         esp_http_server
