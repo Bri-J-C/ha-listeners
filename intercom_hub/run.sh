@@ -22,6 +22,13 @@ else
   export PIPER_PORT="10200"
 fi
 
+# Log level
+if bashio::config.exists 'log_level'; then
+  export LOG_LEVEL=$(bashio::config 'log_level')
+else
+  export LOG_LEVEL="info"
+fi
+
 echo "Starting Intercom Hub..."
 echo "MQTT: ${MQTT_HOST}:${MQTT_PORT}"
 echo "Multicast: ${MULTICAST_GROUP}:${MULTICAST_PORT}"

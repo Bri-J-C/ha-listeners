@@ -161,92 +161,21 @@
         }
 
         .ptt-button {
-            width: 200px;
-            height: 200px;
-            border-radius: 50%;
-            border: 3px solid transparent;
-            background:
-                linear-gradient(var(--bg-dark), var(--bg-dark)) padding-box,
-                var(--gradient) border-box;
+            background: transparent;
+            border: none;
             cursor: pointer;
+            padding: 20px;
             display: flex;
-            flex-direction: column;
             align-items: center;
             justify-content: center;
             transition: all 0.2s ease;
             user-select: none;
             -webkit-user-select: none;
             touch-action: manipulation;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .ptt-button::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: var(--gradient);
-            opacity: 0.1;
-            border-radius: 50%;
-            transition: opacity 0.2s ease;
-        }
-
-        .ptt-button:hover::before {
-            opacity: 0.15;
         }
 
         .ptt-button:active, .ptt-button.active {
-            transform: scale(0.96);
-        }
-
-        .ptt-button:active::before, .ptt-button.active::before {
-            opacity: 0.2;
-        }
-
-        .ptt-button.transmitting {
-            border-color: var(--success);
-            box-shadow:
-                0 0 40px rgba(16, 185, 129, 0.4),
-                inset 0 0 40px rgba(16, 185, 129, 0.1);
-            animation: glow-green 1.5s ease-in-out infinite;
-        }
-
-        .ptt-button.transmitting::before {
-            background: var(--success);
-            opacity: 0.15;
-        }
-
-        @keyframes glow-green {
-            0%, 100% { box-shadow: 0 0 40px rgba(16, 185, 129, 0.4), inset 0 0 40px rgba(16, 185, 129, 0.1); }
-            50% { box-shadow: 0 0 60px rgba(16, 185, 129, 0.6), inset 0 0 60px rgba(16, 185, 129, 0.15); }
-        }
-
-        .ptt-button.receiving {
-            border-color: var(--cyan);
-            box-shadow:
-                0 0 40px rgba(0, 212, 255, 0.4),
-                inset 0 0 40px rgba(0, 212, 255, 0.1);
-            animation: glow-cyan 1.5s ease-in-out infinite;
-        }
-
-        .ptt-button.receiving::before {
-            background: var(--cyan);
-            opacity: 0.15;
-        }
-
-        @keyframes glow-cyan {
-            0%, 100% { box-shadow: 0 0 40px rgba(0, 212, 255, 0.4), inset 0 0 40px rgba(0, 212, 255, 0.1); }
-            50% { box-shadow: 0 0 60px rgba(0, 212, 255, 0.6), inset 0 0 60px rgba(0, 212, 255, 0.15); }
-        }
-
-        .ptt-button.busy {
-            border-color: var(--warning);
-            box-shadow: 0 0 30px rgba(245, 158, 11, 0.3);
-        }
-
-        .ptt-button.busy::before {
-            background: var(--warning);
-            opacity: 0.1;
+            transform: scale(0.92);
         }
 
         .ptt-button.disabled {
@@ -255,28 +184,41 @@
         }
 
         .ptt-icon {
-            font-size: 56px;
-            margin-bottom: 8px;
-            position: relative;
-            z-index: 1;
-        }
-
-        .ptt-text {
-            font-size: 13px;
-            font-weight: 700;
+            width: 140px;
+            height: 140px;
             color: var(--text-dim);
-            text-transform: uppercase;
-            letter-spacing: 2px;
-            position: relative;
-            z-index: 1;
+            transition: color 0.2s ease, transform 0.2s ease, filter 0.2s ease;
         }
 
-        .ptt-button.transmitting .ptt-text {
+        .ptt-button:hover .ptt-icon {
+            color: var(--text);
+        }
+
+        .ptt-button.transmitting .ptt-icon {
             color: var(--success);
+            filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.6));
+            animation: pulse-green 1.5s ease-in-out infinite;
         }
 
-        .ptt-button.receiving .ptt-text {
+        @keyframes pulse-green {
+            0%, 100% { filter: drop-shadow(0 0 20px rgba(16, 185, 129, 0.6)); }
+            50% { filter: drop-shadow(0 0 40px rgba(16, 185, 129, 0.8)); }
+        }
+
+        .ptt-button.receiving .ptt-icon {
             color: var(--cyan);
+            filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.6));
+            animation: pulse-cyan 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse-cyan {
+            0%, 100% { filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.6)); }
+            50% { filter: drop-shadow(0 0 40px rgba(0, 212, 255, 0.8)); }
+        }
+
+        .ptt-button.busy .ptt-icon {
+            color: var(--warning);
+            filter: drop-shadow(0 0 15px rgba(245, 158, 11, 0.5));
         }
 
         .instructions {
@@ -284,6 +226,13 @@
             color: var(--text-dim);
             font-size: 13px;
             line-height: 1.6;
+        }
+
+        .version {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.2);
+            font-size: 10px;
+            margin-top: 24px;
         }
 
         .error-banner {
@@ -397,10 +346,6 @@
     </div>
 
     <div class="container">
-        <div class="header">
-            <img src="icon.png" alt="" class="header-icon">
-            <h1>Intercom</h1>
-        </div>
 
         <div id="errorBanner" class="error-banner"></div>
 
@@ -427,8 +372,15 @@
 
         <div class="ptt-container">
             <button id="pttButton" class="ptt-button disabled">
-                <span class="ptt-icon">🎤</span>
-                <span class="ptt-text">Hold to Talk</span>
+                <svg class="ptt-icon" viewBox="0 0 512 512" fill="none">
+                    <rect x="32" y="32" width="448" height="448" rx="72" stroke="currentColor" stroke-width="48"/>
+                    <rect x="116" y="140" width="36" height="140" rx="18" fill="currentColor"/>
+                    <rect x="178" y="110" width="36" height="200" rx="18" fill="currentColor"/>
+                    <rect x="238" y="95" width="36" height="230" rx="18" fill="currentColor"/>
+                    <rect x="298" y="110" width="36" height="200" rx="18" fill="currentColor"/>
+                    <rect x="360" y="140" width="36" height="140" rx="18" fill="currentColor"/>
+                    <path d="M140 370 Q256 440 372 370" stroke="currentColor" stroke-width="32" stroke-linecap="round" fill="none"/>
+                </svg>
             </button>
         </div>
 
@@ -436,8 +388,10 @@
             Press and hold to transmit<br>
             Release to stop
         </p>
+
+        <p class="version">v1.8.3</p>
     </div>
 
-    <script src="ptt-v5.js"></script>
+    <script src="ptt-v6.js"></script>
 </body>
 </html>

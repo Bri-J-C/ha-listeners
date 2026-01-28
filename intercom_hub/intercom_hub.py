@@ -23,19 +23,35 @@ import threading
 import subprocess
 import time
 import asyncio
+import logging
 from pathlib import Path
 import paho.mqtt.client as mqtt
+
+# Setup logging
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'info').upper()
+LOG_LEVELS = {
+    'DEBUG': logging.DEBUG,
+    'INFO': logging.INFO,
+    'WARNING': logging.WARNING,
+    'ERROR': logging.ERROR
+}
+logging.basicConfig(
+    level=LOG_LEVELS.get(LOG_LEVEL, logging.INFO),
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger('intercom_hub')
 
 try:
     from aiohttp import web
 except ImportError:
-    print("aiohttp not available - web PTT disabled")
+    log.warning("aiohttp not available - web PTT disabled")
     web = None
 
 try:
     import opuslib
 except ImportError:
-    print("opuslib not available")
+    log.warning("opuslib not available")
     opuslib = None
 
 # Configuration from environment
@@ -102,7 +118,7 @@ channel_wait_timeout = 5.0  # max seconds to wait for channel before sending
 # Transmission lock - prevent concurrent transmissions
 tx_lock = threading.Lock()
 
-# Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.168.1.50"}}
+# Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.1.8.3.50"}}
 discovered_devices = {}
 
 # Web PTT state
@@ -166,7 +182,7 @@ def send_audio_packet(opus_data, target_ip=None):
             tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
     except Exception as e:
         mode = f"unicast to {target_ip}" if target_ip else "multicast"
-        print(f"Error sending {mode}: {e}")
+        log.error(f"sending {mode}: {e}")
 
 
 def get_target_ip():
@@ -182,7 +198,7 @@ def get_target_ip():
             return info.get("ip")
 
     # Target not found, fall back to multicast
-    print(f"Warning: Target '{current_target}' not found, using multicast")
+    log.warning(f"Target '{current_target}' not found, using multicast")
     return None
 
 
@@ -215,17 +231,17 @@ def wait_for_channel(timeout=None):
     if not is_channel_busy():
         return True
 
-    print("Channel busy - waiting for it to be free...")
+    log.debug("Channel busy - waiting for it to be free...")
     start = time.time()
 
     while time.time() - start < timeout:
         if not is_channel_busy():
             waited = time.time() - start
-            print(f"Channel free after {waited:.1f}s")
+            log.debug(f"Channel free after {waited:.1f}s")
             return True
         time.sleep(0.1)
 
-    print(f"Channel busy timeout ({timeout}s) - sending anyway")
+    log.warning(f"Channel busy timeout ({timeout}s) - sending anyway")
     return False
 
 
@@ -233,16 +249,16 @@ def receive_thread():
     """Thread to receive multicast audio from ESP32 devices."""
     global current_state, last_rx_time, rx_socket
 
-    print("Receive thread started")
+    log.debug("Receive thread started")
 
     # Create Opus decoder for forwarding to web clients
     rx_decoder = None
     if opuslib:
         try:
             rx_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
-            print("RX decoder created for web client forwarding")
+            log.debug("RX decoder created for web client forwarding")
         except Exception as e:
-            print(f"Failed to create RX decoder: {e}")
+            log.error(f"Failed to create RX decoder: {e}")
 
     while True:
         try:
@@ -266,7 +282,7 @@ def receive_thread():
             if current_state != "receiving" and current_state != "transmitting":
                 current_state = "receiving"
                 publish_state()
-                print(f"Receiving audio from {sender_id_str}")
+                log.debug(f"Receiving audio from {sender_id_str}")
 
             last_rx_time = now
 
@@ -285,15 +301,15 @@ def receive_thread():
                 if time.time() - last_rx_time > rx_timeout:
                     current_state = "idle"
                     publish_state()
-                    print("Receive ended, back to idle")
+                    log.debug("Receive ended, back to idle")
         except Exception as e:
-            print(f"RX error: {e}")
+            log.error(f"RX error: {e}")
             time.sleep(0.1)
 
 
 def text_to_speech(text):
     """Convert text to PCM audio using Wyoming/Piper TTS."""
-    print(f"TTS: {text}")
+    log.info(f"TTS: {text}")
 
     try:
         import asyncio
@@ -334,10 +350,10 @@ def text_to_speech(text):
         audio_data, sample_rate = asyncio.run(do_tts())
 
         if len(audio_data) == 0:
-            print("No audio data received from TTS")
+            log.warning("No audio data received from TTS")
             return None
 
-        print(f"TTS complete: {len(audio_data)} bytes at {sample_rate}Hz")
+        log.debug(f"TTS complete: {len(audio_data)} bytes at {sample_rate}Hz")
 
         # Convert to our target format (16kHz mono 16-bit)
         if sample_rate != SAMPLE_RATE:
@@ -352,16 +368,16 @@ def text_to_speech(text):
             if result.returncode == 0:
                 return result.stdout
             else:
-                print(f"Resample error: {result.stderr.decode()}")
+                log.error(f"Resample error: {result.stderr.decode()}")
                 return audio_data
 
         return audio_data
 
     except ConnectionRefusedError:
-        print(f"TTS connection refused - is Piper running at {PIPER_HOST}:{PIPER_PORT}?")
+        log.warning(f"TTS connection refused - is Piper running at {PIPER_HOST}:{PIPER_PORT}?")
         return None
     except Exception as e:
-        print(f"TTS error: {e}")
+        log.error(f"TTS error: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -369,7 +385,7 @@ def text_to_speech(text):
 
 def fetch_and_convert_audio(url):
     """Fetch audio from URL and convert to 16kHz mono PCM."""
-    print(f"Fetching audio: {url}")
+    log.info(f"Fetching audio: {url}")
 
     try:
         # Use ffmpeg to fetch and convert in one step
@@ -386,16 +402,16 @@ def fetch_and_convert_audio(url):
         result = subprocess.run(cmd, capture_output=True, timeout=30)
 
         if result.returncode != 0:
-            print(f"ffmpeg error: {result.stderr.decode()}")
+            log.error(f"ffmpeg error: {result.stderr.decode()}")
             return None
 
         return result.stdout
 
     except subprocess.TimeoutExpired:
-        print("Audio fetch timeout")
+        log.warning("Audio fetch timeout")
         return None
     except Exception as e:
-        print(f"Error fetching audio: {e}")
+        log.error(f"fetching audio: {e}")
         return None
 
 
@@ -413,7 +429,7 @@ def encode_and_broadcast(pcm_data):
 
     # Prevent concurrent transmissions
     if not tx_lock.acquire(blocking=False):
-        print("Warning: Transmission already in progress, skipping")
+        log.warning("Transmission already in progress, skipping")
         return
 
     try:
@@ -426,7 +442,7 @@ def encode_and_broadcast(pcm_data):
 
         frame_bytes = FRAME_SIZE * 2  # 16-bit samples = 640 bytes per frame
         audio_frames = len(pcm_data) // frame_bytes
-        print(f"Encoding {audio_frames} frames of audio...")
+        log.debug(f"Encoding {audio_frames} frames of audio...")
 
         # === PHASE 1: PRE-ENCODE ALL FRAMES ===
         # This separates encoding time from transmission timing
@@ -456,7 +472,7 @@ def encode_and_broadcast(pcm_data):
             encoded_frames.append(silence_opus)
 
         # === PHASE 2: SEND WITH PRECISE TIMING ===
-        print(f"Sending {len(encoded_frames)} frames {target_desc}...")
+        log.debug(f"Sending {len(encoded_frames)} frames {target_desc}...")
         current_state = "transmitting"
         publish_state()
 
@@ -484,10 +500,10 @@ def encode_and_broadcast(pcm_data):
         elapsed = time.monotonic() - start_time
         expected = len(encoded_frames) * frame_interval
         drift_ms = (elapsed - expected) * 1000
-        print(f"Send complete: {len(encoded_frames)} frames in {elapsed:.2f}s (drift: {drift_ms:+.1f}ms)")
+        log.debug(f"Send complete: {len(encoded_frames)} frames in {elapsed:.2f}s (drift: {drift_ms:+.1f}ms)")
 
     except Exception as e:
-        print(f"Error encoding/sending audio: {e}")
+        log.error(f"encoding/sending audio: {e}")
         import traceback
         traceback.print_exc()
 
@@ -535,7 +551,7 @@ def publish_discovery():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.6.5.6"
+        "sw_version": "1.8.3"
     }
 
     # Notify entity - send text (TTS) or URL to broadcast
@@ -625,7 +641,7 @@ def publish_discovery():
     # Target room select - will be updated when devices are discovered
     update_target_select_options()
 
-    print("Published HA discovery configs")
+    log.info("Published HA discovery configs")
 
 
 def publish_state():
@@ -650,7 +666,7 @@ def notify_web_clients_state():
             web_event_loop
         )
     except Exception as e:
-        print(f"Error notifying web clients: {e}")
+        log.error(f"notifying web clients: {e}")
 
 
 def forward_audio_to_web_clients(pcm_data):
@@ -666,7 +682,7 @@ def forward_audio_to_web_clients(pcm_data):
             web_event_loop
         )
     except Exception as e:
-        print(f"Error forwarding audio to web clients: {e}")
+        log.error(f"forwarding audio to web clients: {e}")
 
 
 def publish_volume():
@@ -706,7 +722,7 @@ def update_target_select_options():
         "name": DEVICE_NAME,
         "model": "Intercom Hub",
         "manufacturer": "guywithacomputer",
-        "sw_version": "1.6.5.6"
+        "sw_version": "1.8.3"
     }
 
     options = get_target_options()
@@ -740,7 +756,7 @@ def update_target_select_options():
 
 def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     """Handle MQTT connection."""
-    print(f"Connected to MQTT broker (rc={reason_code})")
+    log.info(f"Connected to MQTT broker (rc={reason_code})")
 
     # Subscribe to command topics
     client.subscribe(VOLUME_CMD_TOPIC)
@@ -750,7 +766,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
 
     # Subscribe to device info for discovery
     client.subscribe(DEVICE_INFO_TOPIC)
-    print(f"Subscribed to device discovery: {DEVICE_INFO_TOPIC}")
+    log.info(f"Subscribed to device discovery: {DEVICE_INFO_TOPIC}")
 
     # Publish discovery
     publish_discovery()
@@ -774,7 +790,7 @@ def on_mqtt_message(client, userdata, msg):
 
     # Don't log device info spam
     if not topic.startswith("intercom/devices/"):
-        print(f"MQTT: {topic} = {payload}")
+        log.debug(f"MQTT: {topic} = {payload}")
 
     if topic == VOLUME_CMD_TOPIC:
         try:
@@ -792,7 +808,7 @@ def on_mqtt_message(client, userdata, msg):
         # Target room selection
         current_target = payload
         publish_target()
-        print(f"Target set to: {current_target}")
+        log.info(f"Target set to: {current_target}")
 
     elif topic.startswith("intercom/devices/") and topic.endswith("/info"):
         # Device info from ESP32 intercoms
@@ -808,7 +824,7 @@ def on_mqtt_message(client, userdata, msg):
 
                 # If new device, update the select options
                 if device_id not in old_devices:
-                    print(f"Discovered device: {room} ({device_id}) at {ip}")
+                    log.info(f"Discovered device: {room} ({device_id}) at {ip}")
                     update_target_select_options()
 
         except json.JSONDecodeError:
@@ -833,7 +849,7 @@ def on_mqtt_message(client, userdata, msg):
 
 def on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
     """Handle MQTT disconnection."""
-    print(f"Disconnected from MQTT (rc={reason_code})")
+    log.warning(f"Disconnected from MQTT (rc={reason_code})")
 
 
 # =============================================================================
@@ -844,13 +860,13 @@ async def websocket_handler(request):
     """Handle WebSocket connections for web PTT."""
     global web_ptt_active, web_ptt_encoder, current_state
 
-    print(f"WebSocket connection request from {request.remote}")
+    log.debug(f"WebSocket connection request from {request.remote}")
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    print(f"WebSocket prepared for {request.remote}")
+    log.debug(f"WebSocket prepared for {request.remote}")
 
     web_clients.add(ws)
-    print(f"Web PTT client connected ({len(web_clients)} total)")
+    log.info(f"Web PTT client connected ({len(web_clients)} total)")
 
     # Create encoder for this session if needed
     if opuslib and web_ptt_encoder is None:
@@ -935,7 +951,7 @@ async def websocket_handler(request):
 
                             current_state = "transmitting"
                             publish_state()
-                            print(f"Web PTT started -> {target_room}")
+                            log.info(f"Web PTT started -> {target_room}")
 
                             # Notify all web clients
                             await broadcast_to_web_clients({
@@ -960,7 +976,7 @@ async def websocket_handler(request):
                             web_ptt_encoder = None
                             current_state = "idle"
                             publish_state()
-                            print(f"Web PTT stopped ({frame_count} frames)")
+                            log.debug(f"Web PTT stopped ({frame_count} frames)")
 
                             # Gap for ESP32 jitter buffer to drain before next TX
                             await asyncio.sleep(0.75)
@@ -993,10 +1009,10 @@ async def websocket_handler(request):
                     pass
 
             elif msg.type == web.WSMsgType.ERROR:
-                print(f"WebSocket error: {ws.exception()}")
+                log.error(f"WebSocket error: {ws.exception()}")
 
     except Exception as e:
-        print(f"WebSocket handler error: {e}")
+        log.error(f"WebSocket handler error: {e}")
 
     finally:
         # Clean up on disconnect
@@ -1010,7 +1026,7 @@ async def websocket_handler(request):
             web_tx_lock.release()
 
         web_clients.discard(ws)
-        print(f"Web PTT client disconnected ({len(web_clients)} remaining)")
+        log.info(f"Web PTT client disconnected ({len(web_clients)} remaining)")
 
     return ws
 
@@ -1044,7 +1060,7 @@ async def broadcast_audio_to_web_clients(pcm_data):
 
 async def index_handler(request):
     """Serve the main PTT page."""
-    print(f"Index request: {request.path}")
+    log.debug(f"Index request: {request.path}")
     return web.FileResponse(WWW_PATH / 'index.html')
 
 
@@ -1052,12 +1068,12 @@ async def static_handler(request):
     """Serve static files."""
     filename = request.match_info.get('filename', 'index.html')
     filepath = WWW_PATH / filename
-    print(f"Static request: {request.path} -> {filepath}")
+    log.debug(f"Static request: {request.path} -> {filepath}")
 
     if filepath.exists() and filepath.is_file():
         return web.FileResponse(filepath)
     else:
-        print(f"File not found: {filepath}")
+        log.warning(f"File not found: {filepath}")
         raise web.HTTPNotFound()
 
 
@@ -1080,7 +1096,7 @@ async def run_web_server():
     global web_event_loop, web_tx_lock
 
     if web is None:
-        print("Web server not available (aiohttp not installed)")
+        log.warning("Web server not available (aiohttp not installed)")
         return
 
     # Store reference to event loop for thread-safe callbacks
@@ -1096,7 +1112,7 @@ async def run_web_server():
     site = web.TCPSite(runner, '0.0.0.0', INGRESS_PORT)
     await site.start()
 
-    print(f"Web PTT server running on port {INGRESS_PORT}")
+    log.info(f"Web PTT server running on port {INGRESS_PORT}")
 
     # Keep running
     while True:
@@ -1111,18 +1127,19 @@ def run_mqtt_loop():
 def main():
     global mqtt_client, tx_socket, rx_socket
 
-    print("=" * 50)
-    print("Intercom Hub v1.6.5.6")
-    print(f"Device ID: {DEVICE_ID_STR}")
-    print(f"Unique ID: {UNIQUE_ID}")
-    print("=" * 50)
+    log.info("=" * 50)
+    log.info("Intercom Hub v1.8.3")
+    log.info(f"Device ID: {DEVICE_ID_STR}")
+    log.info(f"Unique ID: {UNIQUE_ID}")
+    log.info(f"Log level: {LOG_LEVEL}")
+    log.info("=" * 50)
 
     # Create multicast sockets
     tx_socket = create_tx_socket()
-    print(f"TX socket ready: {MULTICAST_GROUP}:{MULTICAST_PORT}")
+    log.info(f"TX socket ready: {MULTICAST_GROUP}:{MULTICAST_PORT}")
 
     rx_socket = create_rx_socket()
-    print(f"RX socket ready (joined multicast group)")
+    log.info(f"RX socket ready (joined multicast group)")
 
     # Start receive thread
     rx_thread = threading.Thread(target=receive_thread, daemon=True)
@@ -1141,12 +1158,12 @@ def main():
     mqtt_client.on_message = on_mqtt_message
     mqtt_client.on_disconnect = on_mqtt_disconnect
 
-    print(f"Connecting to MQTT: {MQTT_HOST}:{MQTT_PORT}")
+    log.info(f"Connecting to MQTT: {MQTT_HOST}:{MQTT_PORT}")
 
     try:
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
     except Exception as e:
-        print(f"Failed to connect to MQTT: {e}")
+        log.error(f"Failed to connect to MQTT: {e}")
         sys.exit(1)
 
     # Start MQTT loop in background thread
@@ -1154,12 +1171,12 @@ def main():
     mqtt_thread.start()
 
     # Run web server in main thread (for ingress panel)
-    print("Intercom Hub running...")
+    log.info("Intercom Hub running...")
     if web is not None:
         try:
             asyncio.run(run_web_server())
         except KeyboardInterrupt:
-            print("Shutting down...")
+            log.info("Shutting down...")
     else:
         # Fallback if aiohttp not available - just run MQTT
         mqtt_client.loop_forever()

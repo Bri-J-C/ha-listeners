@@ -4,8 +4,8 @@
  * Connects to the Intercom Hub add-on via WebSocket and provides
  * push-to-talk functionality from any web browser.
  *
- * Mic is only acquired when PTT is pressed and released when PTT is released.
- * This prevents holding the mic when the app is backgrounded.
+ * Mic is acquired on init, released when app is backgrounded,
+ * and re-acquired when app returns to foreground.
  */
 
 class IntercomPTT {
@@ -20,7 +20,7 @@ class IntercomPTT {
         this.isTransmitting = false;
         this.isReceiving = false;
         this.isInitialized = false;
-        this.workletReady = false;
+        this.micEnabled = false;
 
         // Audio playback
         this.nextPlayTime = 0;
@@ -37,22 +37,25 @@ class IntercomPTT {
         // Bind event handlers
         this.initButton.addEventListener('click', () => this.initialize());
 
-        // PTT button - support both mouse and touch
-        this.pttButton.addEventListener('mousedown', (e) => this.startTransmit(e));
-        this.pttButton.addEventListener('mouseup', (e) => this.stopTransmit(e));
-        this.pttButton.addEventListener('mouseleave', (e) => this.stopTransmit(e));
-
-        this.pttButton.addEventListener('touchstart', (e) => {
+        // PTT button - use pointer events for unified touch/mouse handling
+        this.pttButton.addEventListener('pointerdown', (e) => {
             e.preventDefault();
+            this.pttButton.setPointerCapture(e.pointerId);
             this.startTransmit(e);
         });
-        this.pttButton.addEventListener('touchend', (e) => {
+        this.pttButton.addEventListener('pointerup', (e) => {
             e.preventDefault();
             this.stopTransmit(e);
         });
-        this.pttButton.addEventListener('touchcancel', (e) => {
+        this.pttButton.addEventListener('pointercancel', (e) => {
             e.preventDefault();
             this.stopTransmit(e);
+        });
+        this.pttButton.addEventListener('pointerleave', (e) => {
+            // Only stop if we don't have capture (prevents stopping when finger moves)
+            if (!this.pttButton.hasPointerCapture(e.pointerId)) {
+                this.stopTransmit(e);
+            }
         });
 
         // Target selection
@@ -72,7 +75,7 @@ class IntercomPTT {
             }
         });
 
-        // Suspend audio/websocket when app is backgrounded
+        // Suspend audio/websocket/mic when app is backgrounded
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 this.suspend();
@@ -108,19 +111,17 @@ class IntercomPTT {
 
     async initialize() {
         try {
-            // Create audio context for playback only (16kHz to match protocol)
-            this.audioContext = new AudioContext({ sampleRate: 16000 });
-
-            // Pre-load the worklet module so it's ready when PTT is pressed
-            await this.audioContext.audioWorklet.addModule('ptt-processor.js');
-            this.workletReady = true;
-
             // Check if we're in a secure context (HTTPS or localhost)
-            this.micEnabled = window.isSecureContext;
-
-            if (!this.micEnabled) {
+            if (!window.isSecureContext) {
                 console.warn('Microphone requires HTTPS. Receive-only mode.');
                 this.showError('Microphone requires HTTPS. You can listen but not talk.');
+                this.micEnabled = false;
+
+                // Create audio context for playback only
+                this.audioContext = new AudioContext({ sampleRate: 16000 });
+            } else {
+                // Acquire microphone and set up audio
+                await this.setupMic();
             }
 
             // Hide init overlay
@@ -132,22 +133,82 @@ class IntercomPTT {
 
         } catch (error) {
             console.error('Initialization error:', error);
-            this.showError('Failed to initialize: ' + error.message);
+            if (error.name === 'NotAllowedError') {
+                this.showError('Microphone permission denied. Please allow access and reload.');
+            } else if (error.name === 'NotFoundError') {
+                this.showError('No microphone found. Please connect a microphone.');
+            } else {
+                this.showError('Failed to initialize: ' + error.message);
+            }
 
             // Still try to connect for receive-only
             this.initOverlay.classList.add('hidden');
             this.isInitialized = true;
             this.micEnabled = false;
+            this.audioContext = new AudioContext({ sampleRate: 16000 });
             this.connectWebSocket();
         }
+    }
+
+    async setupMic() {
+        // Request microphone
+        this.mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                sampleRate: 16000,
+                channelCount: 1
+            }
+        });
+
+        // Create audio context (16kHz to match protocol)
+        this.audioContext = new AudioContext({ sampleRate: 16000 });
+
+        // Load AudioWorklet
+        await this.audioContext.audioWorklet.addModule('ptt-processor.js');
+
+        // Create worklet node
+        this.workletNode = new AudioWorkletNode(this.audioContext, 'ptt-processor');
+
+        // Handle audio frames from worklet
+        this.workletNode.port.onmessage = (event) => {
+            if (event.data.type === 'audio' && this.isConnected && this.isTransmitting) {
+                this.sendAudio(event.data.pcm);
+            }
+        };
+
+        // Connect microphone to worklet
+        this.mediaSource = this.audioContext.createMediaStreamSource(this.mediaStream);
+        this.mediaSource.connect(this.workletNode);
+
+        this.micEnabled = true;
+    }
+
+    releaseMic() {
+        // Disconnect worklet
+        if (this.mediaSource) {
+            this.mediaSource.disconnect();
+            this.mediaSource = null;
+        }
+        if (this.workletNode) {
+            this.workletNode.disconnect();
+            this.workletNode = null;
+        }
+
+        // Stop all mic tracks - this releases the mic
+        if (this.mediaStream) {
+            this.mediaStream.getTracks().forEach(track => track.stop());
+            this.mediaStream = null;
+        }
+
+        this.micEnabled = false;
     }
 
     connectWebSocket() {
         // Determine WebSocket URL - use relative path for ingress compatibility
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        // Get the base path (ingress adds a prefix like /api/hassio_ingress/<token>/)
         const basePath = window.location.pathname.replace(/\/$/, '');
-        // Use /ws to avoid conflict with HA's /api/websocket endpoint
         const wsUrl = `${protocol}//${window.location.host}${basePath}/ws`;
 
         console.log('Connecting to WebSocket:', wsUrl);
@@ -175,8 +236,10 @@ class IntercomPTT {
             this.pttButton.classList.add('disabled');
             this.updateStatus('idle');
 
-            // Reconnect after delay
-            setTimeout(() => this.connectWebSocket(), 3000);
+            // Reconnect after delay (only if initialized and not hidden)
+            if (this.isInitialized && !document.hidden) {
+                setTimeout(() => this.connectWebSocket(), 3000);
+            }
         };
 
         this.websocket.onerror = (error) => {
@@ -236,12 +299,13 @@ class IntercomPTT {
         }
     }
 
-    async startTransmit(event) {
+    startTransmit(event) {
+        console.log('startTransmit called, isConnected:', this.isConnected, 'isTransmitting:', this.isTransmitting);
         if (!this.isConnected || this.isTransmitting) return;
 
         // Check if mic is available
         if (!this.micEnabled) {
-            this.showError('Microphone requires HTTPS connection.');
+            this.showError('Microphone not available.');
             return;
         }
 
@@ -251,68 +315,38 @@ class IntercomPTT {
             return;
         }
 
-        try {
-            // Acquire microphone NOW
-            this.mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: 16000,
-                    channelCount: 1
-                }
-            });
+        this.isTransmitting = true;
+        this.pttButton.classList.add('active', 'transmitting');
+        this.updateStatus('transmitting');
+        console.log('PTT started');
 
-            // Resume audio context if suspended
-            if (this.audioContext.state === 'suspended') {
-                await this.audioContext.resume();
-            }
-
-            // Create worklet node
-            this.workletNode = new AudioWorkletNode(this.audioContext, 'ptt-processor');
-
-            // Handle audio frames from worklet
-            this.workletNode.port.onmessage = (event) => {
-                if (event.data.type === 'audio' && this.isConnected && this.isTransmitting) {
-                    this.sendAudio(event.data.pcm);
-                }
-            };
-
-            // Connect microphone to worklet
-            this.mediaSource = this.audioContext.createMediaStreamSource(this.mediaStream);
-            this.mediaSource.connect(this.workletNode);
-
-            this.isTransmitting = true;
-            this.pttButton.classList.add('active', 'transmitting');
-            this.updateStatus('transmitting');
-
-            // Tell worklet to start capturing
+        // Tell worklet to start capturing
+        if (this.workletNode) {
             this.workletNode.port.postMessage({ type: 'ptt', active: true });
+        }
 
-            // Tell server we're transmitting
-            if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-                this.websocket.send(JSON.stringify({
-                    type: 'ptt_start',
-                    target: this.targetSelect.value
-                }));
-            }
-
-        } catch (error) {
-            console.error('Failed to start transmit:', error);
-            this.showError('Microphone error: ' + error.message);
-            this.releaseMic();
+        // Tell server we're transmitting
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+            this.websocket.send(JSON.stringify({
+                type: 'ptt_start',
+                target: this.targetSelect.value
+            }));
         }
     }
 
     stopTransmit(event) {
+        console.log('stopTransmit called, isTransmitting:', this.isTransmitting);
+
+        // Always clean up UI state
+        this.pttButton.classList.remove('active', 'transmitting', 'busy');
+
         if (!this.isTransmitting) {
-            this.pttButton.classList.remove('busy');
             return;
         }
 
         this.isTransmitting = false;
-        this.pttButton.classList.remove('active', 'transmitting', 'busy');
         this.updateStatus('idle');
+        console.log('PTT stopped');
 
         // Tell worklet to stop capturing
         if (this.workletNode) {
@@ -322,27 +356,6 @@ class IntercomPTT {
         // Tell server we stopped
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
             this.websocket.send(JSON.stringify({ type: 'ptt_stop' }));
-        }
-
-        // Release microphone immediately
-        this.releaseMic();
-    }
-
-    releaseMic() {
-        // Disconnect and clean up worklet
-        if (this.mediaSource) {
-            this.mediaSource.disconnect();
-            this.mediaSource = null;
-        }
-        if (this.workletNode) {
-            this.workletNode.disconnect();
-            this.workletNode = null;
-        }
-
-        // Stop all mic tracks - this releases the mic
-        if (this.mediaStream) {
-            this.mediaStream.getTracks().forEach(track => track.stop());
-            this.mediaStream = null;
         }
     }
 
@@ -400,10 +413,13 @@ class IntercomPTT {
 
         console.log('Suspending - app backgrounded');
 
-        // Stop any active transmission and release mic
+        // Stop any active transmission
         if (this.isTransmitting) {
             this.stopTransmit();
         }
+
+        // Release microphone
+        this.releaseMic();
 
         // Close WebSocket to stop receiving audio
         if (this.websocket) {
@@ -413,9 +429,10 @@ class IntercomPTT {
         }
         this.isConnected = false;
 
-        // Suspend audio context (stops playback)
-        if (this.audioContext && this.audioContext.state === 'running') {
-            this.audioContext.suspend();
+        // Close audio context completely
+        if (this.audioContext) {
+            this.audioContext.close();
+            this.audioContext = null;
         }
 
         // Update UI
@@ -424,18 +441,28 @@ class IntercomPTT {
         this.pttButton.classList.add('disabled');
     }
 
-    resume() {
+    async resume() {
         if (!this.isInitialized) return;
 
         console.log('Resuming - app foregrounded');
 
-        // Resume audio context
-        if (this.audioContext && this.audioContext.state === 'suspended') {
-            this.audioContext.resume();
-        }
+        try {
+            // Re-setup microphone and audio context
+            if (window.isSecureContext) {
+                await this.setupMic();
+            } else {
+                this.audioContext = new AudioContext({ sampleRate: 16000 });
+            }
 
-        // Reconnect WebSocket if not connected
-        if (!this.websocket || this.websocket.readyState !== WebSocket.OPEN) {
+            // Reconnect WebSocket
+            this.connectWebSocket();
+
+        } catch (error) {
+            console.error('Resume error:', error);
+            this.showError('Failed to resume: ' + error.message);
+
+            // Try to at least connect for receive-only
+            this.audioContext = new AudioContext({ sampleRate: 16000 });
             this.connectWebSocket();
         }
     }
