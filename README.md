@@ -30,37 +30,37 @@ ESP32-S3-based multi-room intercom system with Home Assistant integration.
 
 ```mermaid
 graph TB
-    subgraph HA["Home Assistant (10.0.0.8)"]
-        MQTT["MQTT Broker\n(port 1883)"]
+    subgraph HA["Home Assistant"]
+        MQTT["MQTT Broker<br/>(Mosquitto)"]
         subgraph HUB["Intercom Hub Add-on (Python)"]
-            HUB_MQTT["MQTT Client\nauto-discovery · state sync\nvolume · mute · targeting"]
-            HUB_WS["WebSocket Server\naudio + control\nclient ID tracking"]
-            HUB_ROUTE["Audio Router\nESP32↔ESP32\nESP32↔Web · Web↔Web\nTTS→all"]
-            HUB_TTS["TTS Bridge\nPiper · channel-busy wait"]
-            HUB_CARD["Lovelace PTT Card\nintercom-ptt-card.js"]
+            HUB_MQTT["MQTT Client<br/>auto-discovery · state sync<br/>volume · mute · targeting"]
+            HUB_WS["WebSocket Server<br/>audio + control<br/>client ID tracking"]
+            HUB_ROUTE["Audio Router<br/>ESP32↔ESP32<br/>ESP32↔Web · Web↔Web<br/>TTS→all"]
+            HUB_TTS["TTS Bridge<br/>Piper · channel-busy wait"]
+            HUB_CARD["Lovelace PTT Card<br/>intercom-ptt-card.js"]
         end
         MQTT <-->|"subscribe/publish"| HUB_MQTT
     end
 
     subgraph ESP_NODES["ESP32-S3 Room Nodes"]
-        ESP1["Kitchen\nESP32-S3\n[OLED · LED]"]
-        ESP2["Bedroom\nESP32-S3\n[OLED · LED]"]
-        ESP3["Office\nESP32-S3\n[OLED · LED]"]
+        ESP1["Room A<br/>ESP32-S3<br/>[OLED · LED]"]
+        ESP2["Room B<br/>ESP32-S3<br/>[OLED · LED]"]
+        ESP3["Room C<br/>ESP32-S3<br/>[OLED · LED]"]
     end
 
     subgraph WEB_CLIENTS["Browser Clients"]
-        WC1["Web PTT\n(desktop)"]
-        WC2["Web PTT\n(mobile browser)"]
+        WC1["Web PTT<br/>(desktop)"]
+        WC2["Web PTT<br/>(mobile browser)"]
     end
 
-    MOB["Mobile Devices\n(HA Companion)\nnotification-only"]
+    MOB["Mobile Devices<br/>(HA Companion)<br/>notification-only"]
 
-    HUB_MQTT <-->|"MQTT\ndiscovery · commands\nstate · LWT"| ESP_NODES
-    HUB_WS <-->|"WebSocket\nbinary PCM + JSON"| WEB_CLIENTS
+    HUB_MQTT <-->|"MQTT<br/>discovery · commands<br/>state · LWT"| ESP_NODES
+    HUB_WS <-->|"WebSocket<br/>binary PCM + JSON"| WEB_CLIENTS
     HUB_MQTT -->|"push notification"| MOB
 
-    ESP_NODES <-->|"UDP Audio\nmulticast 224.0.0.100:5005\nor unicast :5005"| ESP_NODES
-    HUB_ROUTE <-->|"UDP Audio\nmulticast / unicast :5005"| ESP_NODES
+    ESP_NODES <-->|"UDP Audio<br/>multicast · unicast<br/>port 5005"| ESP_NODES
+    HUB_ROUTE <-->|"UDP Audio<br/>multicast / unicast :5005"| ESP_NODES
 ```
 
 ### ESP32 Audio Flow
@@ -69,25 +69,25 @@ graph TB
 flowchart LR
     subgraph TX["TX Path (Transmit)"]
         direction LR
-        MIC["INMP441\nMEMS Mic"]
-        I2S_IN["I2S Bus 0\nSCK=4 WS=5 SD=6"]
-        CONV["32→16 bit\nconversion"]
-        AGC_B["AGC\n(gain control)"]
-        AEC_B["AEC\n(echo cancel)"]
-        ENC["Opus Encoder\n32kbps VBR\n16kHz · 20ms frames\n(internal RAM)"]
-        UDP_TX["UDP TX\nmulticast or unicast\nport 5005"]
+        MIC["INMP441<br/>MEMS Mic"]
+        I2S_IN["I2S Bus 0"]
+        CONV["32→16 bit"]
+        AGC_B["AGC"]
+        AEC_B["AEC"]
+        ENC["Opus Encoder<br/>32kbps VBR<br/>(internal RAM)"]
+        UDP_TX["UDP TX<br/>port 5005"]
 
         MIC --> I2S_IN --> CONV --> AGC_B --> AEC_B --> ENC --> UDP_TX
     end
 
     subgraph RX["RX Path (Receive)"]
         direction LR
-        UDP_RX["UDP RX\nport 5005"]
-        DEC["Opus Decoder\nPLC + FEC\n(PSRAM)"]
-        VOL["Volume · Mute\nscaling"]
-        STEREO["Mono → Stereo\nconversion"]
-        I2S_OUT["I2S Bus 1\nSCK=15 WS=16 SD=17"]
-        SPK["MAX98357A\nAmp + Speaker"]
+        UDP_RX["UDP RX<br/>port 5005"]
+        DEC["Opus Decoder<br/>PLC + FEC<br/>(PSRAM)"]
+        VOL["Volume<br/>Mute"]
+        STEREO["Mono→Stereo"]
+        I2S_OUT["I2S Bus 1"]
+        SPK["MAX98357A<br/>Speaker"]
 
         UDP_RX --> DEC --> VOL --> STEREO --> I2S_OUT --> SPK
     end
