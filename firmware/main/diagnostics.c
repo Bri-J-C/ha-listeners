@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 
 #include "diagnostics.h"
+#include "network.h"
 
 static const char *TAG = "diag";
 
@@ -181,13 +182,17 @@ char* diagnostics_get_logs_html(void)
 
 char* diagnostics_get_json(void)
 {
-    size_t buf_size = 512;
+    size_t buf_size = 640;
     char *json = malloc(buf_size);
     if (!json) return NULL;
 
     uint32_t uptime = diagnostics_get_uptime();
     uint32_t heap = esp_get_free_heap_size();
     uint32_t min_heap = esp_get_minimum_free_heap_size();
+
+    uint32_t tx_sent = 0, tx_failed = 0;
+    int tx_errno = 0;
+    network_get_tx_stats(&tx_sent, &tx_failed, &tx_errno);
 
     snprintf(json, buf_size,
         "{"
@@ -196,14 +201,20 @@ char* diagnostics_get_json(void)
         "\"uptime_formatted\":\"%lud %luh %lum %lus\","
         "\"free_heap\":%lu,"
         "\"min_heap\":%lu,"
-        "\"heap_usage_percent\":%.1f"
+        "\"heap_usage_percent\":%.1f,"
+        "\"tx_packets_sent\":%lu,"
+        "\"tx_packets_failed\":%lu,"
+        "\"tx_last_errno\":%d"
         "}",
         diagnostics_get_reset_reason(),
         uptime,
         uptime / 86400, (uptime % 86400) / 3600, (uptime % 3600) / 60, uptime % 60,
         heap,
         min_heap,
-        100.0 - (min_heap * 100.0 / 320000.0)  // Approximate total heap
+        100.0 - (min_heap * 100.0 / 320000.0),  // Approximate total heap
+        tx_sent,
+        tx_failed,
+        tx_errno
     );
 
     return json;

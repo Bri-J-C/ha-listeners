@@ -24,6 +24,7 @@
             --success: #10B981;
             --warning: #F59E0B;
             --error: #EF4444;
+            --emergency: #DC2626;
         }
 
         body {
@@ -131,8 +132,15 @@
         .status-receiving { color: var(--success); }
         .status-idle { color: var(--text); }
 
+        /* Target + call button row */
+        .target-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
         .target-select {
-            width: 100%;
+            flex: 1;
             padding: 14px 16px;
             border-radius: 12px;
             border: 1px solid var(--border);
@@ -140,7 +148,6 @@
             color: var(--text);
             font-size: 16px;
             font-weight: 500;
-            margin-bottom: 24px;
             cursor: pointer;
             appearance: none;
             background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.5)' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
@@ -152,6 +159,138 @@
             outline: none;
             border-color: var(--cyan);
             box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+        }
+
+        .call-button {
+            background: transparent;
+            border: none;
+            cursor: pointer;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+        }
+
+        .call-button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .call-icon {
+            width: 52px;
+            height: 52px;
+            transition: filter 0.2s ease, transform 0.2s ease;
+        }
+
+        .call-button:not(:disabled):hover .call-icon {
+            filter: drop-shadow(0 0 8px rgba(0, 212, 255, 0.5));
+        }
+
+        .call-button:not(:disabled):hover .call-icon .call-rect {
+            stroke: url(#callGradient);
+        }
+
+        .call-button:not(:disabled):hover .call-icon .call-text {
+            fill: url(#callGradient);
+        }
+
+        .call-button:not(:disabled):active .call-icon {
+            transform: scale(0.95);
+        }
+
+        .call-button.calling .call-icon .call-rect {
+            stroke: url(#callGradientGreen);
+        }
+
+        .call-button.calling .call-icon .call-text {
+            fill: url(#callGradientGreen);
+        }
+
+        .call-button.calling .call-icon {
+            filter: drop-shadow(0 0 12px rgba(16, 185, 129, 0.6));
+        }
+
+        /* Priority + DND row */
+        .controls-row {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+            align-items: center;
+        }
+
+        .priority-select {
+            flex: 1;
+            padding: 10px 14px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            color: var(--text);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='rgba(255,255,255,0.5)' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            transition: border-color 0.2s ease;
+        }
+
+        .priority-select:focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+        }
+
+        /* Priority colour coding */
+        .priority-select.priority-normal { border-color: var(--border); }
+        .priority-select.priority-high { border-color: var(--warning); color: var(--warning); }
+        .priority-select.priority-emergency { border-color: var(--emergency); color: var(--emergency); }
+
+        .dnd-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-dim);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .dnd-label input[type="checkbox"] {
+            appearance: none;
+            width: 36px;
+            height: 20px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            cursor: pointer;
+            position: relative;
+            transition: background 0.2s ease, border-color 0.2s ease;
+            flex-shrink: 0;
+        }
+
+        .dnd-label input[type="checkbox"]::after {
+            content: '';
+            position: absolute;
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: var(--text-dim);
+            top: 2px;
+            left: 2px;
+            transition: left 0.2s ease, background 0.2s ease;
+        }
+
+        .dnd-label input[type="checkbox"]:checked {
+            background: rgba(99, 102, 241, 0.3);
+            border-color: var(--purple);
+        }
+
+        .dnd-label input[type="checkbox"]:checked::after {
+            left: 18px;
+            background: var(--purple);
         }
 
         .ptt-container {
@@ -200,9 +339,33 @@
             animation: pulse-cyan 1.5s ease-in-out infinite;
         }
 
+        /* High priority TX — orange glow */
+        .ptt-button.transmitting.priority-high .ptt-icon {
+            color: var(--warning);
+            filter: drop-shadow(0 0 20px rgba(245, 158, 11, 0.7));
+            animation: pulse-orange 1.5s ease-in-out infinite;
+        }
+
+        /* Emergency TX — red glow */
+        .ptt-button.transmitting.priority-emergency .ptt-icon {
+            color: var(--emergency);
+            filter: drop-shadow(0 0 24px rgba(220, 38, 38, 0.8));
+            animation: pulse-red 1s ease-in-out infinite;
+        }
+
         @keyframes pulse-cyan {
             0%, 100% { filter: drop-shadow(0 0 20px rgba(0, 212, 255, 0.6)); }
             50% { filter: drop-shadow(0 0 40px rgba(0, 212, 255, 0.8)); }
+        }
+
+        @keyframes pulse-orange {
+            0%, 100% { filter: drop-shadow(0 0 20px rgba(245, 158, 11, 0.7)); }
+            50% { filter: drop-shadow(0 0 40px rgba(245, 158, 11, 0.9)); }
+        }
+
+        @keyframes pulse-red {
+            0%, 100% { filter: drop-shadow(0 0 24px rgba(220, 38, 38, 0.8)); }
+            50% { filter: drop-shadow(0 0 48px rgba(220, 38, 38, 1.0)); }
         }
 
         .ptt-button.receiving .ptt-icon {
@@ -333,6 +496,30 @@
             max-width: 280px;
             line-height: 1.5;
         }
+
+        .device-name-input {
+            width: 100%;
+            max-width: 280px;
+            padding: 14px 16px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            color: var(--text);
+            font-size: 16px;
+            font-weight: 500;
+            margin-bottom: 24px;
+            text-align: center;
+        }
+
+        .device-name-input:focus {
+            outline: none;
+            border-color: var(--cyan);
+            box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.1);
+        }
+
+        .device-name-input::placeholder {
+            color: var(--text-dim);
+        }
     </style>
 </head>
 <body>
@@ -341,6 +528,7 @@
         <img src="icon.png" alt="Intercom" class="init-logo">
         <div class="init-title">Intercom</div>
         <div class="init-subtitle">Push-to-talk communication</div>
+        <input type="text" id="deviceNameInput" class="device-name-input" placeholder="Device name (optional)">
         <button id="initButton" class="init-button">Start</button>
         <p class="init-note">Microphone access required for transmission. You can still listen without a microphone.</p>
     </div>
@@ -366,9 +554,45 @@
             </div>
         </div>
 
-        <select id="targetSelect" class="target-select">
-            <option value="all">All Rooms</option>
-        </select>
+        <!-- Target room + call button -->
+        <div class="target-row">
+            <select id="targetSelect" class="target-select">
+                <option value="all">All Rooms</option>
+            </select>
+            <button id="callButton" class="call-button" disabled>
+                <svg class="call-icon" viewBox="0 0 512 512" fill="none">
+                    <defs>
+                        <linearGradient id="callGradientDim" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="rgba(255,255,255,0.5)"/>
+                            <stop offset="100%" stop-color="rgba(255,255,255,0.5)"/>
+                        </linearGradient>
+                        <linearGradient id="callGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#00D4FF"/>
+                            <stop offset="100%" stop-color="#6366F1"/>
+                        </linearGradient>
+                        <linearGradient id="callGradientGreen" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" stop-color="#10B981"/>
+                            <stop offset="100%" stop-color="#059669"/>
+                        </linearGradient>
+                    </defs>
+                    <rect class="call-rect" x="32" y="32" width="448" height="448" rx="72" stroke="url(#callGradientDim)" stroke-width="48" fill="none"/>
+                    <text class="call-text" x="256" y="310" text-anchor="middle" fill="url(#callGradientDim)" font-size="160" font-weight="700" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">Call</text>
+                </svg>
+            </button>
+        </div>
+
+        <!-- Priority selector + DND toggle -->
+        <div class="controls-row">
+            <select id="prioritySelect" class="priority-select priority-normal">
+                <option value="0">Normal</option>
+                <option value="1">High Priority</option>
+                <option value="2">Emergency</option>
+            </select>
+            <label class="dnd-label" title="Do Not Disturb — only Emergency audio will play">
+                <input type="checkbox" id="dndToggle">
+                DND
+            </label>
+        </div>
 
         <div class="ptt-container">
             <button id="pttButton" class="ptt-button disabled">
@@ -389,7 +613,7 @@
             Release to stop
         </p>
 
-        <p class="version">v--</p>
+        <p class="version">v1.9.6</p>
     </div>
 
     <script src="ptt-v7.js"></script>

@@ -27,6 +27,10 @@ typedef enum {
     HA_CMD_MUTE,
     HA_CMD_LED,
     HA_CMD_TARGET,
+    HA_CMD_AGC,
+    HA_CMD_CALL,      // Incoming call notification
+    HA_CMD_PRIORITY,  // Priority changed (value = PRIORITY_NORMAL / HIGH / EMERGENCY)
+    HA_CMD_DND,       // Do Not Disturb toggle (value = 0 or 1)
 } ha_cmd_t;
 
 // Callback for HA commands (cmd type, value)
@@ -74,6 +78,22 @@ void ha_mqtt_publish_mute(void);
  * Call this after changing LED locally.
  */
 void ha_mqtt_publish_led(void);
+
+/**
+ * Publish current AGC state to Home Assistant.
+ * Call this after changing AGC locally.
+ */
+void ha_mqtt_publish_agc(void);
+
+/**
+ * Publish current priority state to Home Assistant.
+ */
+void ha_mqtt_publish_priority(void);
+
+/**
+ * Publish current DND state to Home Assistant.
+ */
+void ha_mqtt_publish_dnd(void);
 
 /**
  * Check if MQTT is connected.
@@ -138,5 +158,42 @@ bool ha_mqtt_availability_changed(void);
  * This updates both local target and publishes to MQTT.
  */
 void ha_mqtt_set_target(const char *room_name);
+
+/**
+ * Check if a device at index is a mobile device.
+ */
+bool ha_mqtt_is_device_mobile(int index);
+
+/**
+ * Check if the current target is a mobile device.
+ * Mobile devices have IP "mobile" and need notification instead of audio.
+ */
+bool ha_mqtt_is_target_mobile(void);
+
+/**
+ * Send call notification for mobile target.
+ * Call this when PTT starts with a mobile target.
+ */
+void ha_mqtt_notify_mobile_call(void);
+
+/**
+ * Send call notification to any target device.
+ * @param target_room Room name to call (can't be "All Rooms")
+ */
+void ha_mqtt_send_call(const char *target_room);
+
+/**
+ * Send call notification to ALL discovered rooms simultaneously (excluding self).
+ * Iterates discovered_devices and calls ha_mqtt_send_call() for each available device.
+ * @return number of devices called (0 if none available)
+ */
+int ha_mqtt_send_call_all_rooms(void);
+
+/**
+ * Check if there's an incoming call for this device.
+ * @param caller_name Buffer for caller name (min 32 bytes), or NULL
+ * @return true if there's a pending call (clears the flag)
+ */
+bool ha_mqtt_check_incoming_call(char *caller_name);
 
 #endif // HA_MQTT_H

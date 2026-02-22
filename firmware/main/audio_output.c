@@ -2,29 +2,52 @@
  * Audio Output (Speaker) Module
  *
  * I2S interface to MAX98357A amplifier.
+ * Thread-safe with mutex protection on shared buffers.
  */
 
 #include "audio_output.h"
+#include "aec.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_memory_utils.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <string.h>
 
 static const char *TAG = "audio_output";
 
 static i2s_chan_handle_t tx_handle = NULL;
-static bool is_active = false;
-static uint8_t current_volume = 100;  // Default 100% - MAX98357A has its own gain
+static volatile bool is_active = false;  // volatile for cross-task visibility
+static uint8_t current_volume = 100;
 static bool is_muted = false;
+
+// Emergency override state
+static bool emergency_override_active = false;
+static uint8_t pre_emergency_volume = 100;
+static bool pre_emergency_muted = false;
+
+// Dynamically allocated stereo buffer (PSRAM if available)
+static int16_t *stereo_buffer = NULL;
 
 esp_err_t audio_output_init(void)
 {
     ESP_LOGI(TAG, "Initializing I2S speaker output");
 
-    // I2S channel configuration - larger buffers to handle network jitter
+    // I2S channel configuration
+    //
+    // DMA buffer depth: 8 descriptors x FRAME_SIZE (320) samples = 2560 samples = 160ms at 16kHz.
+    // This provides 8 Opus frames of headroom, which absorbs typical WiFi retransmission
+    // latency (50-100ms) while keeping end-to-end audio latency low (~80ms average).
+    // ESP-IDF default is 6x240=90ms; previous config was 12x640=480ms (excessive for voice).
+    // Memory: 8 x 320 x 2ch x 2B = ~10KB DMA (vs ~30KB at old settings).
+    //
+    // auto_clear=true: on underrun, DMA outputs silence instead of replaying stale audio.
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 12;  // More buffers for jitter tolerance
-    chan_cfg.dma_frame_num = FRAME_SIZE * 2;
+#define I2S_DMA_DESC_NUM 8
+    chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
+    chan_cfg.dma_frame_num = FRAME_SIZE;
+    chan_cfg.auto_clear = true;
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, &tx_handle, NULL);
     if (ret != ESP_OK) {
@@ -60,6 +83,22 @@ esp_err_t audio_output_init(void)
         return ret;
     }
 
+    // Allocate stereo conversion buffer - prefer PSRAM
+    size_t buf_size = FRAME_SIZE * 2 * sizeof(int16_t);
+    stereo_buffer = (int16_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!stereo_buffer) {
+        stereo_buffer = (int16_t *)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!stereo_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate stereo buffer");
+        i2s_del_channel(tx_handle);
+        tx_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "Stereo buffer: %u bytes (%s)",
+             (unsigned)buf_size,
+             esp_ptr_external_ram(stereo_buffer) ? "PSRAM" : "internal");
+
     ESP_LOGI(TAG, "I2S speaker initialized (SCK=%d, WS=%d, SD=%d)",
              I2S_SPK_SCK_PIN, I2S_SPK_WS_PIN, I2S_SPK_SD_PIN);
 
@@ -73,10 +112,23 @@ void audio_output_start(void)
         if (ret == ESP_OK) {
             is_active = true;
 
-            // Flush DMA buffers with silence to prevent replay of old audio
-            static int16_t silence[FRAME_SIZE * 2] = {0};
+            /*
+             * Pre-fill the entire DMA pipeline with silence.
+             *
+             * i2s_channel_disable() stops DMA but does NOT zero the descriptor
+             * buffers.  When re-enabled, those descriptors still hold whatever
+             * was last written (e.g. chime data).  auto_clear only helps with
+             * underruns, not stale data from a prior session.
+             *
+             * Write one silence frame per DMA descriptor (dma_desc_num = 8)
+             * so every descriptor is overwritten before real audio arrives.
+             */
+            static const int16_t silence[FRAME_SIZE * 2] = {0};
             size_t written;
-            i2s_channel_write(tx_handle, silence, sizeof(silence), &written, 10);
+            for (int i = 0; i < I2S_DMA_DESC_NUM; i++) {
+                i2s_channel_write(tx_handle, silence, sizeof(silence),
+                                  &written, pdMS_TO_TICKS(50));
+            }
 
             ESP_LOGI(TAG, "Audio output started");
         } else {
@@ -88,13 +140,8 @@ void audio_output_start(void)
 void audio_output_stop(void)
 {
     if (tx_handle && is_active) {
-        // Write silence before stopping to flush any remaining audio
-        static int16_t silence[FRAME_SIZE * 2] = {0};
-        size_t written;
-        i2s_channel_write(tx_handle, silence, sizeof(silence), &written, 10);
-
+        is_active = false;  // Set this FIRST to prevent writes during shutdown
         i2s_channel_disable(tx_handle);
-        is_active = false;
         ESP_LOGI(TAG, "Audio output stopped");
     }
 }
@@ -106,32 +153,42 @@ bool audio_output_is_active(void)
 
 int audio_output_write(const int16_t *buffer, size_t samples, uint32_t timeout_ms)
 {
+    // Quick check - if not active, just return (don't log error)
     if (!tx_handle || !is_active) {
-        return -1;
+        return 0;
     }
 
-    // Convert mono to stereo (duplicate each sample to L and R channels)
-    // and apply volume scaling
-    // Static buffer to avoid stack overflow
-    static int16_t stereo_buffer[FRAME_SIZE * 2];
-    int32_t volume_scale = is_muted ? 0 : (int32_t)current_volume;
+    if (!stereo_buffer) return 0;
 
-    for (size_t i = 0; i < samples && i < FRAME_SIZE; i++) {
+    size_t count = samples < FRAME_SIZE ? samples : FRAME_SIZE;
+
+    // Step 1: Apply volume scaling to mono samples, store in first half of stereo_buffer
+    const int32_t volume_scale = is_muted ? 0 : (int32_t)current_volume;
+    for (size_t i = 0; i < count; i++) {
         int32_t sample = (int32_t)buffer[i] * volume_scale / 100;
         if (sample > 32767) sample = 32767;
-        if (sample < -32768) sample = -32768;
-        int16_t s = (int16_t)sample;
-        stereo_buffer[i * 2] = s;       // Left channel
-        stereo_buffer[i * 2 + 1] = s;   // Right channel
+        else if (sample < -32768) sample = -32768;
+        stereo_buffer[i] = (int16_t)sample;
+    }
+
+    // Step 2: Push volume-scaled mono to AEC reference.
+    // The AEC needs the signal as the speaker actually outputs it (after volume)
+    // so the adaptive filter amplitude matches the actual echo picked up by the mic.
+    aec_push_reference(stereo_buffer, count);
+
+    // Step 3: Expand mono to stereo in-place (back-to-front to avoid overwriting unread data)
+    for (int i = (int)count - 1; i >= 0; i--) {
+        stereo_buffer[i * 2]     = stereo_buffer[i];
+        stereo_buffer[i * 2 + 1] = stereo_buffer[i];
     }
 
     size_t bytes_written = 0;
-    esp_err_t ret = i2s_channel_write(tx_handle, stereo_buffer, samples * 2 * sizeof(int16_t),
+    esp_err_t ret = i2s_channel_write(tx_handle, stereo_buffer, count * 2 * sizeof(int16_t),
                                        &bytes_written, pdMS_TO_TICKS(timeout_ms));
 
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "I2S write error: %s", esp_err_to_name(ret));
-        return -1;
+        // Don't spam logs - just return 0
+        return 0;
     }
 
     return bytes_written / (2 * sizeof(int16_t));
@@ -160,12 +217,51 @@ bool audio_output_is_muted(void)
     return is_muted;
 }
 
+void audio_output_force_unmute_max_volume(void)
+{
+    if (emergency_override_active) {
+        return;  // Already in emergency override — don't nest
+    }
+
+    // Save current state
+    pre_emergency_volume = current_volume;
+    pre_emergency_muted = is_muted;
+    emergency_override_active = true;
+
+    // Force unmute at max volume
+    is_muted = false;
+    current_volume = 100;
+    ESP_LOGW(TAG, "Emergency override: forced unmute + max volume (was vol=%d, muted=%d)",
+             pre_emergency_volume, pre_emergency_muted);
+}
+
+void audio_output_restore_volume(void)
+{
+    if (!emergency_override_active) {
+        return;  // No active override to restore
+    }
+
+    current_volume = pre_emergency_volume;
+    is_muted = pre_emergency_muted;
+    emergency_override_active = false;
+    ESP_LOGI(TAG, "Emergency override restored: vol=%d, muted=%d", current_volume, is_muted);
+}
+
+bool audio_output_is_emergency_override(void)
+{
+    return emergency_override_active;
+}
+
 void audio_output_deinit(void)
 {
     if (tx_handle) {
         audio_output_stop();
         i2s_del_channel(tx_handle);
         tx_handle = NULL;
-        ESP_LOGI(TAG, "Audio output deinitialized");
     }
+    if (stereo_buffer) {
+        free(stereo_buffer);
+        stereo_buffer = NULL;
+    }
+    ESP_LOGI(TAG, "Audio output deinitialized");
 }

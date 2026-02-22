@@ -72,6 +72,24 @@ void audio_output_set_mute(bool muted);
 bool audio_output_is_muted(void);
 
 /**
+ * Emergency override: force unmute and set volume to 100%.
+ * Saves the previous mute/volume state so it can be restored.
+ * Safe to call multiple times (subsequent calls are no-ops until restore).
+ */
+void audio_output_force_unmute_max_volume(void);
+
+/**
+ * Restore mute state and volume saved by audio_output_force_unmute_max_volume().
+ * No-op if an emergency override is not currently active.
+ */
+void audio_output_restore_volume(void);
+
+/**
+ * Check whether an emergency volume override is currently active.
+ */
+bool audio_output_is_emergency_override(void);
+
+/**
  * Deinitialize audio output.
  */
 void audio_output_deinit(void);

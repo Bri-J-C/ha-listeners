@@ -2,21 +2,148 @@
  * Web Server Module
  *
  * HTTP server for configuration and OTA updates.
+ * Includes HTTP Basic Authentication and CSRF protection.
  */
 
 #include "webserver.h"
 #include "settings.h"
 #include "diagnostics.h"
+#include "protocol.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_random.h"
+#include "mbedtls/base64.h"
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
 
 static const char *TAG = "webserver";
 static httpd_handle_t server = NULL;
+
+// CSRF token (generated once at server start, stable for session)
+static char csrf_token[33] = {0};
+
+// Generate a random CSRF token
+static void generate_csrf_token(void)
+{
+    uint32_t random_bytes[4];
+    for (int i = 0; i < 4; i++) {
+        random_bytes[i] = esp_random();
+    }
+    snprintf(csrf_token, sizeof(csrf_token),
+             "%08lx%08lx%08lx%08lx",
+             (unsigned long)random_bytes[0], (unsigned long)random_bytes[1],
+             (unsigned long)random_bytes[2], (unsigned long)random_bytes[3]);
+}
+
+// Verify CSRF token from form submission
+static bool verify_csrf_token(const char *token)
+{
+    if (!token || strlen(csrf_token) == 0) {
+        return false;
+    }
+    return (strcmp(csrf_token, token) == 0);
+}
+
+// Check HTTP Basic Authentication
+// Returns true if authenticated, false otherwise
+static bool check_basic_auth(httpd_req_t *req)
+{
+    const settings_t *s = settings_get();
+
+    // If no password is set, allow access (first-time setup)
+    if (strlen(s->web_admin_password) == 0) {
+        return true;
+    }
+
+    // Get Authorization header
+    char auth_header[256] = {0};
+    size_t auth_len = httpd_req_get_hdr_value_len(req, "Authorization");
+
+    if (auth_len == 0 || auth_len >= sizeof(auth_header)) {
+        return false;
+    }
+
+    if (httpd_req_get_hdr_value_str(req, "Authorization", auth_header, sizeof(auth_header)) != ESP_OK) {
+        return false;
+    }
+
+    // Check for "Basic " prefix
+    if (strncmp(auth_header, "Basic ", 6) != 0) {
+        return false;
+    }
+
+    // Decode base64 credentials
+    const char *encoded = auth_header + 6;
+    unsigned char decoded[128] = {0};
+    size_t decoded_len = 0;
+
+    if (mbedtls_base64_decode(decoded, sizeof(decoded) - 1, &decoded_len,
+                              (const unsigned char *)encoded, strlen(encoded)) != 0) {
+        return false;
+    }
+    decoded[decoded_len] = '\0';
+
+    // Parse username:password
+    char *colon = strchr((char *)decoded, ':');
+    if (!colon) {
+        return false;
+    }
+
+    char *password = colon + 1;
+
+    // Verify password (username is "admin")
+    return settings_verify_web_password(password);
+}
+
+// Send 401 Unauthorized response
+static esp_err_t send_auth_required(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"Intercom Settings\"");
+    httpd_resp_set_type(req, "text/html");
+    const char *msg = "<!DOCTYPE html><html><body><h1>Authentication Required</h1>"
+                      "<p>Please log in with username 'admin' and your password.</p></body></html>";
+    httpd_resp_send(req, msg, strlen(msg));
+    return ESP_OK;
+}
+
+// HTML-encode a string to prevent XSS attacks
+static void html_encode(char *dst, const char *src, size_t dst_size)
+{
+    size_t i = 0;
+    while (*src && i < dst_size - 6) {  // Reserve space for longest entity
+        switch (*src) {
+            case '<':
+                memcpy(dst + i, "&lt;", 4);
+                i += 4;
+                break;
+            case '>':
+                memcpy(dst + i, "&gt;", 4);
+                i += 4;
+                break;
+            case '&':
+                memcpy(dst + i, "&amp;", 5);
+                i += 5;
+                break;
+            case '"':
+                memcpy(dst + i, "&quot;", 6);
+                i += 6;
+                break;
+            case '\'':
+                memcpy(dst + i, "&#39;", 5);
+                i += 5;
+                break;
+            default:
+                dst[i++] = *src;
+                break;
+        }
+        src++;
+    }
+    dst[i] = '\0';
+}
 
 // HTML page template - Modern gradient design
 static const char *HTML_PAGE =
@@ -68,10 +195,11 @@ static const char *HTML_PAGE =
 "<div><span>Room</span><br><strong>%s</strong></div>"
 "<div><span>IP Address</span><br><strong>%s</strong></div>"
 "<div><span>MQTT</span><br><strong>%s</strong></div>"
-"<div><span>Version</span><br><strong>1.6.1</strong></div>"
+"<div><span>Version</span><br><strong>" FIRMWARE_VERSION "</strong></div>"
 "</div></div>"
 "<a href='/diagnostics' class='btn-link'>View Diagnostics</a>"
 "<form action='/save' method='POST' class='card'>"
+"<input type='hidden' name='csrf' value='%s'>"
 "<h3>WiFi</h3>"
 "<label>SSID</label><input type='text' name='ssid' value='%s'>"
 "<label>Password</label><input type='password' name='pass' placeholder='Leave blank to keep'>"
@@ -80,20 +208,25 @@ static const char *HTML_PAGE =
 "<label>Volume (0-100)</label><input type='number' name='vol' min='0' max='100' value='%d'>"
 "<h3>Home Assistant</h3>"
 "<label><input type='checkbox' name='mqtt_en' value='1' %s> Enable MQTT</label>"
+"<label><input type='checkbox' name='mqtt_tls' value='1' %s> Enable TLS (secure)</label>"
 "<div class='row'>"
 "<div><label>Host</label><input type='text' name='mqtt_host' value='%s' placeholder='192.168.1.x'></div>"
 "<div><label>Port</label><input type='number' name='mqtt_port' value='%d'></div></div>"
 "<label>Username</label><input type='text' name='mqtt_user' value='%s'>"
 "<label>Password</label><input type='password' name='mqtt_pass' placeholder='Leave blank to keep'>"
+"<h3>Security</h3>"
+"<label>Web Admin Password</label><input type='password' name='web_pass' placeholder='%s'>"
 "<button type='submit' class='btn'>Save Settings</button>"
 "</form>"
 "<form action='/update' method='POST' enctype='multipart/form-data' class='card'>"
+"<input type='hidden' name='csrf' value='%s'>"
 "<h3>Firmware</h3>"
 "<label>Select .bin file</label>"
 "<input type='file' name='firmware' accept='.bin'>"
 "<button type='submit' class='btn'>Upload</button>"
 "</form>"
 "<form action='/reset' method='POST' class='card danger'>"
+"<input type='hidden' name='csrf' value='%s'>"
 "<h3>Factory Reset</h3>"
 "<button type='submit' class='btn' onclick=\"return confirm('Reset all settings?');\">Reset Device</button>"
 "</form>"
@@ -239,11 +372,16 @@ static bool get_form_value(const char *body, const char *key, char *value, size_
 // GET / - serve config page
 static esp_err_t root_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
     const settings_t *s = settings_get();
     char ip[16] = "0.0.0.0";
     get_ip_string(ip, sizeof(ip));
 
-    char *html = malloc(5120);
+    char *html = malloc(8192);  // Increased size for security fields and CSRF tokens
     if (!html) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -252,11 +390,32 @@ static esp_err_t root_handler(httpd_req_t *req)
     const char *mqtt_status = s->mqtt_enabled ?
         (strlen(s->mqtt_host) > 0 ? "Enabled" : "Not configured") : "Disabled";
 
-    snprintf(html, 5120, HTML_PAGE,
-             s->room_name, ip, mqtt_status,
-             get_current_ssid(), s->room_name, s->volume,
+    // HTML-encode user-supplied values to prevent XSS
+    char safe_room[SETTINGS_ROOM_MAX * 6];
+    char safe_ssid[SETTINGS_SSID_MAX * 6];
+    char safe_mqtt_host[SETTINGS_MQTT_HOST_MAX * 6];
+    char safe_mqtt_user[SETTINGS_MQTT_USER_MAX * 6];
+
+    html_encode(safe_room, s->room_name, sizeof(safe_room));
+    html_encode(safe_ssid, get_current_ssid(), sizeof(safe_ssid));
+    html_encode(safe_mqtt_host, s->mqtt_host, sizeof(safe_mqtt_host));
+    html_encode(safe_mqtt_user, s->mqtt_user, sizeof(safe_mqtt_user));
+
+    snprintf(html, 8192, HTML_PAGE,
+             safe_room, ip, mqtt_status,
+             csrf_token,  // CSRF token for save form
+             safe_ssid, safe_room, s->volume,
              s->mqtt_enabled ? "checked" : "",
-             s->mqtt_host, s->mqtt_port, s->mqtt_user);
+             s->mqtt_tls_enabled ? "checked" : "",
+             safe_mqtt_host, s->mqtt_port, safe_mqtt_user,
+             strlen(s->web_admin_password) > 0 ? "Leave blank to keep" : "Set admin password",
+             csrf_token,  // CSRF token for firmware form
+             csrf_token); // CSRF token for reset form
+
+    // Set security headers
+    httpd_resp_set_hdr(req, "Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'");
+    httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
+    httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, strlen(html));
@@ -268,6 +427,11 @@ static esp_err_t root_handler(httpd_req_t *req)
 // POST /save - save settings
 static esp_err_t save_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
     char body[1024] = {0};
     int ret = httpd_req_recv(req, body, sizeof(body) - 1);
     if (ret <= 0) {
@@ -275,8 +439,18 @@ static esp_err_t save_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    // Verify CSRF token
+    char csrf[64] = {0};
+    if (!get_form_value(body, "csrf", csrf, sizeof(csrf)) || !verify_csrf_token(csrf)) {
+        ESP_LOGW(TAG, "CSRF token validation failed");
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_send(req, "CSRF validation failed", -1);
+        return ESP_FAIL;
+    }
+
     char ssid[64], pass[128], room[64], vol[8];
-    char mqtt_host[64], mqtt_port[8], mqtt_user[32], mqtt_pass[64], mqtt_en[4];
+    char mqtt_host[64], mqtt_port[8], mqtt_user[32], mqtt_pass[64], mqtt_en[4], mqtt_tls[4];
+    char web_pass[64];
 
     // Only update WiFi if password is provided (intentional change)
     if (get_form_value(body, "pass", pass, sizeof(pass)) && strlen(pass) > 0) {
@@ -286,9 +460,17 @@ static esp_err_t save_handler(httpd_req_t *req)
         }
     }
 
-    // Room name can be changed independently
+    // Room name can be changed independently — strip leading/trailing whitespace
     if (get_form_value(body, "room", room, sizeof(room))) {
-        settings_set_room(room);
+        // Trim leading whitespace
+        char *trimmed = room;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        // Trim trailing whitespace
+        int tlen = strlen(trimmed);
+        while (tlen > 0 && (trimmed[tlen-1] == ' ' || trimmed[tlen-1] == '\t')) {
+            trimmed[--tlen] = '\0';
+        }
+        if (tlen > 0) settings_set_room(trimmed);
     }
 
     // Volume can be changed independently
@@ -300,9 +482,13 @@ static esp_err_t save_handler(httpd_req_t *req)
     bool mqtt_enabled = get_form_value(body, "mqtt_en", mqtt_en, sizeof(mqtt_en));
     settings_set_mqtt_enabled(mqtt_enabled);
 
+    // MQTT TLS setting
+    bool tls_enabled = get_form_value(body, "mqtt_tls", mqtt_tls, sizeof(mqtt_tls));
+    settings_set_mqtt_tls_enabled(tls_enabled);
+
     // Update MQTT connection settings if host is provided
     if (get_form_value(body, "mqtt_host", mqtt_host, sizeof(mqtt_host)) && strlen(mqtt_host) > 0) {
-        uint16_t port = 1883;
+        uint16_t port = tls_enabled ? 8883 : 1883;  // Default TLS port
         if (get_form_value(body, "mqtt_port", mqtt_port, sizeof(mqtt_port))) {
             port = atoi(mqtt_port);
         }
@@ -318,6 +504,11 @@ static esp_err_t save_handler(httpd_req_t *req)
         }
     }
 
+    // Web admin password - only update if provided
+    if (get_form_value(body, "web_pass", web_pass, sizeof(web_pass)) && strlen(web_pass) > 0) {
+        settings_set_web_admin_password(web_pass);
+    }
+
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, HTML_SAVED, strlen(HTML_SAVED));
 
@@ -331,6 +522,24 @@ static esp_err_t save_handler(httpd_req_t *req)
 // POST /reset - factory reset
 static esp_err_t reset_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
+    char body[256] = {0};
+    int ret = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (ret > 0) {
+        // Verify CSRF token
+        char csrf[64] = {0};
+        if (!get_form_value(body, "csrf", csrf, sizeof(csrf)) || !verify_csrf_token(csrf)) {
+            ESP_LOGW(TAG, "CSRF token validation failed for reset");
+            httpd_resp_set_status(req, "403 Forbidden");
+            httpd_resp_send(req, "CSRF validation failed", -1);
+            return ESP_FAIL;
+        }
+    }
+
     settings_reset();
 
     httpd_resp_set_type(req, "text/html");
@@ -345,7 +554,30 @@ static esp_err_t reset_handler(httpd_req_t *req)
 // POST /update - OTA firmware update
 static esp_err_t ota_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
     ESP_LOGI(TAG, "OTA update started, size=%d", req->content_len);
+
+    // Extract the multipart boundary from Content-Type header.
+    // We build an end-of-part marker "\r\n--<boundary>" to use instead of
+    // a hardcoded pattern that can appear in firmware binary data.
+    char content_type[256] = {0};
+    char end_marker[128] = "\r\n------";  // fallback
+    int marker_len = 8;
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) == ESP_OK) {
+        char *bnd = strstr(content_type, "boundary=");
+        if (bnd) {
+            bnd += 9;
+            int built = snprintf(end_marker, sizeof(end_marker), "\r\n--%s", bnd);
+            if (built > 0 && built < (int)sizeof(end_marker)) {
+                marker_len = built;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "OTA boundary marker: '%s' (%d bytes)", end_marker, marker_len);
 
     esp_ota_handle_t ota_handle;
     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
@@ -373,8 +605,9 @@ static esp_err_t ota_handler(httpd_req_t *req)
     int received = 0;
     int total = req->content_len;
     bool header_skipped = false;
+    bool done = false;
 
-    while (received < total) {
+    while (received < total && !done) {
         int ret = httpd_req_recv(req, buf, 1024);
         if (ret <= 0) {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT) continue;
@@ -384,7 +617,7 @@ static esp_err_t ota_handler(httpd_req_t *req)
         char *data = buf;
         int data_len = ret;
 
-        // Skip multipart header on first chunk
+        // Skip multipart header on first chunk (find end of part header)
         if (!header_skipped) {
             char *bin_start = memmem(buf, ret, "\r\n\r\n", 4);
             if (bin_start) {
@@ -398,10 +631,12 @@ static esp_err_t ota_handler(httpd_req_t *req)
             }
         }
 
-        // Check for multipart boundary at end
-        char *boundary = memmem(data, data_len, "\r\n------", 8);
-        if (boundary) {
-            data_len = boundary - data;
+        // Check for multipart end boundary using the actual boundary string.
+        // This prevents false matches against firmware binary data.
+        char *boundary_end = memmem(data, data_len, end_marker, marker_len);
+        if (boundary_end) {
+            data_len = boundary_end - data;
+            done = true;  // Stop after writing this chunk
         }
 
         if (data_len > 0) {
@@ -456,6 +691,11 @@ static esp_err_t ota_handler(httpd_req_t *req)
 // GET /diagnostics - system diagnostics page
 static esp_err_t diagnostics_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
     const char *reset_reason = diagnostics_get_reset_reason();
     uint32_t uptime = diagnostics_get_uptime();
     uint32_t heap = esp_get_free_heap_size();
@@ -526,6 +766,11 @@ static esp_err_t diagnostics_handler(httpd_req_t *req)
 // GET /diagnostics/json - diagnostics as JSON
 static esp_err_t diagnostics_json_handler(httpd_req_t *req)
 {
+    // Check authentication
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
     char *json = diagnostics_get_json();
     if (!json) {
         httpd_resp_send_500(req);
@@ -546,9 +791,14 @@ esp_err_t webserver_start(void)
         return ESP_OK;
     }
 
+    // Generate CSRF token once at startup (stable for entire session)
+    generate_csrf_token();
+
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 8192;
+    config.stack_size = 12288;  // 12KB for complex page rendering
     config.uri_match_fn = httpd_uri_match_wildcard;
+    config.recv_wait_timeout = 60;  // 60s for OTA uploads over slow WiFi
+    config.send_wait_timeout = 60;
 
     esp_err_t ret = httpd_start(&server, &config);
     if (ret != ESP_OK) {

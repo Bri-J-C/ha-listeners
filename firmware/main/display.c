@@ -9,6 +9,9 @@
 #if FEATURE_DISPLAY
 
 #include <string.h>
+#include <stdio.h>
+#include "protocol.h"
+#include "settings.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -35,7 +38,18 @@ static char remote_name[MAX_ROOM_NAME_LEN] = "";
 // Cycle button state
 static bool cycle_button_pressed = false;
 static int64_t last_cycle_time = 0;
+static int64_t cycle_press_start = 0;
+static bool cycle_long_press_fired = false;
 #define CYCLE_DEBOUNCE_MS 200
+#define CYCLE_LONG_PRESS_MS 1000
+
+// Long press callback (for sending mobile notifications)
+static display_long_press_cb_t long_press_callback = NULL;
+
+void display_set_long_press_callback(display_long_press_cb_t cb)
+{
+    long_press_callback = cb;
+}
 
 // Temporary message
 static char temp_message[32] = "";
@@ -47,6 +61,57 @@ static int64_t last_scroll_time = 0;
 static int last_selected_index = -1;
 #define SCROLL_DELAY_MS 150  // Speed of scrolling
 #define MAX_VISIBLE_CHARS 16  // Characters that fit in selection box
+
+// ── Settings page ──────────────────────────────────────────────────────────────
+
+// Current display mode
+static display_mode_t display_mode = DISPLAY_MODE_ROOMS;
+
+// Settings callback
+static display_settings_cb_t settings_callback = NULL;
+
+// Label and type metadata for each settings item
+typedef enum {
+    STYPE_TOGGLE,   // bool  — shows ON / OFF
+    STYPE_ENUM,     // uint8 — shows one of a fixed string table
+    STYPE_NUMERIC,  // uint8 — shows "<value>%"
+} settings_type_t;
+
+typedef struct {
+    const char     *label;
+    settings_type_t type;
+    int             min_val;
+    int             max_val;
+    int             step;
+    // For STYPE_ENUM: pointer to a NULL-terminated array of value strings
+    const char    **enum_labels;
+} settings_meta_t;
+
+static const char *priority_labels[] = { "Normal", "High", "Emerg", NULL };
+
+static const settings_meta_t settings_meta[SETTINGS_ITEM_COUNT] = {
+    [SETTINGS_ITEM_DND]      = { "DND",      STYPE_TOGGLE,  0,   1,  1,  NULL           },
+    [SETTINGS_ITEM_PRIORITY] = { "Priority", STYPE_ENUM,    0,   2,  1,  priority_labels },
+    [SETTINGS_ITEM_MUTE]     = { "Mute",     STYPE_TOGGLE,  0,   1,  1,  NULL           },
+    [SETTINGS_ITEM_VOLUME]   = { "Volume",   STYPE_NUMERIC, 0, 100, 10,  NULL           },
+    [SETTINGS_ITEM_AGC]      = { "AGC",      STYPE_TOGGLE,  0,   1,  1,  NULL           },
+    [SETTINGS_ITEM_LED]      = { "LED",      STYPE_TOGGLE,  0,   1,  1,  NULL           },
+};
+
+// Live values for the settings page (int representation of each setting)
+static int settings_values[SETTINGS_ITEM_COUNT];
+
+// Currently highlighted row in settings menu
+static int settings_selected = 0;
+
+// Number of rows visible at once in the settings list (header=8px, hline=1px, item=10px)
+// 64 - 9 = 55px usable; floor(55/10) = 5 rows
+#define SETTINGS_VISIBLE_ROWS  5
+
+// Vertical scroll offset for the settings list
+static int settings_scroll = 0;
+
+// ── End settings page ──────────────────────────────────────────────────────────
 
 // Frame buffer (128x64 = 1024 bytes, organized as 8 pages of 128 bytes)
 static uint8_t framebuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT / 8];
@@ -369,6 +434,115 @@ static void fb_draw_icon(int x, int y)
     }
 }
 
+// Draw a right-aligned string ending at x_right
+static void fb_draw_string_right(int x_right, int y, const char *str, bool inverted)
+{
+    int len = (int)strlen(str);
+    int x = x_right - len * 6;
+    if (x < 0) x = 0;
+    fb_draw_string(x, y, str, inverted);
+}
+
+// Populate settings_values[] from current settings_get() snapshot
+static void settings_menu_sync(void)
+{
+    const settings_t *cfg = settings_get();
+    settings_values[SETTINGS_ITEM_DND]      = (int)cfg->dnd_enabled;
+    settings_values[SETTINGS_ITEM_PRIORITY] = (int)cfg->priority;
+    settings_values[SETTINGS_ITEM_MUTE]     = (int)cfg->muted;
+    settings_values[SETTINGS_ITEM_VOLUME]   = (int)cfg->volume;
+    settings_values[SETTINGS_ITEM_AGC]      = (int)cfg->agc_enabled;
+    settings_values[SETTINGS_ITEM_LED]      = (int)cfg->led_enabled;
+}
+
+// Advance the selected settings item value by one step (wraps)
+static void settings_change_selected(void)
+{
+    const settings_meta_t *m = &settings_meta[settings_selected];
+    int v = settings_values[settings_selected];
+
+    v += m->step;
+    if (v > m->max_val) v = m->min_val;
+    settings_values[settings_selected] = v;
+
+    ESP_LOGI(TAG, "Settings item %d (%s) changed to %d",
+             settings_selected, m->label, v);
+
+    if (settings_callback) {
+        settings_callback(settings_selected, v);
+    }
+}
+
+// Render the settings page into the framebuffer
+static void draw_settings_page(void)
+{
+    // Header row
+    fb_draw_string_centered(0, "= SETTINGS =", false);
+
+    // Horizontal divider below header (y=9)
+    fb_draw_hline(0, 9, DISPLAY_WIDTH);
+
+    // Total items = settings + "< Back" entry
+    int total_items = SETTINGS_ITEM_COUNT + 1;
+
+    // List items — each row is 10px tall starting at y=11
+    int first = settings_scroll;
+    int last  = first + SETTINGS_VISIBLE_ROWS;
+    if (last > total_items) last = total_items;
+
+    for (int i = first; i < last; i++) {
+        int row   = i - first;
+        int y     = 11 + row * 10;
+        bool sel  = (i == settings_selected);
+
+        if (sel) {
+            // Inverted background for selected row
+            fb_fill_rect(0, y - 1, DISPLAY_WIDTH, 10, true);
+        }
+
+        if (i == SETTINGS_ITEM_COUNT) {
+            // "< Back" entry at the bottom
+            if (sel) {
+                fb_draw_string(2, y, ">", true);
+            }
+            fb_draw_string(10, y, "< Back", sel);
+        } else {
+            const settings_meta_t *m = &settings_meta[i];
+            int v = settings_values[i];
+
+            // Selection cursor
+            if (sel) {
+                fb_draw_string(2, y, ">", true);
+            }
+
+            // Label (left side, 10px indent)
+            fb_draw_string(10, y, m->label, sel);
+
+            // Value (right side)
+            char val_buf[8];
+            if (m->type == STYPE_TOGGLE) {
+                snprintf(val_buf, sizeof(val_buf), "%s", v ? " ON" : "OFF");
+            } else if (m->type == STYPE_ENUM && m->enum_labels) {
+                int idx = v;
+                if (idx < 0) idx = 0;
+                if (idx > m->max_val) idx = m->max_val;
+                snprintf(val_buf, sizeof(val_buf), "%s", m->enum_labels[idx]);
+            } else {
+                snprintf(val_buf, sizeof(val_buf), "%d%%", v);
+            }
+            fb_draw_string_right(DISPLAY_WIDTH - 1, y, val_buf, sel);
+        }
+    }
+
+    // Scroll indicators
+    if (first > 0) {
+        fb_draw_string(DISPLAY_WIDTH - 7, 11, "^", false);
+    }
+    if (last < total_items) {
+        fb_draw_string(DISPLAY_WIDTH - 7, 11 + (SETTINGS_VISIBLE_ROWS - 1) * 10, "v", false);
+    }
+}
+
 // Send framebuffer to display
 static esp_err_t fb_flush(void)
 {
@@ -407,21 +581,89 @@ static void cycle_button_task(void *arg)
         bool current = gpio_get_level(CYCLE_BUTTON_PIN);
         int64_t now = esp_timer_get_time() / 1000;
 
-        // Detect press (falling edge) with debounce
+        // Detect press (falling edge)
         if (last_state && !current) {
-            if (now - last_cycle_time > CYCLE_DEBOUNCE_MS) {
-                last_cycle_time = now;
-                display_cycle_next();
-                ESP_LOGI(TAG, "Cycle button pressed, selected: %d", selected_index);
+            cycle_press_start = now;
+            cycle_long_press_fired = false;
+        }
+
+        // Check for long press while held
+        if (!current && !cycle_long_press_fired) {
+            if (now - cycle_press_start > CYCLE_LONG_PRESS_MS) {
+                cycle_long_press_fired = true;
+                if (display_mode == DISPLAY_MODE_ROOMS) {
+                    if (selected_index == room_count) {
+                        // Long press on "Settings" entry: enter settings page
+                        display_mode = DISPLAY_MODE_SETTINGS;
+                        settings_selected = 0;
+                        settings_scroll = 0;
+                        settings_menu_sync();
+                        ESP_LOGI(TAG, "Entering settings page");
+                        display_update();
+                    } else {
+                        // Long press on a room: send call notification
+                        ESP_LOGI(TAG, "Cycle button LONG PRESS - notify mobile");
+                        if (long_press_callback) {
+                            long_press_callback();
+                        }
+                    }
+                } else {
+                    if (settings_selected == SETTINGS_ITEM_COUNT) {
+                        // Long press on "< Back": exit settings page
+                        display_mode = DISPLAY_MODE_ROOMS;
+                        ESP_LOGI(TAG, "Exiting settings page");
+                        display_update();
+                    } else {
+                        // Long press on a setting: change its value
+                        ESP_LOGI(TAG, "Cycle button LONG PRESS - change setting %d", settings_selected);
+                        settings_change_selected();
+                        display_update();
+                    }
+                }
             }
         }
 
-        // Periodic display refresh for scroll animation (every 150ms)
-        if (current_state == DISPLAY_STATE_IDLE &&
-            now - last_refresh > SCROLL_DELAY_MS) {
+        // Detect release (rising edge) — short press only (no long press fired)
+        if (!last_state && current) {
+            if (!cycle_long_press_fired && now - last_cycle_time > CYCLE_DEBOUNCE_MS) {
+                last_cycle_time = now;
+
+                if (display_mode == DISPLAY_MODE_ROOMS) {
+                    display_cycle_next();
+                    ESP_LOGI(TAG, "Cycle button pressed, selected: %d", selected_index);
+                } else {
+                    // In settings mode: advance to next item (including "< Back")
+                    int total_items = SETTINGS_ITEM_COUNT + 1;  // +1 for Back
+                    settings_selected = (settings_selected + 1) % total_items;
+                    // Keep selected item in the visible window
+                    if (settings_selected < settings_scroll) {
+                        settings_scroll = settings_selected;
+                    } else if (settings_selected >= settings_scroll + SETTINGS_VISIBLE_ROWS) {
+                        settings_scroll = settings_selected - SETTINGS_VISIBLE_ROWS + 1;
+                    }
+                    if (settings_selected < SETTINGS_ITEM_COUNT) {
+                        ESP_LOGI(TAG, "Settings item selected: %d (%s)",
+                                 settings_selected, settings_meta[settings_selected].label);
+                    } else {
+                        ESP_LOGI(TAG, "Settings item selected: < Back");
+                    }
+                    display_update();
+                }
+            }
+        }
+
+        // Periodic display refresh (every 150ms)
+        if (now - last_refresh > SCROLL_DELAY_MS) {
             last_refresh = now;
-            // Check if selected room name needs scrolling
-            if (room_count > 0 && selected_index < room_count) {
+
+            // Always check for temp message timeout
+            if (temp_message[0] && temp_message_until > 0 && now >= temp_message_until) {
+                display_update();  // Will clear the expired message
+            }
+            // Scroll animation when idle in rooms mode
+            else if (display_mode == DISPLAY_MODE_ROOMS &&
+                     current_state == DISPLAY_STATE_IDLE &&
+                     room_count > 0 && selected_index < room_count) {
                 int name_len = strlen(rooms[selected_index].name);
                 if (name_len > MAX_VISIBLE_CHARS) {
                     display_update();
@@ -499,12 +741,13 @@ esp_err_t display_init(void)
     display_available = true;
     ESP_LOGI(TAG, "Display initialized");
 
-    // Show boot screen with underlined title
+    // Show boot screen with underlined title and version
     fb_clear();
-    fb_draw_string_centered(24, "HA Intercom", false);
+    fb_draw_string_centered(20, "HA Intercom", false);
     int title_width = 11 * 6;  // 11 chars * 6 pixels
     int title_x = (DISPLAY_WIDTH - title_width) / 2;
-    fb_draw_hline(title_x, 32, title_width);  // Underline
+    fb_draw_hline(title_x, 29, title_width);  // Underline
+    fb_draw_string_centered(34, "v" FIRMWARE_VERSION, false);
     fb_flush();
 
     // Initialize cycle button
@@ -547,8 +790,8 @@ void display_set_rooms(const room_target_t *new_rooms, int count)
     room_count = count;
     memcpy(rooms, new_rooms, count * sizeof(room_target_t));
 
-    // Reset selection if out of bounds
-    if (selected_index >= room_count) {
+    // Reset selection if out of bounds (room_count = Settings entry, so allow that)
+    if (selected_index > room_count) {
         selected_index = 0;
     }
 
@@ -569,6 +812,8 @@ int display_get_selected_index(void)
 const room_target_t *display_get_selected_room(void)
 {
     if (room_count == 0) return NULL;
+    // If "Settings" virtual entry is selected, return first room (All Rooms)
+    if (selected_index >= room_count) return &rooms[0];
     return &rooms[selected_index];
 }
 
@@ -576,13 +821,22 @@ void display_cycle_next(void)
 {
     if (room_count == 0) return;
 
-    selected_index = (selected_index + 1) % room_count;
+    // Cycle through rooms + virtual "Settings" entry at the end
+    int total = room_count + 1;  // +1 for Settings
+    selected_index = (selected_index + 1) % total;
     display_update();
 }
 
 void display_set_state(display_state_t state)
 {
     current_state = state;
+    // Auto-exit settings when active audio starts
+    if (state == DISPLAY_STATE_TRANSMITTING || state == DISPLAY_STATE_RECEIVING) {
+        if (display_mode == DISPLAY_MODE_SETTINGS) {
+            ESP_LOGI(TAG, "Auto-exit settings (TX/RX started)");
+            display_mode = DISPLAY_MODE_ROOMS;
+        }
+    }
     display_update();
 }
 
@@ -604,13 +858,20 @@ void display_update(void)
 
     fb_clear();
 
-    // Check for temporary message
+    // Check for temporary message (shown in both modes)
     if (temp_message[0] && (temp_message_until == 0 || now < temp_message_until)) {
         fb_draw_string_centered(28, temp_message, false);
         fb_flush();
         return;
     }
     temp_message[0] = '\0';
+
+    // Settings page overrides the normal room/state display
+    if (display_mode == DISPLAY_MODE_SETTINGS) {
+        draw_settings_page();
+        fb_flush();
+        return;
+    }
 
     switch (current_state) {
         case DISPLAY_STATE_TRANSMITTING: {
@@ -652,8 +913,11 @@ void display_update(void)
             fb_draw_string_centered(0, "Target:", false);
             fb_draw_hline(0, 10, DISPLAY_WIDTH);
 
-            // Calculate visible range (show up to 4 rooms)
-            int visible_count = (room_count < 4) ? room_count : 4;
+            // Total entries = rooms + "Settings" virtual entry
+            int total_entries = room_count + 1;
+
+            // Calculate visible range (show up to 4 entries)
+            int visible_count = (total_entries < 4) ? total_entries : 4;
             int start_idx = 0;
 
             // Scroll to keep selection visible
@@ -668,13 +932,22 @@ void display_update(void)
                 last_selected_index = selected_index;
             }
 
-            for (int i = 0; i < visible_count && (start_idx + i) < room_count; i++) {
+            for (int i = 0; i < visible_count && (start_idx + i) < total_entries; i++) {
                 int idx = start_idx + i;
                 int y = 14 + i * 13;  // Slightly more spacing
 
                 bool is_selected = (idx == selected_index);
 
-                if (is_selected) {
+                if (idx == room_count) {
+                    // Virtual "Settings" entry at the bottom
+                    if (is_selected) {
+                        fb_fill_rect(2, y - 2, 110, 11, true);
+                        fb_draw_string(4, y, "~", true);
+                        fb_draw_string(16, y, "[Settings]", true);
+                    } else {
+                        fb_draw_string(16, y, "[Settings]", false);
+                    }
+                } else if (is_selected) {
                     // Draw larger selection box with 2px padding
                     fb_fill_rect(2, y - 2, 110, 11, true);
                     // Draw arrow
@@ -704,9 +977,17 @@ void display_update(void)
                     } else {
                         fb_draw_string(16, y, name, true);
                     }
+                    // Show phone indicator for mobile devices (inverted)
+                    if (rooms[idx].is_mobile) {
+                        fb_draw_string(DISPLAY_WIDTH - 14, y, "*", true);
+                    }
                 } else {
                     // Draw room name normal (truncated if too long)
                     fb_draw_string(16, y, rooms[idx].name, false);
+                    // Show phone indicator for mobile devices
+                    if (rooms[idx].is_mobile) {
+                        fb_draw_string(DISPLAY_WIDTH - 14, y, "*", false);
+                    }
                 }
             }
 
@@ -714,7 +995,7 @@ void display_update(void)
             if (start_idx > 0) {
                 fb_draw_string(DISPLAY_WIDTH - 8, 14, "^", false);
             }
-            if (start_idx + visible_count < room_count) {
+            if (start_idx + visible_count < total_entries) {
                 fb_draw_string(DISPLAY_WIDTH - 8, 14 + 36, "v", false);
             }
             break;
@@ -738,6 +1019,42 @@ void display_show_message(const char *message, uint32_t duration_ms)
     }
 
     display_update();
+}
+
+void display_show_ap_info(const char *ssid, const char *password)
+{
+    if (!display_available) return;
+
+    fb_clear();
+    fb_draw_string_centered(2, "AP CONFIG MODE", false);
+    fb_draw_hline(0, 12, DISPLAY_WIDTH);
+
+    // Show SSID, password, and IP so user knows how to connect
+    char line[32];
+    snprintf(line, sizeof(line), "SSID: %s", ssid ? ssid : "");
+    fb_draw_string(0, 16, line, false);
+
+    snprintf(line, sizeof(line), "Pass: %s", password ? password : "");
+    fb_draw_string(0, 28, line, false);
+
+    fb_draw_string_centered(40, "192.168.4.1", false);
+    fb_draw_string_centered(52, "to configure", false);
+
+    fb_flush();
+}
+
+void display_set_settings_callback(display_settings_cb_t cb)
+{
+    settings_callback = cb;
+}
+
+void display_sync_settings(void)
+{
+    if (!display_available) return;
+    settings_menu_sync();
+    if (display_mode == DISPLAY_MODE_SETTINGS) {
+        display_update();
+    }
 }
 
 void display_deinit(void)

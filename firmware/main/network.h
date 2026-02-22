@@ -90,6 +90,14 @@ esp_err_t network_send_unicast(const audio_packet_t *packet, size_t len, const c
 esp_err_t network_start_mdns(const char *hostname);
 
 /**
+ * Get TX packet statistics.
+ * @param sent    Total packets successfully sent (may be NULL)
+ * @param failed  Total packets that failed to send (may be NULL)
+ * @param last_errno  errno from last send failure, 0 if none (may be NULL)
+ */
+void network_get_tx_stats(uint32_t *sent, uint32_t *failed, int *last_errno);
+
+/**
  * Deinitialize network.
  */
 void network_deinit(void);

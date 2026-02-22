@@ -8,7 +8,9 @@
  */
 
 #include "ha_mqtt.h"
+#include "protocol.h"
 #include "settings.h"
+#include "agc.h"
 #include "audio_output.h"
 #include "button.h"
 #include "network.h"
@@ -35,6 +37,7 @@ typedef struct {
     char id[32];
     bool active;
     bool available;  // Online/offline status from LWT
+    bool is_mobile;  // True if this is a mobile device (phone/tablet)
 } discovered_device_t;
 
 static discovered_device_t discovered_devices[MAX_DISCOVERED_DEVICES];
@@ -54,8 +57,19 @@ static char led_cmd_topic[64];
 static char device_info_topic[64];
 static char target_state_topic[64];
 static char target_cmd_topic[64];
+static char agc_state_topic[64];
+static char agc_cmd_topic[64];
+static char priority_state_topic[64];
+static char priority_cmd_topic[64];
+static char dnd_state_topic[64];
+static char dnd_cmd_topic[64];
 static const char *device_discovery_topic = "intercom/devices/+/info";
 static const char *device_status_topic = "intercom/+/status";  // For availability tracking
+static const char *call_topic = "intercom/call";  // Call notifications
+
+// Incoming call state
+static bool incoming_call_pending = false;
+static char incoming_call_caller[32] = "";
 
 // Callback for settings changes from HA
 static ha_mqtt_callback_t user_callback = NULL;
@@ -64,6 +78,8 @@ static void publish_discovery(void);
 static void publish_all_states(void);
 static void publish_target(void);
 static void publish_target_discovery(void);
+static void publish_priority(void);
+static void publish_dnd(void);
 
 /**
  * Create device info JSON object (shared by all entities).
@@ -82,7 +98,7 @@ static cJSON* create_device_info(void)
     cJSON_AddStringToObject(device, "name", cfg->room_name);
     cJSON_AddStringToObject(device, "model", "ESP32-S3 Intercom");
     cJSON_AddStringToObject(device, "manufacturer", "guywithacomputer");
-    cJSON_AddStringToObject(device, "sw_version", "1.2.0");
+    cJSON_AddStringToObject(device, "sw_version", FIRMWARE_VERSION);
 
     return device;
 }
@@ -106,9 +122,12 @@ static void publish_sensor_discovery(void)
     char uid[48];
     snprintf(uid, sizeof(uid), "%s_state", unique_id);
     cJSON_AddStringToObject(root, "unique_id", uid);
-    cJSON_AddStringToObject(root, "object_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "sensor.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
 
     cJSON_AddStringToObject(root, "state_topic", state_topic);
+    cJSON_AddStringToObject(root, "value_template", "{{ value_json.state }}");
     cJSON_AddStringToObject(root, "availability_topic", availability_topic);
     cJSON_AddStringToObject(root, "icon", "mdi:phone-classic");
     cJSON_AddItemToObject(root, "device", create_device_info());
@@ -140,7 +159,9 @@ static void publish_volume_discovery(void)
     char uid[48];
     snprintf(uid, sizeof(uid), "%s_volume", unique_id);
     cJSON_AddStringToObject(root, "unique_id", uid);
-    cJSON_AddStringToObject(root, "object_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "number.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
 
     cJSON_AddStringToObject(root, "state_topic", volume_state_topic);
     cJSON_AddStringToObject(root, "command_topic", volume_cmd_topic);
@@ -180,7 +201,9 @@ static void publish_mute_discovery(void)
     char uid[48];
     snprintf(uid, sizeof(uid), "%s_mute", unique_id);
     cJSON_AddStringToObject(root, "unique_id", uid);
-    cJSON_AddStringToObject(root, "object_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "switch.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
 
     cJSON_AddStringToObject(root, "state_topic", mute_state_topic);
     cJSON_AddStringToObject(root, "command_topic", mute_cmd_topic);
@@ -217,7 +240,9 @@ static void publish_led_discovery(void)
     char uid[48];
     snprintf(uid, sizeof(uid), "%s_led", unique_id);
     cJSON_AddStringToObject(root, "unique_id", uid);
-    cJSON_AddStringToObject(root, "object_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "switch.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
 
     cJSON_AddStringToObject(root, "state_topic", led_state_topic);
     cJSON_AddStringToObject(root, "command_topic", led_cmd_topic);
@@ -233,6 +258,169 @@ static void publish_led_discovery(void)
         free(payload);
     }
     cJSON_Delete(root);
+}
+
+/**
+ * Publish discovery config for AGC switch.
+ */
+static void publish_agc_discovery(void)
+{
+    const settings_t *cfg = settings_get();
+    char discovery_topic[128];
+    snprintf(discovery_topic, sizeof(discovery_topic),
+             "homeassistant/switch/%s_agc/config", unique_id);
+
+    cJSON *root = cJSON_CreateObject();
+
+    char name[64];
+    snprintf(name, sizeof(name), "%s AGC", cfg->room_name);
+    cJSON_AddStringToObject(root, "name", name);
+
+    char uid[48];
+    snprintf(uid, sizeof(uid), "%s_agc", unique_id);
+    cJSON_AddStringToObject(root, "unique_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "switch.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
+
+    cJSON_AddStringToObject(root, "state_topic", agc_state_topic);
+    cJSON_AddStringToObject(root, "command_topic", agc_cmd_topic);
+    cJSON_AddStringToObject(root, "availability_topic", availability_topic);
+    cJSON_AddStringToObject(root, "payload_on", "ON");
+    cJSON_AddStringToObject(root, "payload_off", "OFF");
+    cJSON_AddStringToObject(root, "icon", "mdi:microphone-settings");
+    cJSON_AddItemToObject(root, "device", create_device_info());
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload) {
+        esp_mqtt_client_publish(mqtt_client, discovery_topic, payload, 0, 1, true);
+        free(payload);
+    }
+    cJSON_Delete(root);
+}
+
+/**
+ * Publish current AGC state.
+ */
+static void publish_agc(void)
+{
+    if (!mqtt_connected) return;
+
+    const settings_t *cfg = settings_get();
+    const char *state = cfg->agc_enabled ? "ON" : "OFF";
+    esp_mqtt_client_publish(mqtt_client, agc_state_topic, state, 0, 0, true);
+}
+
+/**
+ * Publish discovery config for priority select entity.
+ */
+static void publish_priority_discovery(void)
+{
+    const settings_t *cfg = settings_get();
+    char discovery_topic[128];
+    snprintf(discovery_topic, sizeof(discovery_topic),
+             "homeassistant/select/%s_priority/config", unique_id);
+
+    cJSON *root = cJSON_CreateObject();
+
+    char name[64];
+    snprintf(name, sizeof(name), "%s Priority", cfg->room_name);
+    cJSON_AddStringToObject(root, "name", name);
+
+    char uid[48];
+    snprintf(uid, sizeof(uid), "%s_priority", unique_id);
+    cJSON_AddStringToObject(root, "unique_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "select.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
+
+    cJSON_AddStringToObject(root, "state_topic", priority_state_topic);
+    cJSON_AddStringToObject(root, "command_topic", priority_cmd_topic);
+    cJSON_AddStringToObject(root, "availability_topic", availability_topic);
+    cJSON_AddStringToObject(root, "icon", "mdi:alert-circle-outline");
+
+    cJSON *options = cJSON_CreateArray();
+    cJSON_AddItemToArray(options, cJSON_CreateString("Normal"));
+    cJSON_AddItemToArray(options, cJSON_CreateString("High"));
+    cJSON_AddItemToArray(options, cJSON_CreateString("Emergency"));
+    cJSON_AddItemToObject(root, "options", options);
+
+    cJSON_AddItemToObject(root, "device", create_device_info());
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload) {
+        esp_mqtt_client_publish(mqtt_client, discovery_topic, payload, 0, 1, true);
+        free(payload);
+    }
+    cJSON_Delete(root);
+}
+
+/**
+ * Publish discovery config for DND switch entity.
+ */
+static void publish_dnd_discovery(void)
+{
+    const settings_t *cfg = settings_get();
+    char discovery_topic[128];
+    snprintf(discovery_topic, sizeof(discovery_topic),
+             "homeassistant/switch/%s_dnd/config", unique_id);
+
+    cJSON *root = cJSON_CreateObject();
+
+    char name[64];
+    snprintf(name, sizeof(name), "%s Do Not Disturb", cfg->room_name);
+    cJSON_AddStringToObject(root, "name", name);
+
+    char uid[48];
+    snprintf(uid, sizeof(uid), "%s_dnd", unique_id);
+    cJSON_AddStringToObject(root, "unique_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "switch.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
+
+    cJSON_AddStringToObject(root, "state_topic", dnd_state_topic);
+    cJSON_AddStringToObject(root, "command_topic", dnd_cmd_topic);
+    cJSON_AddStringToObject(root, "availability_topic", availability_topic);
+    cJSON_AddStringToObject(root, "payload_on", "ON");
+    cJSON_AddStringToObject(root, "payload_off", "OFF");
+    cJSON_AddStringToObject(root, "icon", "mdi:bell-sleep");
+    cJSON_AddItemToObject(root, "device", create_device_info());
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload) {
+        esp_mqtt_client_publish(mqtt_client, discovery_topic, payload, 0, 1, true);
+        free(payload);
+    }
+    cJSON_Delete(root);
+}
+
+/**
+ * Publish current priority as a string.
+ */
+static void publish_priority(void)
+{
+    if (!mqtt_connected) return;
+
+    const settings_t *cfg = settings_get();
+    const char *priority_str;
+    switch (cfg->priority) {
+        case 1:  priority_str = "High";       break;
+        case 2:  priority_str = "Emergency";  break;
+        default: priority_str = "Normal";     break;
+    }
+    esp_mqtt_client_publish(mqtt_client, priority_state_topic, priority_str, 0, 0, true);
+}
+
+/**
+ * Publish current DND state.
+ */
+static void publish_dnd(void)
+{
+    if (!mqtt_connected) return;
+
+    const settings_t *cfg = settings_get();
+    const char *state = cfg->dnd_enabled ? "ON" : "OFF";
+    esp_mqtt_client_publish(mqtt_client, dnd_state_topic, state, 0, 0, true);
 }
 
 /**
@@ -257,8 +445,11 @@ static void publish_discovery(void)
     publish_volume_discovery();
     publish_mute_discovery();
     publish_led_discovery();
+    publish_agc_discovery();
     publish_target_discovery();
-    ESP_LOGI(TAG, "Published HA discovery (sensor, volume, mute, led, target)");
+    publish_priority_discovery();
+    publish_dnd_discovery();
+    ESP_LOGI(TAG, "Published HA discovery (sensor, volume, mute, led, agc, target, priority, dnd)");
 }
 
 /**
@@ -268,20 +459,22 @@ static void publish_state(void)
 {
     if (!mqtt_connected) return;
 
-    const char *state_str;
+    char payload[128];
+
     switch (current_state) {
         case HA_STATE_TRANSMITTING:
-            state_str = "transmitting";
+            // Include target when transmitting so hub knows where to forward
+            snprintf(payload, sizeof(payload), "{\"state\":\"transmitting\",\"target\":\"%s\"}", current_target);
             break;
         case HA_STATE_RECEIVING:
-            state_str = "receiving";
+            snprintf(payload, sizeof(payload), "{\"state\":\"receiving\"}");
             break;
         default:
-            state_str = "idle";
+            snprintf(payload, sizeof(payload), "{\"state\":\"idle\"}");
             break;
     }
 
-    esp_mqtt_client_publish(mqtt_client, state_topic, state_str, 0, 0, true);
+    esp_mqtt_client_publish(mqtt_client, state_topic, payload, 0, 0, true);
 }
 
 /**
@@ -327,7 +520,10 @@ static void publish_all_states(void)
     publish_volume();
     publish_mute();
     publish_led();
+    publish_agc();
     publish_target();
+    publish_priority();
+    publish_dnd();
 }
 
 /**
@@ -381,7 +577,9 @@ static void publish_target_discovery(void)
     char uid[48];
     snprintf(uid, sizeof(uid), "%s_target", unique_id);
     cJSON_AddStringToObject(root, "unique_id", uid);
-    cJSON_AddStringToObject(root, "object_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "select.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
 
     cJSON_AddStringToObject(root, "state_topic", target_state_topic);
     cJSON_AddStringToObject(root, "command_topic", target_cmd_topic);
@@ -419,19 +617,36 @@ static void publish_target_discovery(void)
 static bool target_discovery_pending = false;
 static bool availability_changed = false;  // Flag to trigger display refresh
 
+// Cache for device status messages that arrive before device info (MQTT ordering race)
+#define MAX_PENDING_STATUS 5
+typedef struct {
+    char id[32];
+    bool is_online;
+} pending_status_t;
+static pending_status_t pending_statuses[MAX_PENDING_STATUS];
+static int pending_status_count = 0;
+
 /**
  * Simple JSON string extractor (avoids cJSON allocation in MQTT handler).
- * Extracts value for "key":"value" pattern.
+ * Extracts value for "key":"value" or "key": "value" pattern.
  */
 static bool extract_json_string(const char *json, const char *key, char *out, size_t out_len)
 {
     char pattern[48];
-    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
 
     const char *start = strstr(json, pattern);
     if (!start) return false;
 
     start += strlen(pattern);
+
+    // Skip optional whitespace after colon
+    while (*start == ' ' || *start == '\t') start++;
+
+    // Expect opening quote
+    if (*start != '"') return false;
+    start++;
+
     const char *end = strchr(start, '"');
     if (!end) return false;
 
@@ -444,6 +659,32 @@ static bool extract_json_string(const char *json, const char *key, char *out, si
 }
 
 /**
+ * Simple JSON boolean extractor.
+ * Extracts value for "key":true or "key":false pattern.
+ */
+static bool extract_json_bool(const char *json, const char *key, bool *out)
+{
+    char pattern[48];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+
+    const char *start = strstr(json, pattern);
+    if (!start) return false;
+
+    start += strlen(pattern);
+    // Skip whitespace
+    while (*start == ' ') start++;
+
+    if (strncmp(start, "true", 4) == 0) {
+        *out = true;
+        return true;
+    } else if (strncmp(start, "false", 5) == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+/**
  * Handle discovered device info from other intercoms.
  * Uses simple string parsing to avoid cJSON memory allocation.
  */
@@ -452,11 +693,13 @@ static void handle_device_info(const char *payload)
     char room[32] = {0};
     char ip[16] = {0};
     char id[32] = {0};
+    bool is_mobile = false;
 
     // Simple JSON parsing without cJSON
     if (!extract_json_string(payload, "room", room, sizeof(room))) return;
     if (!extract_json_string(payload, "ip", ip, sizeof(ip))) return;
     if (!extract_json_string(payload, "id", id, sizeof(id))) return;
+    extract_json_bool(payload, "is_mobile", &is_mobile);  // Optional field
 
     // Check if we already know this device
     int existing_idx = -1;
@@ -472,16 +715,35 @@ static void handle_device_info(const char *payload)
         strncpy(discovered_devices[existing_idx].room, room, sizeof(discovered_devices[0].room) - 1);
         strncpy(discovered_devices[existing_idx].ip, ip, sizeof(discovered_devices[0].ip) - 1);
         discovered_devices[existing_idx].active = true;
-        discovered_devices[existing_idx].available = true;  // Assume online if we're getting their info
+        /* Keep existing availability — don't override what status messages told us. */
+        discovered_devices[existing_idx].is_mobile = is_mobile;
     } else if (discovered_count < MAX_DISCOVERED_DEVICES) {
-        // Add new device
+        // Add new device — default available=false until an "online" status confirms it.
+        // This prevents stale retained info messages (from gone devices) from polluting
+        // the room list. The retained "online" status will arrive and set available=true.
         strncpy(discovered_devices[discovered_count].room, room, sizeof(discovered_devices[0].room) - 1);
         strncpy(discovered_devices[discovered_count].ip, ip, sizeof(discovered_devices[0].ip) - 1);
         strncpy(discovered_devices[discovered_count].id, id, sizeof(discovered_devices[0].id) - 1);
         discovered_devices[discovered_count].active = true;
-        discovered_devices[discovered_count].available = true;  // Assume online if we're getting their info
+        discovered_devices[discovered_count].available = false;  // Wait for "online" status
+        discovered_devices[discovered_count].is_mobile = is_mobile;
         discovered_count++;
-        ESP_LOGI(TAG, "Discovered device: %s (%s) at %s", room, id, ip);
+        ESP_LOGI(TAG, "Discovered device: %s (%s) at %s%s", room, id, ip, is_mobile ? " [mobile]" : "");
+
+        // Apply any status that arrived before this info (retained message race condition).
+        // If "online" was received while device was unknown, it was cached — apply it now.
+        for (int i = 0; i < pending_status_count; i++) {
+            if (strcmp(pending_statuses[i].id, id) == 0) {
+                discovered_devices[discovered_count - 1].available = pending_statuses[i].is_online;
+                if (pending_statuses[i].is_online) {
+                    availability_changed = true;
+                    ESP_LOGI(TAG, "Applied cached status: %s is online", room);
+                }
+                // Remove from cache (swap with last entry)
+                pending_statuses[i] = pending_statuses[--pending_status_count];
+                break;
+            }
+        }
 
         // Defer target discovery update to main loop (avoid cJSON in MQTT handler)
         target_discovery_pending = true;
@@ -517,6 +779,21 @@ static void handle_device_status(const char *topic, const char *payload)
             }
             return;
         }
+    }
+
+    // Device not yet discovered — cache status so it can be applied when info arrives.
+    // MQTT retained messages can arrive in any order; status often beats info.
+    for (int i = 0; i < pending_status_count; i++) {
+        if (strcmp(pending_statuses[i].id, device_id) == 0) {
+            pending_statuses[i].is_online = is_online;  // update existing cache entry
+            return;
+        }
+    }
+    if (pending_status_count < MAX_PENDING_STATUS) {
+        strncpy(pending_statuses[pending_status_count].id, device_id,
+                sizeof(pending_statuses[0].id) - 1);
+        pending_statuses[pending_status_count].is_online = is_online;
+        pending_status_count++;
     }
 }
 
@@ -566,13 +843,6 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
         settings_set_mute(muted);  // Persist to NVS
         publish_mute();
 
-        // Update LED to show muted state
-        if (muted) {
-            button_set_led_state(LED_STATE_MUTED);
-        } else {
-            button_set_led_state(LED_STATE_IDLE);
-        }
-
         if (user_callback) {
             user_callback(HA_CMD_MUTE, muted ? 1 : 0);
         }
@@ -588,10 +858,55 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
             user_callback(HA_CMD_LED, enabled ? 1 : 0);
         }
     }
+    // AGC command
+    else if (strcmp(topic, agc_cmd_topic) == 0) {
+        bool enabled = (strcmp(data, "ON") == 0);
+        settings_set_agc_enabled(enabled);
+        publish_agc();
+
+        if (user_callback) {
+            user_callback(HA_CMD_AGC, enabled ? 1 : 0);
+        }
+    }
+    // Priority command ("Normal", "High", "Emergency")
+    else if (strcmp(topic, priority_cmd_topic) == 0) {
+        uint8_t priority;
+        if (strcmp(data, "High") == 0) {
+            priority = 1;
+        } else if (strcmp(data, "Emergency") == 0) {
+            priority = 2;
+        } else {
+            priority = 0;
+        }
+        settings_set_priority(priority);
+        publish_priority();
+
+        if (user_callback) {
+            user_callback(HA_CMD_PRIORITY, priority);
+        }
+    }
+    // DND command
+    else if (strcmp(topic, dnd_cmd_topic) == 0) {
+        bool dnd = (strcmp(data, "ON") == 0);
+        settings_set_dnd(dnd);
+        publish_dnd();
+
+        if (user_callback) {
+            user_callback(HA_CMD_DND, dnd ? 1 : 0);
+        }
+    }
     // Target command
     else if (strcmp(topic, target_cmd_topic) == 0) {
-        strncpy(current_target, data, sizeof(current_target) - 1);
+        // Trim leading/trailing whitespace from HA target value (stale retained
+        // messages may include trailing spaces from old room names like "INTERCOM2 ")
+        char *src = data;
+        while (*src == ' ' || *src == '\t') src++;
+        strncpy(current_target, src, sizeof(current_target) - 1);
         current_target[sizeof(current_target) - 1] = '\0';
+        int tlen = strlen(current_target);
+        while (tlen > 0 && (current_target[tlen-1] == ' ' || current_target[tlen-1] == '\t')) {
+            current_target[--tlen] = '\0';
+        }
         publish_target();
         ESP_LOGI(TAG, "Target set to: %s", current_target);
 
@@ -606,6 +921,36 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
     // Device status (availability) from other intercoms
     else if (is_device_status) {
         handle_device_status(topic, data);
+    }
+    // Incoming call notification
+    else if (strcmp(topic, call_topic) == 0) {
+        // Parse call JSON: {"target": "Room Name", "caller": "Caller Name"}
+        char target[32] = {0};
+        char caller[32] = {0};
+
+        ESP_LOGI(TAG, "Call notification received: %s", data);
+
+        if (extract_json_string(data, "target", target, sizeof(target)) &&
+            extract_json_string(data, "caller", caller, sizeof(caller))) {
+
+            const settings_t *cfg = settings_get();
+            ESP_LOGI(TAG, "Call target='%s', our room='%s'", target, cfg->room_name);
+
+            // Check if we're the target
+            if (strcmp(target, cfg->room_name) == 0) {
+                ESP_LOGI(TAG, "Incoming call from: %s - triggering chime", caller);
+                strncpy(incoming_call_caller, caller, sizeof(incoming_call_caller) - 1);
+                incoming_call_pending = true;
+
+                if (user_callback) {
+                    user_callback(HA_CMD_CALL, 0);
+                }
+            } else {
+                ESP_LOGI(TAG, "Call not for us (target mismatch)");
+            }
+        } else {
+            ESP_LOGW(TAG, "Failed to parse call JSON");
+        }
     }
 }
 
@@ -630,11 +975,17 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             esp_mqtt_client_subscribe(mqtt_client, mute_cmd_topic, 0);
             esp_mqtt_client_subscribe(mqtt_client, led_cmd_topic, 0);
             esp_mqtt_client_subscribe(mqtt_client, target_cmd_topic, 0);
+            esp_mqtt_client_subscribe(mqtt_client, agc_cmd_topic, 0);
+            esp_mqtt_client_subscribe(mqtt_client, priority_cmd_topic, 0);
+            esp_mqtt_client_subscribe(mqtt_client, dnd_cmd_topic, 0);
 
             // Subscribe to device discovery to learn about other intercoms
             esp_mqtt_client_subscribe(mqtt_client, device_discovery_topic, 0);
             esp_mqtt_client_subscribe(mqtt_client, device_status_topic, 0);
-            ESP_LOGI(TAG, "Subscribed to command topics, device discovery, and status");
+
+            // Subscribe to call notifications
+            esp_mqtt_client_subscribe(mqtt_client, call_topic, 0);
+            ESP_LOGI(TAG, "Subscribed to command topics, device discovery, status, and calls");
 
             // Publish current states
             publish_all_states();
@@ -685,6 +1036,12 @@ esp_err_t ha_mqtt_init(const uint8_t *device_id)
     snprintf(device_info_topic, sizeof(device_info_topic), "intercom/devices/%s/info", unique_id);
     snprintf(target_state_topic, sizeof(target_state_topic), "%s/target", base_topic);
     snprintf(target_cmd_topic, sizeof(target_cmd_topic), "%s/target/set", base_topic);
+    snprintf(agc_state_topic, sizeof(agc_state_topic), "%s/agc", base_topic);
+    snprintf(agc_cmd_topic, sizeof(agc_cmd_topic), "%s/agc/set", base_topic);
+    snprintf(priority_state_topic, sizeof(priority_state_topic), "%s/priority", base_topic);
+    snprintf(priority_cmd_topic, sizeof(priority_cmd_topic), "%s/priority/set", base_topic);
+    snprintf(dnd_state_topic, sizeof(dnd_state_topic), "%s/dnd", base_topic);
+    snprintf(dnd_cmd_topic, sizeof(dnd_cmd_topic), "%s/dnd/set", base_topic);
 
     // Initialize current target
     strcpy(current_target, "All Rooms");
@@ -702,9 +1059,13 @@ esp_err_t ha_mqtt_start(void)
         return ESP_OK;
     }
 
-    // Build broker URI
+    // Build broker URI - use mqtts:// for TLS, mqtt:// otherwise
     char uri[128];
-    snprintf(uri, sizeof(uri), "mqtt://%s:%d", cfg->mqtt_host, cfg->mqtt_port);
+    if (cfg->mqtt_tls_enabled) {
+        snprintf(uri, sizeof(uri), "mqtts://%s:%d", cfg->mqtt_host, cfg->mqtt_port);
+    } else {
+        snprintf(uri, sizeof(uri), "mqtt://%s:%d", cfg->mqtt_host, cfg->mqtt_port);
+    }
 
     esp_mqtt_client_config_t mqtt_cfg = {
         .broker.address.uri = uri,
@@ -716,6 +1077,19 @@ esp_err_t ha_mqtt_start(void)
         .session.last_will.retain = true,
         .session.keepalive = 15,  // 15 seconds - faster offline detection
     };
+
+    // For TLS: Skip certificate verification for self-signed certs (common in home setups)
+    // Production environments should use proper CA certificate validation
+    if (cfg->mqtt_tls_enabled) {
+        // Allow insecure connections (skip all certificate verification)
+        // This is required for self-signed certificates or brokers without proper certs
+        mqtt_cfg.broker.verification.skip_cert_common_name_check = true;
+        mqtt_cfg.broker.verification.crt_bundle_attach = NULL;
+        mqtt_cfg.broker.verification.certificate = NULL;
+        // Note: For proper security, embed CA cert and set:
+        // mqtt_cfg.broker.verification.certificate = (const char *)ca_cert_pem;
+        ESP_LOGI(TAG, "MQTT TLS enabled (certificate validation skipped for home use)");
+    }
 
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     if (!mqtt_client) {
@@ -731,7 +1105,7 @@ esp_err_t ha_mqtt_start(void)
         return ret;
     }
 
-    ESP_LOGI(TAG, "MQTT client started, connecting to %s", uri);
+    ESP_LOGI(TAG, "MQTT client started, connecting to %s (TLS: %s)", uri, cfg->mqtt_tls_enabled ? "yes" : "no");
     return ESP_OK;
 }
 
@@ -777,6 +1151,21 @@ void ha_mqtt_publish_led(void)
     publish_led();
 }
 
+void ha_mqtt_publish_agc(void)
+{
+    publish_agc();
+}
+
+void ha_mqtt_publish_priority(void)
+{
+    publish_priority();
+}
+
+void ha_mqtt_publish_dnd(void)
+{
+    publish_dnd();
+}
+
 bool ha_mqtt_is_connected(void)
 {
     return mqtt_connected;
@@ -802,6 +1191,10 @@ const char* ha_mqtt_get_target_ip(void)
     for (int i = 0; i < discovered_count; i++) {
         if (discovered_devices[i].active &&
             strcmp(discovered_devices[i].room, current_target) == 0) {
+            // Mobile devices have hub's IP - unicast there, hub forwards to web client
+            if (discovered_devices[i].is_mobile) {
+                ESP_LOGI(TAG, "Target '%s' is mobile, unicast to hub at %s", current_target, discovered_devices[i].ip);
+            }
             return discovered_devices[i].ip;
         }
     }
@@ -849,6 +1242,12 @@ bool ha_mqtt_is_available(int index)
     return discovered_devices[index].available;
 }
 
+bool ha_mqtt_is_device_mobile(int index)
+{
+    if (index < 0 || index >= discovered_count) return false;
+    return discovered_devices[index].is_mobile;
+}
+
 bool ha_mqtt_availability_changed(void)
 {
     if (availability_changed) {
@@ -862,8 +1261,120 @@ void ha_mqtt_set_target(const char *room_name)
 {
     if (!room_name) return;
 
-    strncpy(current_target, room_name, sizeof(current_target) - 1);
+    // Trim leading/trailing whitespace
+    const char *src = room_name;
+    while (*src == ' ' || *src == '\t') src++;
+    strncpy(current_target, src, sizeof(current_target) - 1);
     current_target[sizeof(current_target) - 1] = '\0';
+    int tlen = strlen(current_target);
+    while (tlen > 0 && (current_target[tlen-1] == ' ' || current_target[tlen-1] == '\t')) {
+        current_target[--tlen] = '\0';
+    }
     publish_target();
     ESP_LOGI(TAG, "Target set to: %s", current_target);
+}
+
+bool ha_mqtt_is_target_mobile(void)
+{
+    // Check if current target is a mobile device
+    for (int i = 0; i < discovered_count; i++) {
+        if (discovered_devices[i].active &&
+            strcmp(discovered_devices[i].room, current_target) == 0) {
+            return discovered_devices[i].is_mobile;
+        }
+    }
+    return false;
+}
+
+void ha_mqtt_notify_mobile_call(void)
+{
+    if (!mqtt_connected || !mqtt_client) return;
+
+    const settings_t *cfg = settings_get();
+
+    // Find the mobile device's notify service
+    char notify_service[64] = "";
+    for (int i = 0; i < discovered_count; i++) {
+        if (discovered_devices[i].active &&
+            strcmp(discovered_devices[i].room, current_target) == 0 &&
+            discovered_devices[i].is_mobile) {
+            // Extract notify service from device id (e.g., "intercom_xxx_mobile_0")
+            // The hub will handle the actual service lookup
+            snprintf(notify_service, sizeof(notify_service), "mobile_app_%s",
+                     discovered_devices[i].room);
+            break;
+        }
+    }
+
+    // Publish call notification
+    cJSON *call = cJSON_CreateObject();
+    cJSON_AddStringToObject(call, "target", current_target);
+    cJSON_AddStringToObject(call, "caller", cfg->room_name);
+    cJSON_AddNumberToObject(call, "timestamp", (double)esp_log_timestamp() / 1000.0);
+
+    char *json_str = cJSON_PrintUnformatted(call);
+    if (json_str) {
+        esp_mqtt_client_publish(mqtt_client, "intercom/call", json_str, 0, 0, 0);
+        ESP_LOGI(TAG, "Sent mobile call notification to %s", current_target);
+        free(json_str);
+    }
+    cJSON_Delete(call);
+}
+
+void ha_mqtt_send_call(const char *target_room)
+{
+    if (!mqtt_connected || !mqtt_client || !target_room) return;
+    if (strcmp(target_room, "All Rooms") == 0) return;  // Use ha_mqtt_send_call_all_rooms() instead
+
+    const settings_t *cfg = settings_get();
+
+    // Publish call notification
+    cJSON *call = cJSON_CreateObject();
+    cJSON_AddStringToObject(call, "target", target_room);
+    cJSON_AddStringToObject(call, "caller", cfg->room_name);
+
+    char *json_str = cJSON_PrintUnformatted(call);
+    if (json_str) {
+        esp_mqtt_client_publish(mqtt_client, "intercom/call", json_str, 0, 0, 0);
+        ESP_LOGI(TAG, "Sent call to %s", target_room);
+        free(json_str);
+    }
+    cJSON_Delete(call);
+}
+
+int ha_mqtt_send_call_all_rooms(void)
+{
+    if (!mqtt_connected || !mqtt_client) return 0;
+
+    int call_count = 0;
+    for (int i = 0; i < discovered_count; i++) {
+        if (!discovered_devices[i].active) continue;
+        if (!discovered_devices[i].available) continue;
+
+        // Skip self — don't ring our own chime
+        if (strcmp(discovered_devices[i].id, unique_id) == 0) continue;
+
+        ha_mqtt_send_call(discovered_devices[i].room);
+        call_count++;
+    }
+
+    ESP_LOGI(TAG, "Sent call to all rooms (%d devices)", call_count);
+    return call_count;
+}
+
+bool ha_mqtt_check_incoming_call(char *caller_name)
+{
+    if (!incoming_call_pending) return false;
+
+    // Copy caller name if buffer provided
+    if (caller_name) {
+        strncpy(caller_name, incoming_call_caller, 31);
+        caller_name[31] = '\0';
+    }
+
+    // Clear pending state
+    incoming_call_pending = false;
+    incoming_call_caller[0] = '\0';
+
+    return true;
 }

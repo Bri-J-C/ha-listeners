@@ -18,6 +18,7 @@
 #include "protocol.h"
 #include "audio_input.h"
 #include "audio_output.h"
+#include "aec.h"
 #include "codec.h"
 #include "network.h"
 #include "discovery.h"
@@ -27,6 +28,9 @@
 #include "ha_mqtt.h"
 #include "diagnostics.h"
 #include "display.h"
+#include "agc.h"
+#include "esp_heap_caps.h"
+#include "esp_attr.h"
 
 static const char *TAG = "main";
 
@@ -49,26 +53,32 @@ static uint8_t tx_packet_buffer[MAX_PACKET_SIZE];
 static TaskHandle_t tx_task_handle = NULL;
 static bool tx_task_running = false;
 
+// TX task stack in PSRAM (saves ~32KB of scarce internal RAM).
+// CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y permits this.
+static EXT_RAM_BSS_ATTR StackType_t tx_task_stack[32768 / sizeof(StackType_t)];
+static StaticTask_t tx_task_tcb;
+
 // Audio playback state
 static uint32_t last_audio_rx_time = 0;
 static bool audio_playing = false;
 static uint32_t rx_packet_count = 0;
 
-// Jitter buffer - accumulate frames before playback starts
-#define JITTER_BUFFER_FRAMES 3
-static int16_t jitter_buffer[JITTER_BUFFER_FRAMES][FRAME_SIZE];
-static uint8_t jitter_write_idx = 0;
-static uint8_t jitter_read_idx = 0;
-static uint8_t jitter_count = 0;
-static bool jitter_primed = false;
+// Sequence tracking for PLC/FEC
+static uint32_t last_sequence = 0;
+static bool sequence_initialized = false;
 
 // First-to-talk: track current sender to ignore others
 static uint8_t current_sender[DEVICE_ID_LENGTH] = {0};
 static bool has_current_sender = false;
+static uint8_t current_rx_priority = 0;  // Priority of current sender (PRIORITY_NORMAL = 0)
 #define SENDER_TIMEOUT_MS 500  // Release channel after 500ms silence
 
 // Display room list tracking
 static int last_device_count = -1;
+
+// PTT lockout after sending a call - prevents mic from picking up chime decay
+static uint32_t last_call_sent_time = 0;
+#define CALL_TX_LOCKOUT_MS 2000  // Suppress PTT for 2s after sending a call
 
 /**
  * Generate unique device ID from MAC address.
@@ -110,8 +120,15 @@ static bool is_channel_busy(void)
 }
 
 /**
- * Handle received audio packets with jitter buffering.
- * Implements first-to-talk: locks onto first sender, ignores others.
+ * Handle received audio packets - direct playback.
+ *
+ * Priority logic:
+ * - EMERGENCY: bypass DND, force unmute + max volume, preempts any current sender
+ * - HIGH: preempts NORMAL senders, blocked by other HIGH/EMERGENCY
+ * - NORMAL: first-to-talk (existing behaviour)
+ *
+ * DND: when enabled, NORMAL and HIGH packets are silently discarded.
+ *      EMERGENCY always plays regardless.
  */
 static void on_audio_received(const audio_packet_t *packet, size_t total_len)
 {
@@ -127,18 +144,67 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         return;
     }
 
-    // First-to-talk: if we have a current sender, ignore packets from others
+    // Extract priority (added in v2.5.0 protocol; old senders omit it, default to NORMAL)
+    uint8_t incoming_priority = packet->priority;
+    if (incoming_priority > 2) {  // > PRIORITY_EMERGENCY
+        incoming_priority = 0;    // Clamp unknown values to PRIORITY_NORMAL
+    }
+
+    // DND check: discard NORMAL and HIGH, let EMERGENCY through
+    const settings_t *cfg = settings_get();
+    if (cfg->dnd_enabled && incoming_priority < 2) {  // < PRIORITY_EMERGENCY
+        return;
+    }
+
+    // First-to-talk with priority-based preemption
     if (has_current_sender) {
-        if (memcmp(packet->device_id, current_sender, DEVICE_ID_LENGTH) != 0) {
-            // Different sender - ignore (first-to-talk wins)
-            return;
+        bool same_sender = (memcmp(packet->device_id, current_sender, DEVICE_ID_LENGTH) == 0);
+        if (!same_sender) {
+            // Different sender — check if incoming priority allows preemption
+            if (incoming_priority > current_rx_priority) {
+                // Higher priority preempts the current sender
+                ESP_LOGI(TAG, "Priority preemption: incoming=%d > current=%d",
+                         incoming_priority, current_rx_priority);
+                // Stop current playback and release channel to new sender
+                if (audio_playing) {
+                    audio_output_stop();
+                    audio_playing = false;
+                }
+                // Restore volume if emergency override was active
+                if (audio_output_is_emergency_override()) {
+                    audio_output_restore_volume();
+                }
+                // Accept new sender
+                memcpy(current_sender, packet->device_id, DEVICE_ID_LENGTH);
+                current_rx_priority = incoming_priority;
+                sequence_initialized = false;
+                codec_reset_decoder();
+                ESP_LOGI(TAG, "Channel preempted by %02x%02x%02x%02x (priority=%d)",
+                         current_sender[0], current_sender[1], current_sender[2],
+                         current_sender[3], current_rx_priority);
+            } else {
+                // Same or lower priority — first-to-talk wins, discard packet
+                return;
+            }
         }
+        // Same sender — continue playing
     } else {
         // No current sender - this sender gets the channel
         memcpy(current_sender, packet->device_id, DEVICE_ID_LENGTH);
+        current_rx_priority = incoming_priority;
         has_current_sender = true;
-        ESP_LOGI(TAG, "Channel acquired by %02x%02x%02x%02x",
-                 current_sender[0], current_sender[1], current_sender[2], current_sender[3]);
+        sequence_initialized = false;
+        codec_reset_decoder();
+        ESP_LOGI(TAG, "Channel acquired by %02x%02x%02x%02x (priority=%d)",
+                 current_sender[0], current_sender[1], current_sender[2],
+                 current_sender[3], current_rx_priority);
+    }
+
+    // Emergency override: force unmute + max volume on first packet of emergency stream
+    if (incoming_priority == 2 && !audio_playing) {  // 2 = PRIORITY_EMERGENCY
+        audio_output_force_unmute_max_volume();
+        button_set_led_state(LED_STATE_BUSY);  // Orange LED for emergency
+        ESP_LOGW(TAG, "EMERGENCY audio incoming - forced unmute + max volume");
     }
 
     size_t opus_len = total_len - HEADER_LENGTH;
@@ -146,46 +212,51 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         return;
     }
 
-    // Decode Opus to PCM
-    int samples = codec_decode(packet->opus_data, opus_len, pcm_buffer);
-    if (samples <= 0) {
-        return;
-    }
-
+    // Update timestamp FIRST — before setting audio_playing — to prevent the
+    // main-loop idle timeout from seeing audio_playing=true with a stale timestamp
+    // and immediately stopping playback (race condition causes start/stop flapping).
     last_audio_rx_time = xTaskGetTickCount();
 
     // Start audio output if not already playing
     if (!audio_playing) {
         audio_output_start();
         audio_playing = true;
-        jitter_primed = false;
-        jitter_count = 0;
-        jitter_write_idx = 0;
-        jitter_read_idx = 0;
-        button_set_led_state(LED_STATE_RECEIVING);  // Green LED
+        button_set_led_state(LED_STATE_RECEIVING);
         display_set_state(DISPLAY_STATE_RECEIVING);
         ha_mqtt_set_state(HA_STATE_RECEIVING);
-        ESP_LOGI(TAG, "RX audio started (buffering)");
+        ESP_LOGI(TAG, "RX audio started");
     }
 
-    // Add to jitter buffer
-    memcpy(jitter_buffer[jitter_write_idx], pcm_buffer, samples * sizeof(int16_t));
-    jitter_write_idx = (jitter_write_idx + 1) % JITTER_BUFFER_FRAMES;
-    if (jitter_count < JITTER_BUFFER_FRAMES) {
-        jitter_count++;
-    }
+    uint32_t seq = ntohl(packet->sequence);
 
-    // Once we have enough frames buffered, start playback
-    if (!jitter_primed && jitter_count >= 2) {
-        jitter_primed = true;
-        ESP_LOGI(TAG, "Jitter buffer primed, starting playback");
+    // Detect packet loss and apply PLC/FEC before decoding current packet
+    if (sequence_initialized) {
+        int32_t gap = (int32_t)(seq - last_sequence - 1);
+        if (gap > 0 && gap <= 4) {
+            if (gap == 1) {
+                // Single packet lost — try FEC recovery using current packet's embedded FEC
+                int fec_samples = codec_decode_fec(packet->opus_data, opus_len, pcm_buffer);
+                if (fec_samples > 0) {
+                    audio_output_write(pcm_buffer, fec_samples, 20);
+                }
+            } else {
+                // Multiple packets lost — PLC for each (up to 4)
+                for (int i = 0; i < gap; i++) {
+                    int plc_samples = codec_decode_plc(pcm_buffer);
+                    if (plc_samples > 0) {
+                        audio_output_write(pcm_buffer, plc_samples, 20);
+                    }
+                }
+            }
+        }
     }
+    last_sequence = seq;
+    sequence_initialized = true;
 
-    // Play from jitter buffer
-    if (jitter_primed && jitter_count > 0) {
-        audio_output_write(jitter_buffer[jitter_read_idx], FRAME_SIZE, 50);
-        jitter_read_idx = (jitter_read_idx + 1) % JITTER_BUFFER_FRAMES;
-        jitter_count--;
+    // Decode and play current packet
+    int samples = codec_decode(packet->opus_data, opus_len, pcm_buffer);
+    if (samples > 0) {
+        audio_output_write(pcm_buffer, samples, 100);
     }
 }
 
@@ -202,6 +273,8 @@ static void audio_tx_task(void *arg)
 
     audio_packet_t *packet = (audio_packet_t *)tx_packet_buffer;
     memcpy(packet->device_id, device_id, DEVICE_ID_LENGTH);
+    // Priority is refreshed from settings each TX iteration (allows real-time HA updates)
+    packet->priority = settings_get()->priority;
 
     // Silence buffer for lead-in/trail-out
     static int16_t silence_pcm[FRAME_SIZE] = {0};
@@ -211,16 +284,52 @@ static void audio_tx_task(void *arg)
     // Pre-encode silence frame
     silence_opus_len = codec_encode(silence_pcm, silence_opus, sizeof(silence_opus));
     if (silence_opus_len <= 0) {
-        ESP_LOGE(TAG, "Failed to encode silence frame");
+        ESP_LOGE(TAG, "Failed to encode silence frame (ret=%d)", silence_opus_len);
         silence_opus_len = 0;
+    } else {
+        ESP_LOGI(TAG, "Silence frame encoded: %d bytes", silence_opus_len);
     }
 
     bool was_transmitting = false;
 
+    // AEC cleaned output accumulator. AEC processes 512-sample chunks; Opus uses
+    // 320-sample frames. We accumulate across iterations so each Opus frame is
+    // either all-cleaned or all-raw — never a mixed frame.
+    static int16_t aec_cleaned[FRAME_SIZE];
+    static int aec_cleaned_fill = 0;
+
     while (tx_task_running) {
+        // Refresh priority from settings each pass (allows real-time HA updates)
+        packet->priority = settings_get()->priority;
+
         // Detect start of transmission - send lead-in silence
         if (transmitting && !was_transmitting) {
             was_transmitting = true;
+
+            // Reset AGC state so stale gain from previous TX does not carry over
+            agc_reset();
+
+            // Reset Opus encoder state at TX start.
+            //
+            // The encoder carries internal prediction history between sessions.
+            // Without a reset, the first encoded frames of a new session are
+            // predicted against the previous session's audio (e.g. prior
+            // silence frames or voice), which can cause decoder mis-prediction
+            // artifacts on the receiving end for the first 20-60ms.
+            //
+            // After resetting, re-encode the silence frame so the lead-in
+            // packets are consistent with the fresh encoder state.
+            // Reset both pipeline stages before any encoding happens
+            aec_reset();
+            aec_cleaned_fill = 0;
+
+            codec_reset_encoder();
+            silence_opus_len = codec_encode(silence_pcm, silence_opus, sizeof(silence_opus));
+            if (silence_opus_len <= 0) {
+                ESP_LOGE(TAG, "Failed to re-encode silence after encoder reset");
+                silence_opus_len = 0;
+            }
+
             ESP_LOGI(TAG, "TX started - sending lead-in silence");
 
             // Send 15 frames of silence (300ms) to prime receiver jitter buffer
@@ -276,8 +385,31 @@ static void audio_tx_task(void *arg)
             continue;
         }
 
+        // AEC: push mic samples then accumulate cleaned output until a full
+        // FRAME_SIZE is ready. AEC processes 512-sample chunks while Opus uses
+        // 320-sample frames; accumulating avoids mixing raw and cleaned audio
+        // within the same encoded frame, which causes audible quality artifacts.
+        // Apply AGC to normalize microphone volume (before AEC and encode)
+        if (settings_get()->agc_enabled) {
+            agc_process(pcm_buffer, samples);
+        }
+
+        const int16_t *encode_buf = pcm_buffer;
+        if (aec_is_ready()) {
+            aec_push_mic(pcm_buffer, samples);
+            int got = aec_pop_cleaned(aec_cleaned + aec_cleaned_fill,
+                                      FRAME_SIZE - aec_cleaned_fill);
+            aec_cleaned_fill += got;
+            if (aec_cleaned_fill >= FRAME_SIZE) {
+                encode_buf = aec_cleaned;
+                aec_cleaned_fill = 0;
+            }
+            // If not enough cleaned yet, fall through with raw pcm_buffer for
+            // this frame (happens during AEC priming, ~40ms at TX start)
+        }
+
         // Encode PCM to Opus
-        int opus_len = codec_encode(pcm_buffer, opus_buffer, sizeof(opus_buffer));
+        int opus_len = codec_encode(encode_buf, opus_buffer, sizeof(opus_buffer));
         if (opus_len <= 0) {
             continue;
         }
@@ -300,11 +432,204 @@ static void audio_tx_task(void *arg)
 }
 
 /**
- * Get the appropriate idle LED state (muted or normal idle).
+ * Get the appropriate idle LED state (DND > muted > normal idle).
  */
 static led_state_t get_idle_led_state(void)
 {
+    const settings_t *cfg = settings_get();
+    if (cfg->dnd_enabled) {
+        return LED_STATE_DND;    // Purple - DND active
+    }
     return audio_output_is_muted() ? LED_STATE_MUTED : LED_STATE_IDLE;
+}
+
+/**
+ * Generate a short fallback beep (800 Hz, ~500ms) for call notification.
+ *
+ * The hub streams the real chime over UDP/Opus. This beep is played
+ * immediately on call arrival so the user gets instant feedback even
+ * if the hub chime audio hasn't arrived yet (e.g., hub unreachable).
+ * It is intentionally short to not overlap with incoming hub audio.
+ *
+ * The beep is 200ms (10 × 20ms frames) at 800 Hz, 50% amplitude.
+ * Keeping it brief minimises AEC reference contamination.
+ */
+static void play_fallback_beep(void)
+{
+    if (transmitting) return;
+
+    // Stop any RX audio to free the output path
+    if (audio_playing) {
+        audio_output_stop();
+        audio_playing = false;
+        has_current_sender = false;
+    }
+
+    // Generate one 20ms sine-wave frame and repeat it
+    static int16_t beep_frame[FRAME_SIZE];
+    for (int i = 0; i < FRAME_SIZE; i++) {
+        // 800 Hz at 50% amplitude (16384 peak, well below 32767 clipping)
+        beep_frame[i] = (int16_t)(16384.0f * sinf(2.0f * M_PI * 800.0f * i / (float)SAMPLE_RATE));
+    }
+
+    audio_output_start();
+    button_set_led_state(LED_STATE_RECEIVING);
+
+    // Play 10 frames = 200ms of beep
+    for (int frame = 0; frame < 10; frame++) {
+        audio_output_write(beep_frame, FRAME_SIZE, 50);
+    }
+
+    audio_output_stop();
+
+    // Flush AEC reference: local beep audio must not contaminate the next TX's
+    // AEC reference queue, which would cause voice cancellation artefacts.
+    // See detailed comment in aec.h / the old play_incoming_call_chime().
+    aec_flush_reference();
+
+    button_set_led_state(get_idle_led_state());
+    ESP_LOGI(TAG, "Fallback beep complete (hub chime incoming via UDP)");
+}
+
+/**
+ * Handle incoming call notification.
+ *
+ * The hub streams the real chime audio over UDP immediately after publishing
+ * the MQTT call message.  The ESP32 plays the hub chime through the normal
+ * on_audio_received() path (priority HIGH, so it preempts normal RX).
+ *
+ * This function provides an instant 200ms beep as local feedback (so the
+ * user doesn't see silence while the hub chime is in transit) and sets the
+ * LED to indicate an incoming call.
+ */
+static void play_incoming_call_chime(void)
+{
+    if (transmitting) return;
+
+    ESP_LOGI(TAG, "Incoming call — playing fallback beep, hub chime incoming via UDP");
+
+    // Flash the LED to signal an incoming call (RECEIVING colour)
+    button_set_led_state(LED_STATE_RECEIVING);
+
+    // Play short local beep for immediate audible feedback
+    play_fallback_beep();
+
+    // LED reverts inside play_fallback_beep() — nothing else to do here.
+    // The hub chime arrives as normal Opus/UDP packets and plays through
+    // on_audio_received() automatically (no special handling needed).
+}
+
+/**
+ * Apply a settings change made on the OLED display.
+ *
+ * Called from display.c (cycle_button_task) via the settings callback.
+ * Applies the value to the audio/LED subsystem, persists it via settings_set_xxx(),
+ * and publishes it to Home Assistant over MQTT.
+ *
+ * NOTE: runs in the cycle_button_task context (priority 5, 4KB stack).
+ * Keep it lightweight — no blocking I/O.
+ */
+static void on_display_setting_changed(int index, int value)
+{
+    switch (index) {
+        case SETTINGS_ITEM_DND: {
+            bool dnd = (value != 0);
+            settings_set_dnd(dnd);
+            if (!transmitting && !audio_playing) {
+                button_set_led_state(get_idle_led_state());
+            }
+            ha_mqtt_publish_dnd();
+            ESP_LOGI(TAG, "Display: DND -> %s", dnd ? "ON" : "OFF");
+            break;
+        }
+        case SETTINGS_ITEM_PRIORITY: {
+            uint8_t pri = (uint8_t)value;
+            settings_set_priority(pri);
+            ha_mqtt_publish_priority();
+            ESP_LOGI(TAG, "Display: Priority -> %d", pri);
+            break;
+        }
+        case SETTINGS_ITEM_MUTE: {
+            bool muted = (value != 0);
+            settings_set_mute(muted);
+            audio_output_set_mute(muted);
+            if (!transmitting && !audio_playing) {
+                button_set_led_state(get_idle_led_state());
+            }
+            ha_mqtt_publish_mute();
+            ESP_LOGI(TAG, "Display: Mute -> %s", muted ? "ON" : "OFF");
+            break;
+        }
+        case SETTINGS_ITEM_VOLUME: {
+            uint8_t vol = (uint8_t)value;
+            settings_set_volume(vol);
+            audio_output_set_volume(vol);
+            ha_mqtt_publish_volume();
+            ESP_LOGI(TAG, "Display: Volume -> %d%%", vol);
+            break;
+        }
+        case SETTINGS_ITEM_AGC: {
+            bool agc = (value != 0);
+            settings_set_agc_enabled(agc);
+            ha_mqtt_publish_agc();
+            ESP_LOGI(TAG, "Display: AGC -> %s", agc ? "ON" : "OFF");
+            break;
+        }
+        case SETTINGS_ITEM_LED: {
+            bool led = (value != 0);
+            settings_set_led_enabled(led);
+            button_set_idle_led_enabled(led);
+            ha_mqtt_publish_led();
+            ESP_LOGI(TAG, "Display: LED -> %s", led ? "ON" : "OFF");
+            break;
+        }
+        default:
+            ESP_LOGW(TAG, "Unknown display setting index: %d", index);
+            break;
+    }
+}
+
+/**
+ * Handle MQTT commands from Home Assistant (priority, DND, etc.)
+ */
+static void on_ha_command(ha_cmd_t cmd, int value)
+{
+    switch (cmd) {
+        case HA_CMD_DND: {
+            bool dnd = (value != 0);
+            // Update LED to reflect DND state immediately
+            if (!transmitting && !audio_playing) {
+                button_set_led_state(get_idle_led_state());
+            }
+            // Sync display settings page if open
+            display_sync_settings();
+            ESP_LOGI(TAG, "DND %s via HA", dnd ? "enabled" : "disabled");
+            break;
+        }
+        case HA_CMD_MUTE:
+            // Update LED to reflect mute/DND state
+            if (!transmitting && !audio_playing) {
+                button_set_led_state(get_idle_led_state());
+            }
+            display_sync_settings();
+            ESP_LOGI(TAG, "Mute %s via HA", value ? "on" : "off");
+            break;
+        case HA_CMD_PRIORITY:
+            display_sync_settings();
+            ESP_LOGI(TAG, "Priority set to %d via HA", value);
+            break;
+        case HA_CMD_VOLUME:
+            display_sync_settings();
+            break;
+        case HA_CMD_AGC:
+            display_sync_settings();
+            break;
+        case HA_CMD_LED:
+            display_sync_settings();
+            break;
+        default:
+            break;
+    }
 }
 
 /**
@@ -313,27 +638,75 @@ static led_state_t get_idle_led_state(void)
 static void on_button_event(button_event_t event, bool is_broadcast)
 {
     switch (event) {
-        case BUTTON_EVENT_PRESSED:
+        case BUTTON_EVENT_PRESSED: {
+            const settings_t *cfg = settings_get();
+            uint8_t my_priority = cfg->priority;
+
             // Check if channel is busy (someone else talking)
             if (is_channel_busy()) {
-                button_set_led_state(LED_STATE_BUSY);  // Orange - channel busy
-                display_set_state(DISPLAY_STATE_ERROR);
-                display_show_message("Channel Busy", 1000);
-                ESP_LOGW(TAG, "Channel busy - cannot transmit");
-                // Don't set transmitting = true, so TX task won't send
+                // Check if we have sufficient priority to preempt
+                if (my_priority > current_rx_priority) {
+                    // Preempt: stop current RX, start TX
+                    ESP_LOGW(TAG, "PTT preempting channel (our=%d > rx=%d)",
+                             my_priority, current_rx_priority);
+                    if (audio_playing) {
+                        audio_output_stop();
+                        audio_playing = false;
+                        has_current_sender = false;
+                    }
+                    // Restore emergency override if active from the preempted stream
+                    if (audio_output_is_emergency_override()) {
+                        audio_output_restore_volume();
+                    }
+                    has_current_sender = false;  // Release channel
+                    current_rx_priority = 0;     // Reset priority
+                    button_set_led_state(LED_STATE_TRANSMITTING);
+                    display_set_state(DISPLAY_STATE_TRANSMITTING);
+                    transmitting = true;
+                    ha_mqtt_set_state(HA_STATE_TRANSMITTING);
+                } else {
+                    button_set_led_state(LED_STATE_BUSY);  // Orange - channel busy
+                    display_set_state(DISPLAY_STATE_ERROR);
+                    display_show_message("Channel Busy", 1000);
+                    ESP_LOGW(TAG, "Channel busy - cannot transmit (our=%d, rx=%d)",
+                             my_priority, current_rx_priority);
+                }
             } else {
+                // Suppress PTT for CALL_TX_LOCKOUT_MS after sending a call.
+                // The caller's mic is physically near the speaker, so the chime
+                // acoustic tail would be encoded into the first PTT broadcast.
+                if (last_call_sent_time != 0) {
+                    uint32_t now_ticks = xTaskGetTickCount();
+                    uint32_t since_call_ms = (now_ticks - last_call_sent_time) * portTICK_PERIOD_MS;
+                    if (since_call_ms < CALL_TX_LOCKOUT_MS) {
+                        ESP_LOGW(TAG, "PTT suppressed: %lums since call (lockout %dms)",
+                                 (unsigned long)since_call_ms, CALL_TX_LOCKOUT_MS);
+                        break;
+                    }
+                }
+
+                // Stop any audio currently playing — flushes DMA immediately so
+                // the speaker doesn't leak 160ms of residual audio into the mic.
+                if (audio_playing) {
+                    audio_output_stop();
+                    audio_playing = false;
+                    has_current_sender = false;
+                }
+                // Normal broadcast - works for all targets including mobile
+                // (Mobile users will hear audio when they open Web PTT)
                 button_set_led_state(LED_STATE_TRANSMITTING);  // Cyan
                 display_set_state(DISPLAY_STATE_TRANSMITTING);
                 transmitting = true;
                 ha_mqtt_set_state(HA_STATE_TRANSMITTING);
             }
             break;
+        }
 
         case BUTTON_EVENT_LONG_PRESS:
             break;
 
         case BUTTON_EVENT_RELEASED:
-            button_set_led_state(get_idle_led_state());  // White or red if muted
+            button_set_led_state(get_idle_led_state());  // White, red, or purple if DND
             display_set_state(DISPLAY_STATE_IDLE);
             transmitting = false;
             ha_mqtt_set_state(HA_STATE_IDLE);
@@ -355,6 +728,35 @@ static void on_config_received(const device_config_t *config)
 }
 
 /**
+ * Handle long press on cycle button - send call notification to target.
+ * When "All Rooms" is selected, calls every discovered device simultaneously.
+ */
+static void on_cycle_long_press(void)
+{
+    const char *target = ha_mqtt_get_target_name();
+
+    if (strcmp(target, "All Rooms") == 0) {
+        // Call all discovered rooms at once
+        int count = ha_mqtt_send_call_all_rooms();
+        if (count > 0) {
+            last_call_sent_time = xTaskGetTickCount();  // Start PTT lockout
+            display_show_message("Calling all...", 1500);
+            ESP_LOGI(TAG, "Sent call to all rooms (%d devices)", count);
+        } else {
+            display_show_message("No devices online", 1500);
+            ESP_LOGW(TAG, "Call all rooms: no devices available");
+        }
+        return;
+    }
+
+    // Send call to specific target (works for ESP32s and mobiles)
+    ha_mqtt_send_call(target);
+    last_call_sent_time = xTaskGetTickCount();  // Start PTT lockout
+    display_show_message("Calling...", 1500);
+    ESP_LOGI(TAG, "Sent call to %s", target);
+}
+
+/**
  * Application entry point.
  */
 void app_main(void)
@@ -365,6 +767,16 @@ void app_main(void)
     ESP_LOGI(TAG, "HA Intercom starting...");
     ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
 
+    // Log PSRAM availability
+    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    if (psram_size > 0) {
+        ESP_LOGI(TAG, "PSRAM: %u KB total, %u KB free",
+                 (unsigned)(psram_size / 1024),
+                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    } else {
+        ESP_LOGW(TAG, "No PSRAM detected - using internal RAM only");
+    }
+
     // Initialize settings from NVS (must be early, before network_init uses NVS)
     ESP_ERROR_CHECK(settings_init());
     const settings_t *cfg = settings_get();
@@ -374,6 +786,7 @@ void app_main(void)
 
     // Initialize HA MQTT (does not connect yet)
     ha_mqtt_init(device_id);
+    ha_mqtt_set_callback(on_ha_command);
 
     // Initialize button and LED
     ESP_ERROR_CHECK(button_init());
@@ -383,6 +796,10 @@ void app_main(void)
     esp_err_t disp_ret = display_init();
     if (disp_ret == ESP_OK) {
         ESP_LOGI(TAG, "Display initialized");
+        // Register long press callback for mobile notifications
+        display_set_long_press_callback(on_cycle_long_press);
+        // Register settings change callback for OLED settings page
+        display_set_settings_callback(on_display_setting_changed);
     } else if (disp_ret == ESP_ERR_NOT_FOUND) {
         ESP_LOGI(TAG, "No display detected - running without");
     } else {
@@ -394,17 +811,24 @@ void app_main(void)
     ESP_ERROR_CHECK(audio_input_init());
     ESP_ERROR_CHECK(audio_output_init());
 
+    // Initialize AGC
+    agc_init();
+
+    // Initialize AEC — non-fatal if esp-sr unavailable or no PSRAM
+    esp_err_t aec_ret = aec_init();
+    if (aec_ret == ESP_OK) {
+        ESP_LOGI(TAG, "AEC enabled");
+    } else {
+        ESP_LOGW(TAG, "AEC unavailable (%s) — raw mic audio", esp_err_to_name(aec_ret));
+    }
+
     // Apply saved settings
     audio_output_set_volume(cfg->volume);
     audio_output_set_mute(cfg->muted);
     button_set_idle_led_enabled(cfg->led_enabled);
 
-    // Set initial LED state based on mute
-    if (cfg->muted) {
-        button_set_led_state(LED_STATE_MUTED);
-    } else {
-        button_set_led_state(LED_STATE_IDLE);
-    }
+    // Set initial LED state based on DND > mute > idle
+    button_set_led_state(get_idle_led_state());
 
     // Start microphone input - must be enabled before reading
     audio_input_start();
@@ -472,12 +896,25 @@ void app_main(void)
     discovery_set_config_callback(on_config_received);
     ESP_ERROR_CHECK(discovery_start());
 
-    // Start audio TX task with 32KB stack (required for Opus encoding)
+    // Log heap fragmentation before task creation
+    ESP_LOGI(TAG, "Heap before TX task: internal largest=%u KB, PSRAM largest=%u KB",
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / 1024));
+
+    // Start audio TX task - stack in PSRAM to save ~32KB of internal RAM.
+    // Encoder is in internal RAM (timing-critical); stack can be in PSRAM.
     tx_task_running = true;
-    xTaskCreate(audio_tx_task, "audio_tx", 32768, NULL, 5, &tx_task_handle);
+    tx_task_handle = xTaskCreateStatic(audio_tx_task, "audio_tx", sizeof(tx_task_stack),
+                                       NULL, 5, tx_task_stack, &tx_task_tcb);
+    if (tx_task_handle == NULL) {
+        ESP_LOGE(TAG, "FATAL: Failed to create audio TX task - TX disabled");
+        tx_task_running = false;
+    }
 
     ESP_LOGI(TAG, "Room: %s | Volume: %d%%", cfg->room_name, cfg->volume);
-    ESP_LOGI(TAG, "Free heap: %lu bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Free internal: %u KB, PSRAM: %u KB",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
     ESP_LOGI(TAG, "Ready! Hold BOOT button to transmit");
 
@@ -502,7 +939,13 @@ void app_main(void)
                 audio_output_stop();
                 audio_playing = false;
                 has_current_sender = false;  // Release channel
-                button_set_led_state(get_idle_led_state());  // White or red if muted
+                current_rx_priority = 0;     // Reset for next sender (PRIORITY_NORMAL)
+                // Restore volume/mute if emergency override was active
+                if (audio_output_is_emergency_override()) {
+                    audio_output_restore_volume();
+                    ESP_LOGI(TAG, "Emergency override restored after RX stopped");
+                }
+                button_set_led_state(get_idle_led_state());  // White, red, or purple
                 display_set_state(DISPLAY_STATE_IDLE);
                 ha_mqtt_set_state(HA_STATE_IDLE);
                 ESP_LOGI(TAG, "RX audio stopped (idle), channel released");
@@ -524,6 +967,7 @@ void app_main(void)
                 strncpy(room_list[room_idx].name, "All Rooms", MAX_ROOM_NAME_LEN - 1);
                 strncpy(room_list[room_idx].ip, MULTICAST_GROUP, 15);
                 room_list[room_idx].is_multicast = true;
+                room_list[room_idx].is_mobile = false;
                 room_idx++;
 
                 // Add discovered devices (excluding self and unavailable)
@@ -537,6 +981,7 @@ void app_main(void)
                         strncpy(room_list[room_idx].name, room, MAX_ROOM_NAME_LEN - 1);
                         strncpy(room_list[room_idx].ip, ip, 15);
                         room_list[room_idx].is_multicast = false;
+                        room_list[room_idx].is_mobile = ha_mqtt_is_device_mobile(i);
                         room_idx++;
                     }
                 }
@@ -561,6 +1006,13 @@ void app_main(void)
 
         // Process deferred MQTT operations
         ha_mqtt_process();
+
+        // Check for incoming calls
+        char caller_name[32];
+        if (ha_mqtt_check_incoming_call(caller_name)) {
+            ESP_LOGI(TAG, "Incoming call from: %s", caller_name);
+            play_incoming_call_chime();
+        }
 
         vTaskDelay(pdMS_TO_TICKS(100));
     }

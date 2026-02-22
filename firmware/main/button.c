@@ -208,6 +208,10 @@ void button_set_led_state(led_state_t state)
         case LED_STATE_BUSY:
             set_led_rgb(64, 32, 0);    // Orange when channel busy
             break;
+
+        case LED_STATE_DND:
+            set_led_rgb(40, 0, 60);    // Purple/violet when Do Not Disturb active
+            break;
     }
 
     ESP_LOGI(TAG, "LED state: %d", state);

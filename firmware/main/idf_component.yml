@@ -13,3 +13,7 @@ dependencies:
 
   # mDNS for .local hostname resolution
   espressif/mdns: "^1.0.0"
+
+  # AEC (Acoustic Echo Cancellation) via esp-sr
+  # Provides esp_aec.h: aec_create/process/destroy on ESP32-S3
+  espressif/esp-sr: ">=2.1.0"

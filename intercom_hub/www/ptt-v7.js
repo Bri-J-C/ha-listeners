@@ -6,7 +6,17 @@
  *
  * Mic is acquired on init, released when app is backgrounded,
  * and re-acquired when app returns to foreground.
+ *
+ * Priority levels (must match firmware protocol.h and hub):
+ *   0 = Normal  — first-to-talk collision avoidance
+ *   1 = High    — overrides Normal transmissions
+ *   2 = Emergency — overrides all, bypasses DND on receiver
  */
+
+// Priority constants (kept in sync with firmware protocol.h)
+const PRIORITY_NORMAL = 0;
+const PRIORITY_HIGH = 1;
+const PRIORITY_EMERGENCY = 2;
 
 class IntercomPTT {
     constructor() {
@@ -19,11 +29,43 @@ class IntercomPTT {
         this.isConnected = false;
         this.isTransmitting = false;
         this.isReceiving = false;
+        this.lastCallTime = 0;  // Timestamp of last call sent (ms), for PTT lockout
         this.isInitialized = false;
         this.micEnabled = false;
+        this.pendingCaller = null;
+        this.clientId = null;  // This client's identity (e.g., "Brians_Phone")
+
+        // Priority and DND state
+        this.priority = PRIORITY_NORMAL;  // Our TX priority
+        this.dndEnabled = false;          // Client-side DND: only play EMERGENCY audio
+
+        // Parse caller and device identity from URL
+        const params = new URLSearchParams(window.location.search);
+        const callerParam = params.get('caller');
+        const deviceParam = params.get('device');
+
+        if (callerParam) {
+            this.pendingCaller = decodeURIComponent(callerParam).replace(/_/g, ' ');
+            console.log('Caller from URL:', this.pendingCaller);
+        }
+        if (deviceParam) {
+            // Mobile device from notification - use device name
+            this.clientId = decodeURIComponent(deviceParam).replace(/_/g, ' ');
+            console.log('Client identity from URL:', this.clientId);
+        } else {
+            // Regular web client - get/generate persistent ID
+            this.clientId = this.getOrCreateClientId();
+            console.log('Client identity from storage:', this.clientId);
+        }
+
+        // WebSocket reconnect backoff
+        this.reconnectDelay = 1000;
+        this.maxReconnectDelay = 30000;
+        this.reconnectTimer = null;
 
         // Audio playback
         this.nextPlayTime = 0;
+        this.playbackBuffer = null;  // Reusable Float32Array for playAudio
 
         // UI Elements
         this.initOverlay = document.getElementById('initOverlay');
@@ -32,10 +74,21 @@ class IntercomPTT {
         this.connStatus = document.getElementById('connStatus');
         this.pttStatus = document.getElementById('pttStatus');
         this.targetSelect = document.getElementById('targetSelect');
+        this.callButton = document.getElementById('callButton');
         this.errorBanner = document.getElementById('errorBanner');
+        this.deviceNameInput = document.getElementById('deviceNameInput');
+        this.prioritySelect = document.getElementById('prioritySelect');
+        this.dndToggle = document.getElementById('dndToggle');
+
+        // Pre-fill device name input from localStorage
+        const savedName = localStorage.getItem('intercom_custom_name');
+        if (savedName) {
+            this.deviceNameInput.value = savedName;
+        }
 
         // Bind event handlers
         this.initButton.addEventListener('click', () => this.initialize());
+        this.callButton.addEventListener('click', () => this.sendCall());
 
         // PTT button - use pointer events for unified touch/mouse handling
         this.pttButton.addEventListener('pointerdown', (e) => {
@@ -60,6 +113,16 @@ class IntercomPTT {
 
         // Target selection
         this.targetSelect.addEventListener('change', () => this.sendTargetChange());
+
+        // Priority selection
+        if (this.prioritySelect) {
+            this.prioritySelect.addEventListener('change', () => this.onPriorityChange());
+        }
+
+        // DND toggle
+        if (this.dndToggle) {
+            this.dndToggle.addEventListener('change', () => this.onDndChange());
+        }
 
         // Keyboard support (spacebar)
         document.addEventListener('keydown', (e) => {
@@ -100,10 +163,14 @@ class IntercomPTT {
         this.pttStatus.textContent = status.charAt(0).toUpperCase() + status.slice(1);
         this.pttStatus.className = 'status-value status-' + status;
 
-        // Update button state
-        this.pttButton.classList.remove('transmitting', 'receiving', 'busy');
+        // Update button state — also apply priority class when transmitting
+        this.pttButton.classList.remove('transmitting', 'receiving', 'busy',
+                                        'priority-normal', 'priority-high', 'priority-emergency');
         if (status === 'transmitting') {
             this.pttButton.classList.add('transmitting');
+            const priorityClasses = ['priority-normal', 'priority-high', 'priority-emergency'];
+            const cls = priorityClasses[this.priority];
+            if (cls) this.pttButton.classList.add(cls);
         } else if (status === 'receiving') {
             this.pttButton.classList.add('receiving');
         }
@@ -111,6 +178,19 @@ class IntercomPTT {
 
     async initialize() {
         try {
+            // Check for custom device name (only if not from URL param)
+            if (!new URLSearchParams(window.location.search).get('device')) {
+                const customName = this.deviceNameInput.value.trim();
+                if (customName) {
+                    localStorage.setItem('intercom_custom_name', customName);
+                    this.clientId = customName;
+                    console.log('Using custom device name:', this.clientId);
+                } else {
+                    localStorage.removeItem('intercom_custom_name');
+                    this.clientId = this.getOrCreateClientId();
+                }
+            }
+
             // Check if we're in a secure context (HTTPS or localhost)
             if (!window.isSecureContext) {
                 console.warn('Microphone requires HTTPS. Receive-only mode.');
@@ -206,6 +286,12 @@ class IntercomPTT {
     }
 
     connectWebSocket() {
+        // Clear any pending reconnect timer to prevent stacked connections
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+
         // Determine WebSocket URL - use relative path for ingress compatibility
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const basePath = window.location.pathname.replace(/\/$/, '');
@@ -219,10 +305,21 @@ class IntercomPTT {
         this.websocket.onopen = () => {
             console.log('WebSocket connected');
             this.isConnected = true;
+            this.reconnectDelay = 1000;  // Reset backoff on successful connection
             this.connStatus.textContent = 'Connected';
             this.connStatus.className = 'status-value status-connected';
             this.pttButton.classList.remove('disabled');
+            this.callButton.disabled = false;
             this.hideError();
+
+            // Send client identity if known (from notification URL)
+            if (this.clientId) {
+                this.websocket.send(JSON.stringify({
+                    type: 'identify',
+                    client_id: this.clientId
+                }));
+                console.log('Sent identity:', this.clientId);
+            }
 
             // Request current state and target list
             this.websocket.send(JSON.stringify({ type: 'get_state' }));
@@ -234,11 +331,16 @@ class IntercomPTT {
             this.connStatus.textContent = 'Disconnected';
             this.connStatus.className = 'status-value status-disconnected';
             this.pttButton.classList.add('disabled');
+            this.callButton.disabled = true;
             this.updateStatus('idle');
 
-            // Reconnect after delay (only if initialized and not hidden)
+            // Reconnect with exponential backoff (only if initialized and not hidden)
             if (this.isInitialized && !document.hidden) {
-                setTimeout(() => this.connectWebSocket(), 3000);
+                const delay = this.reconnectDelay;
+                console.log(`Reconnecting in ${delay / 1000}s...`);
+                this.connStatus.textContent = `Reconnecting in ${delay / 1000}s...`;
+                this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+                this.reconnectTimer = setTimeout(() => this.connectWebSocket(), delay);
             }
         };
 
@@ -274,6 +376,22 @@ class IntercomPTT {
                 if (msg.status) {
                     this.updateStatus(msg.status);
                 }
+                // If server suggests a name and we don't have one from URL or custom storage
+                if (msg.suggested_name && !new URLSearchParams(window.location.search).get('device')) {
+                    const customName = localStorage.getItem('intercom_custom_name');
+                    if (!customName) {
+                        // Use suggested name (mobile app detected)
+                        this.clientId = msg.suggested_name;
+                        console.log('Using suggested name from server:', this.clientId);
+                        // Re-send identity with the suggested name
+                        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+                            this.websocket.send(JSON.stringify({
+                                type: 'identify',
+                                client_id: this.clientId
+                            }));
+                        }
+                    }
+                }
                 break;
 
             case 'state':
@@ -295,6 +413,30 @@ class IntercomPTT {
                         option.textContent = room;
                         this.targetSelect.appendChild(option);
                     });
+                }
+                // Auto-select caller if coming from notification
+                if (this.pendingCaller) {
+                    const callerOption = Array.from(this.targetSelect.options).find(
+                        opt => opt.value.toLowerCase().includes(this.pendingCaller.toLowerCase())
+                    );
+                    if (callerOption) {
+                        this.targetSelect.value = callerOption.value;
+                        console.log('Auto-selected caller:', callerOption.value);
+                    }
+                    this.pendingCaller = null; // Clear so it doesn't re-select
+                }
+                break;
+
+            case 'recent_call':
+                // Auto-select caller from recent notification
+                if (msg.caller) {
+                    const callerOption = Array.from(this.targetSelect.options).find(
+                        opt => opt.value.toLowerCase().includes(msg.caller.toLowerCase())
+                    );
+                    if (callerOption) {
+                        this.targetSelect.value = callerOption.value;
+                        console.log('Auto-selected recent caller:', callerOption.value);
+                    }
                 }
                 break;
 
@@ -326,6 +468,13 @@ class IntercomPTT {
             return;
         }
 
+        // Suppress PTT for 2s after sending a call to prevent the chime acoustic
+        // tail from being captured by the mic and broadcast to the called room.
+        if (this.lastCallTime > 0 && (Date.now() - this.lastCallTime) < 2000) {
+            console.log('PTT suppressed: waiting for call tone to decay');
+            return;
+        }
+
         this.isTransmitting = true;
         this.pttButton.classList.add('active', 'transmitting');
         this.updateStatus('transmitting');
@@ -336,11 +485,13 @@ class IntercomPTT {
             this.workletNode.port.postMessage({ type: 'ptt', active: true });
         }
 
-        // Tell server we're transmitting
+        // Tell server we're transmitting — include selected priority
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+            const priorityNames = ['Normal', 'High', 'Emergency'];
             this.websocket.send(JSON.stringify({
                 type: 'ptt_start',
-                target: this.targetSelect.value
+                target: this.targetSelect.value,
+                priority: priorityNames[this.priority] || 'Normal'
             }));
         }
     }
@@ -385,19 +536,60 @@ class IntercomPTT {
         }
     }
 
-    playAudio(pcmBuffer) {
+    sendCall() {
+        const target = this.targetSelect.value;
+        if (!this.isConnected) {
+            return;
+        }
+
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+            this.websocket.send(JSON.stringify({
+                type: 'call',
+                target: target
+            }));
+            console.log('Sent call to:', target);
+            this.lastCallTime = Date.now();  // Start PTT lockout
+
+            // Brief visual feedback
+            this.callButton.classList.add('calling');
+            setTimeout(() => {
+                this.callButton.classList.remove('calling');
+            }, 1000);
+        }
+    }
+
+    playAudio(rawBuffer) {
         if (!this.audioContext) return;
+
+        // Parse the 1-byte priority prefix prepended by the hub
+        // Frame format: [1 byte priority][PCM Int16LE data...]
+        const rawBytes = new Uint8Array(rawBuffer);
+        if (rawBytes.length < 2) return;
+
+        const incomingPriority = rawBytes[0];
+        const pcmBuffer = rawBuffer.slice(1);  // PCM data without the prefix byte
+
+        // Client-side DND: only play EMERGENCY audio
+        if (this.dndEnabled && incomingPriority < PRIORITY_EMERGENCY) {
+            return;
+        }
 
         // Resume context if needed (mobile browsers suspend it)
         if (this.audioContext.state === 'suspended') {
             this.audioContext.resume();
         }
 
-        // Convert Int16 to Float32
+        // Convert Int16 to Float32, reusing buffer when possible
         const int16 = new Int16Array(pcmBuffer);
-        const float32 = new Float32Array(int16.length);
+        const numSamples = int16.length;
 
-        for (let i = 0; i < int16.length; i++) {
+        // Reuse pre-allocated buffer if it matches the expected size, otherwise allocate
+        if (!this.playbackBuffer || this.playbackBuffer.length !== numSamples) {
+            this.playbackBuffer = new Float32Array(numSamples);
+        }
+        const float32 = this.playbackBuffer;
+
+        for (let i = 0; i < numSamples; i++) {
             float32[i] = int16[i] / 32768.0;
         }
 
@@ -419,6 +611,21 @@ class IntercomPTT {
         this.nextPlayTime += buffer.duration;
     }
 
+    onPriorityChange() {
+        const val = parseInt(this.prioritySelect.value, 10);
+        if (val >= PRIORITY_NORMAL && val <= PRIORITY_EMERGENCY) {
+            this.priority = val;
+            console.log('Priority set to:', ['Normal', 'High', 'Emergency'][val]);
+            // Update UI styling to reflect the selected priority
+            this.prioritySelect.className = 'priority-select priority-' + ['normal', 'high', 'emergency'][val];
+        }
+    }
+
+    onDndChange() {
+        this.dndEnabled = this.dndToggle.checked;
+        console.log('DND', this.dndEnabled ? 'enabled' : 'disabled');
+    }
+
     suspend() {
         if (!this.isInitialized) return;
 
@@ -431,6 +638,12 @@ class IntercomPTT {
 
         // Release microphone
         this.releaseMic();
+
+        // Cancel any pending reconnect timer
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
 
         // Close WebSocket to stop receiving audio
         if (this.websocket) {
@@ -465,6 +678,9 @@ class IntercomPTT {
                 this.audioContext = new AudioContext({ sampleRate: 16000 });
             }
 
+            // Reset backoff so reconnect is immediate after resume
+            this.reconnectDelay = 1000;
+
             // Reconnect WebSocket
             this.connectWebSocket();
 
@@ -476,6 +692,24 @@ class IntercomPTT {
             this.audioContext = new AudioContext({ sampleRate: 16000 });
             this.connectWebSocket();
         }
+    }
+
+    getOrCreateClientId() {
+        const storageKey = 'intercom_client_id';
+
+        // Check localStorage for existing ID
+        let clientId = localStorage.getItem(storageKey);
+        if (clientId) {
+            return clientId;
+        }
+
+        // Generate a friendly name: "Web_XXXX" where XXXX is random hex
+        const randomPart = Math.random().toString(16).substring(2, 6).toUpperCase();
+        clientId = `Web_${randomPart}`;
+
+        // Store for future sessions
+        localStorage.setItem(storageKey, clientId);
+        return clientId;
     }
 }
 

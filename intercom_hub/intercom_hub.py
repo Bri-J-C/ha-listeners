@@ -20,11 +20,17 @@ import socket
 import struct
 import hashlib
 import threading
+import concurrent.futures
 import subprocess
 import time
 import asyncio
 import logging
+import urllib.request
+import urllib.error
+import re
+import html
 from pathlib import Path
+from typing import Optional, Dict, Any
 import paho.mqtt.client as mqtt
 
 # Setup logging
@@ -42,8 +48,104 @@ logging.basicConfig(
 )
 log = logging.getLogger('intercom_hub')
 
+# =============================================================================
+# Input Validation and Sanitization (Security)
+# =============================================================================
+
+# Maximum lengths for user inputs
+MAX_CLIENT_ID_LENGTH = 64
+MAX_ROOM_NAME_LENGTH = 32
+MAX_MESSAGE_LENGTH = 1024
+MAX_URL_LENGTH = 2048
+
+# Allowed characters for client IDs and room names (alphanumeric, spaces, underscores, dashes)
+SAFE_NAME_PATTERN = re.compile(r'^[\w\s\-\.]+$', re.UNICODE)
+
+# URL whitelist patterns for audio fetch (restrict to safe sources)
+ALLOWED_URL_PATTERNS = [
+    r'^https?://[a-zA-Z0-9\.\-]+/.*\.(mp3|wav|ogg|m4a)$',  # Audio file URLs
+    r'^https?://(localhost|127\.0\.0\.1|10\.0\.0\.\d+|homeassistant|supervisor)/api/.*$',  # HA API endpoints only
+]
+
+
+def sanitize_string(value: str, max_length: int = 64) -> str:
+    """Sanitize a string by removing dangerous characters and limiting length."""
+    if not isinstance(value, str):
+        return ""
+    # Remove control characters and null bytes
+    value = ''.join(c for c in value if c.isprintable() or c in ' \t')
+    # Trim to max length
+    return value[:max_length].strip()
+
+
+def sanitize_client_id(client_id: str) -> Optional[str]:
+    """Sanitize and validate a client ID."""
+    if not client_id or not isinstance(client_id, str):
+        return None
+    client_id = sanitize_string(client_id, MAX_CLIENT_ID_LENGTH)
+    if not client_id or not SAFE_NAME_PATTERN.match(client_id):
+        log.warning(f"Invalid client_id rejected: {repr(client_id[:20])}")
+        return None
+    return client_id
+
+
+def sanitize_room_name(room: str) -> Optional[str]:
+    """Sanitize and validate a room name."""
+    if not room or not isinstance(room, str):
+        return None
+    room = sanitize_string(room, MAX_ROOM_NAME_LENGTH)
+    if not room or not SAFE_NAME_PATTERN.match(room):
+        log.warning(f"Invalid room name rejected: {repr(room[:20])}")
+        return None
+    return room
+
+
+def validate_ip_address(ip: str) -> bool:
+    """Validate an IP address format."""
+    if not ip or not isinstance(ip, str):
+        return False
+    # Simple IPv4 validation
+    parts = ip.split('.')
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except ValueError:
+        return False
+
+
+def validate_url(url: str) -> bool:
+    """Validate URL against whitelist patterns (for audio fetch)."""
+    if not url or not isinstance(url, str):
+        return False
+    if len(url) > MAX_URL_LENGTH:
+        return False
+    for pattern in ALLOWED_URL_PATTERNS:
+        if re.match(pattern, url, re.IGNORECASE):
+            return True
+    return False
+
+
+def sanitize_json_payload(payload: str) -> Optional[Dict[str, Any]]:
+    """Parse and validate JSON payload."""
+    if not payload or not isinstance(payload, str):
+        return None
+    if len(payload) > MAX_MESSAGE_LENGTH:
+        log.warning(f"JSON payload too large: {len(payload)} bytes")
+        return None
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+
+
+def html_escape(text: str) -> str:
+    """Escape HTML special characters to prevent XSS."""
+    return html.escape(text, quote=True)
+
+
 # Version - single source of truth
-VERSION = "1.9.0"
+VERSION = "2.2.0"  # Revert sync, keep hub-managed chime
 
 try:
     from aiohttp import web
@@ -74,7 +176,16 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_DURATION_MS = 20
 FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples
-OPUS_BITRATE = 12000
+OPUS_BITRATE = 32000  # Match ESP32 for consistent quality
+
+# Protocol v2.5.0+: packet header now 13 bytes (8 device_id + 4 seq + 1 priority)
+PACKET_HEADER_SIZE = 13  # Updated from 12 to include priority byte
+# Priority levels (must match firmware protocol.h)
+PRIORITY_NORMAL = 0
+PRIORITY_HIGH = 1
+PRIORITY_EMERGENCY = 2
+
+# Broadcast sync: delay added to multicast packets so all receivers play at the same time
 
 # Generate unique device ID from hostname
 def generate_device_id():
@@ -102,6 +213,14 @@ NOTIFY_CMD_TOPIC = f"{BASE_TOPIC}/notify"
 TARGET_STATE_TOPIC = f"{BASE_TOPIC}/target"
 TARGET_CMD_TOPIC = f"{BASE_TOPIC}/target/set"
 
+# Priority select topics
+PRIORITY_STATE_TOPIC = f"{BASE_TOPIC}/priority"
+PRIORITY_CMD_TOPIC = f"{BASE_TOPIC}/priority/set"
+
+# DND switch topics
+DND_STATE_TOPIC = f"{BASE_TOPIC}/dnd"
+DND_CMD_TOPIC = f"{BASE_TOPIC}/dnd/set"
+
 # Device discovery topic
 DEVICE_INFO_TOPIC = "intercom/devices/+/info"
 
@@ -121,21 +240,57 @@ channel_wait_timeout = 5.0  # max seconds to wait for channel before sending
 # Transmission lock - prevent concurrent transmissions
 tx_lock = threading.Lock()
 
+# State lock - protects compound read-modify-write on critical shared state:
+# current_state, web_ptt_active, last_ptt_time (used in is_channel_busy)
+state_lock = threading.Lock()
+
+# Priority state
+current_tx_priority = PRIORITY_NORMAL  # Hub's own TX priority
+hub_dnd_enabled = False               # Hub DND: only EMERGENCY plays when on
+current_rx_priority = PRIORITY_NORMAL  # Priority of whoever is currently transmitting
+
 # Discovered devices: {unique_id: {"room": "Kitchen", "ip": "192.1.8.4.50"}}
 discovered_devices = {}
 
 # Web PTT state
 web_clients = set()  # Connected WebSocket clients
+web_client_ids = {}  # Map WebSocket -> client_id (e.g., "Brians_Phone", "Web_A1B2")
+web_client_topics = {}  # Map client_id -> {"info": topic, "status": topic}
 web_ptt_active = False  # Is a web client transmitting
 web_ptt_encoder = None  # Opus encoder for web PTT
 web_event_loop = None  # Event loop for async web operations
 web_tx_lock = None  # Async lock to serialize web PTT transmissions (created at runtime)
 INGRESS_PORT = int(os.environ.get('INGRESS_PORT', '8099'))
 WWW_PATH = Path(__file__).parent / 'www'
+CHIMES_PATH = Path(__file__).parent / 'chimes'
 
-# Web client MQTT topics
-WEB_CLIENT_INFO_TOPIC = f"intercom/devices/{UNIQUE_ID}_web/info"
-WEB_CLIENT_STATUS_TOPIC = f"intercom/{UNIQUE_ID}_web/status"
+# Mobile devices config and topics
+MOBILE_DEVICES = []  # List of {"name": "...", "notify_service": "..."}
+MOBILE_CALL_TOPIC = "intercom/call"  # Publish call notifications here
+
+# Track recent incoming calls for auto-select in Web PTT
+recent_call = {"caller": None, "target": None, "timestamp": 0}  # Caller, target, and time
+RECENT_CALL_TIMEOUT = 60  # Seconds to consider a call "recent"
+
+# Track ESP32 targets (for targeted audio forwarding)
+esp32_targets = {}  # Map device_id -> target_room
+
+# Track current audio sender (for routing to correct web client)
+current_audio_sender = None  # The device_id hex string of current transmitter
+
+# Reusable Opus encoder for TTS/media broadcast (lazily initialized)
+tts_encoder = None
+
+# Chime state: pre-encoded chime frames, keyed by chime name (e.g. "doorbell")
+# Loaded at startup; each entry is a list of Opus-encoded bytes objects.
+loaded_chimes: Dict[str, list] = {}
+
+# Selected chime name (controlled via HA select entity)
+current_chime = "doorbell"
+
+# MQTT topics for chime select
+CHIME_STATE_TOPIC = f"{BASE_TOPIC}/chime"
+CHIME_CMD_TOPIC = f"{BASE_TOPIC}/chime/set"
 
 
 def get_local_ip():
@@ -151,29 +306,292 @@ def get_local_ip():
         return "127.0.0.1"
 
 
-def publish_web_client_info():
-    """Publish web client as a discoverable target via MQTT."""
+def get_web_client_topics(client_id):
+    """Get MQTT topics for a web client, creating if needed."""
+    if client_id not in web_client_topics:
+        # Create unique ID for this client (sanitize client_id for topic)
+        safe_id = client_id.replace(' ', '_').replace('/', '_').lower()
+        unique_id = f"{UNIQUE_ID}_web_{safe_id}"
+        web_client_topics[client_id] = {
+            "info": f"intercom/devices/{unique_id}/info",
+            "status": f"intercom/{unique_id}/status",
+            "unique_id": unique_id
+        }
+    return web_client_topics[client_id]
+
+
+def publish_web_client_online(client_id):
+    """Publish a web client as a discoverable target via MQTT."""
     if not mqtt_client or not mqtt_client.is_connected():
         return
 
-    if not web_clients:
-        # No web clients - clear device info (status will show offline via retained msg)
-        mqtt_client.publish(WEB_CLIENT_INFO_TOPIC, "", retain=True)
-        mqtt_client.publish(WEB_CLIENT_STATUS_TOPIC, "offline", retain=True)
-        log.info("WebClients disconnected")
-        return
-
-    # Publish web client info and online status
+    topics = get_web_client_topics(client_id)
     info = {
-        "room": "WebClients",
+        "room": client_id,
         "ip": get_local_ip(),
-        "id": f"{UNIQUE_ID}_web"
+        "id": topics["unique_id"]
     }
     payload = json.dumps(info, separators=(',', ':'))  # No spaces - ESP32 parser expects this
+
     # Publish online status FIRST to ensure it's retained before device info arrives
-    mqtt_client.publish(WEB_CLIENT_STATUS_TOPIC, "online", retain=True)
-    mqtt_client.publish(WEB_CLIENT_INFO_TOPIC, payload, retain=True)
-    log.info(f"WebClients online: {payload}")
+    mqtt_client.publish(topics["status"], "online", retain=True)
+    mqtt_client.publish(topics["info"], payload, retain=True)
+    log.info(f"Web client online: {client_id} ({topics['unique_id']})")
+
+
+def publish_web_client_offline(client_id):
+    """Mark a web client as offline via MQTT."""
+    if not mqtt_client or not mqtt_client.is_connected():
+        return
+
+    if client_id not in web_client_topics:
+        return
+
+    topics = web_client_topics[client_id]
+    mqtt_client.publish(topics["info"], "", retain=True)
+    mqtt_client.publish(topics["status"], "offline", retain=True)
+    log.info(f"Web client offline: {client_id}")
+
+
+def discover_mobile_devices_from_ha():
+    """Auto-discover mobile app devices from Home Assistant."""
+    discovered = []
+
+    # Get Supervisor token (available to all add-ons)
+    supervisor_token = os.environ.get('SUPERVISOR_TOKEN')
+    log.info(f"Mobile auto-discovery: SUPERVISOR_TOKEN={'present' if supervisor_token else 'missing'}")
+
+    if not supervisor_token:
+        log.info("No SUPERVISOR_TOKEN - running outside HA, skipping auto-discovery")
+        return discovered
+
+    try:
+        # First check our add-on info to verify homeassistant_api access
+        self_url = "http://supervisor/addons/self/info"
+        req = urllib.request.Request(self_url)
+        req.add_header("Authorization", f"Bearer {supervisor_token}")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            addon_info = json.loads(response.read().decode())
+            has_ha_api = addon_info.get("data", {}).get("homeassistant_api", False)
+            log.info(f"Add-on homeassistant_api permission: {has_ha_api}")
+
+        # We'll get device names later using template API after we know the device tracker IDs
+        device_names = {}  # Map notify_service_suffix -> friendly name
+
+        # Query HA services via Supervisor API
+        url = "http://supervisor/core/api/services"
+        log.info(f"Querying HA API: {url}")
+        req = urllib.request.Request(url)
+        req.add_header("Authorization", f"Bearer {supervisor_token}")
+        req.add_header("Content-Type", "application/json")
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            services = json.loads(response.read().decode())
+
+        # Find notify domain and look for mobile_app services
+        for domain in services:
+            if domain.get("domain") == "notify":
+                for service in domain.get("services", {}):
+                    if service.startswith("mobile_app_"):
+                        # Extract device_id from service name (e.g., mobile_app_brians_phone -> brians_phone)
+                        device_suffix = service.replace("mobile_app_", "")
+
+                        # Use template API to get device name via device_attr()
+                        # This gets the user-customized name from device registry
+                        friendly_name = None
+                        try:
+                            template_url = "http://supervisor/core/api/template"
+                            # Template: get device_id from device_tracker entity, then get name_by_user
+                            template = (
+                                f"{{% set dev = device_id('device_tracker.{device_suffix}') %}}"
+                                "{{ device_attr(dev, 'name_by_user') or device_attr(dev, 'name') or '' }}"
+                            )
+                            template_data = json.dumps({"template": template}).encode('utf-8')
+                            req = urllib.request.Request(template_url, data=template_data, method='POST')
+                            req.add_header("Authorization", f"Bearer {supervisor_token}")
+                            req.add_header("Content-Type", "application/json")
+                            with urllib.request.urlopen(req, timeout=5) as response:
+                                result = response.read().decode().strip()
+                                if result and result != "None":
+                                    friendly_name = result
+                                    log.info(f"Device name from registry: {device_suffix} -> '{friendly_name}'")
+                        except Exception as e:
+                            log.debug(f"Could not get device name for {device_suffix}: {e}")
+
+                        if not friendly_name:
+                            # Fallback: convert service name to friendly name
+                            friendly_name = device_suffix.replace("_", " ").title()
+                            friendly_name = friendly_name.replace("Iphone", "iPhone")
+                            friendly_name = friendly_name.replace("Ipad", "iPad")
+
+                        discovered.append({
+                            "name": friendly_name,
+                            "notify_service": service
+                        })
+                        log.info(f"Auto-discovered mobile: {friendly_name} ({service})")
+
+    except urllib.error.URLError as e:
+        log.warning(f"Could not connect to HA API for mobile discovery: {e}")
+    except Exception as e:
+        log.warning(f"Mobile device auto-discovery failed: {e}")
+
+    return discovered
+
+
+def load_mobile_devices():
+    """Load mobile devices - auto-discover from HA and merge with manual config."""
+    global MOBILE_DEVICES
+
+    # First, auto-discover from Home Assistant
+    auto_discovered = discover_mobile_devices_from_ha()
+
+    # Then load any manual overrides from options
+    manual_devices = []
+    try:
+        options_path = Path("/data/options.json")
+        if options_path.exists():
+            with open(options_path) as f:
+                options = json.load(f)
+                manual_devices = options.get("mobile_devices", [])
+    except Exception as e:
+        log.warning(f"Could not load mobile device options: {e}")
+
+    # Merge: manual config takes precedence (by notify_service)
+    manual_services = {d["notify_service"] for d in manual_devices}
+
+    # Start with manual devices
+    MOBILE_DEVICES = list(manual_devices)
+
+    # Add auto-discovered devices that aren't manually configured
+    for dev in auto_discovered:
+        if dev["notify_service"] not in manual_services:
+            MOBILE_DEVICES.append(dev)
+
+    if MOBILE_DEVICES:
+        log.info(f"Total mobile devices: {len(MOBILE_DEVICES)}")
+        for dev in MOBILE_DEVICES:
+            source = "manual" if dev["notify_service"] in manual_services else "auto"
+            log.info(f"  - {dev['name']} -> {dev['notify_service']} ({source})")
+
+    # Re-publish mobile devices to MQTT if connected
+    if mqtt_client and mqtt_client.is_connected():
+        publish_mobile_devices()
+
+
+def mobile_refresh_thread():
+    """Background thread to periodically refresh mobile device list."""
+    REFRESH_INTERVAL = 300  # 5 minutes
+
+    while True:
+        time.sleep(REFRESH_INTERVAL)
+        try:
+            old_devices = {d["notify_service"]: d["name"] for d in MOBILE_DEVICES}
+            load_mobile_devices()
+            new_devices = {d["notify_service"]: d["name"] for d in MOBILE_DEVICES}
+
+            # Log any changes
+            if old_devices != new_devices:
+                log.info("Mobile device list updated")
+        except Exception as e:
+            log.warning(f"Mobile refresh failed: {e}")
+
+
+def publish_mobile_devices():
+    """Publish mobile devices as discoverable targets."""
+    if not mqtt_client or not mqtt_client.is_connected():
+        return
+
+    hub_ip = get_local_ip()  # Use hub's IP so ESP32 can unicast to us
+
+    for i, device in enumerate(MOBILE_DEVICES):
+        device_id = f"{UNIQUE_ID}_mobile_{i}"
+        topic = f"intercom/devices/{device_id}/info"
+        status_topic = f"intercom/{device_id}/status"
+
+        info = {
+            "room": device["name"],
+            "ip": hub_ip,  # Hub's IP - ESP32 unicasts here, hub forwards to web client
+            "id": device_id,
+            "is_mobile": True  # Mark as mobile for special handling
+        }
+        payload = json.dumps(info, separators=(',', ':'))
+
+        # Publish as online and available
+        mqtt_client.publish(status_topic, "online", retain=True)
+        mqtt_client.publish(topic, payload, retain=True)
+        log.info(f"Published mobile device: {device['name']} at {hub_ip}")
+
+
+def send_mobile_notification(device_name, caller_name):
+    """Send notification to mobile device via HA REST API."""
+    # Find the mobile device config
+    device_config = None
+    for dev in MOBILE_DEVICES:
+        if dev["name"] == device_name:
+            device_config = dev
+            break
+
+    if not device_config:
+        log.warning(f"Mobile device not found: {device_name}")
+        return
+
+    notify_service = device_config["notify_service"]
+
+    # Get Supervisor token for HA API access
+    supervisor_token = os.environ.get('SUPERVISOR_TOKEN')
+    if not supervisor_token:
+        log.warning("No SUPERVISOR_TOKEN - cannot send notification")
+        return
+
+    try:
+        # Call HA notification service via REST API
+        url = f"http://supervisor/core/api/services/notify/{notify_service}"
+
+        # URL-safe caller name for auto-select in Web PTT
+        # Include both caller (who's calling) and device (this mobile's identity)
+        caller_safe = caller_name.replace(' ', '_')
+        device_safe = device_name.replace(' ', '_')
+        ingress_url = f"/hassio/ingress/local_intercom_hub?caller={caller_safe}&device={device_safe}"
+
+        payload = {
+            "title": "Intercom Call",
+            "message": f"{caller_name} is calling",
+            "data": {
+                "channel": "intercom",
+                "importance": "high",
+                "ttl": 0,
+                "priority": "high",
+                "tag": "intercom_call",
+                "clickAction": ingress_url,
+                "actions": [
+                    {
+                        "action": "URI",
+                        "title": "Answer",
+                        "uri": ingress_url
+                    }
+                ]
+            }
+        }
+
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(url, data=data, method='POST')
+        req.add_header("Authorization", f"Bearer {supervisor_token}")
+        req.add_header("Content-Type", "application/json")
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            log.info(f"Sent notification to {device_name} from {caller_name}")
+            # Track recent call for targeted audio forwarding and auto-select
+            recent_call["caller"] = caller_name
+            recent_call["target"] = device_name
+            recent_call["timestamp"] = time.time()
+
+    except Exception as e:
+        log.warning(f"Failed to send notification to {device_name}: {e}")
+
+
+def is_mobile_device(room_name):
+    """Check if a room name is a mobile device."""
+    return any(dev["name"] == room_name for dev in MOBILE_DEVICES)
 
 
 def create_tx_socket():
@@ -181,6 +599,8 @@ def create_tx_socket():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+    # Disable multicast loopback - prevent receiving our own packets
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
     return sock
 
 
@@ -202,28 +622,31 @@ def create_rx_socket():
     return sock
 
 
-def send_audio_packet(opus_data, target_ip=None):
+def send_audio_packet(opus_data, target_ip=None, priority=None):
     """Send an audio packet via multicast or unicast.
 
     Args:
         opus_data: Opus encoded audio frame
-        target_ip: If None, send multicast. Otherwise send unicast to this IP.
+        target_ip: If None, send multicast. Otherwise unicast to target_ip.
+        priority: PRIORITY_NORMAL/HIGH/EMERGENCY — defaults to current_tx_priority.
     """
-    global sequence_num, tx_socket
+    global sequence_num, tx_socket, current_tx_priority
 
     if tx_socket is None:
         return
 
-    # Build packet: device_id (8) + sequence (4) + opus_data
-    packet = DEVICE_ID + struct.pack('>I', sequence_num) + opus_data
+    if priority is None:
+        priority = current_tx_priority
+
+    # Header: device_id (8) + sequence (4) + priority (1) = 13 bytes
+    header = DEVICE_ID + struct.pack('>IB', sequence_num, priority)
     sequence_num += 1
+    packet = header + opus_data
 
     try:
         if target_ip:
-            # Unicast to specific device
             tx_socket.sendto(packet, (target_ip, MULTICAST_PORT))
         else:
-            # Multicast to all devices
             tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
     except Exception as e:
         mode = f"unicast to {target_ip}" if target_ip else "multicast"
@@ -247,40 +670,69 @@ def get_target_ip():
     return None
 
 
-def is_channel_busy():
-    """Check if channel is busy (someone else is transmitting)."""
-    global current_state, last_rx_time
+def is_channel_busy(our_priority=None):
+    """Check if channel is busy considering priority preemption.
 
-    if current_state != "receiving":
+    Args:
+        our_priority: The TX priority we intend to use. If our priority is higher
+                      than the current receiver's priority, the channel is NOT
+                      considered busy (we can preempt). Pass None to use the hub's
+                      current_tx_priority.
+
+    Uses state_lock to ensure a consistent snapshot of the multiple
+    shared variables (current_state, web_ptt_active, last_rx_time)
+    that are written from different threads.
+    """
+    global current_tx_priority, current_rx_priority
+
+    if our_priority is None:
+        our_priority = current_tx_priority
+
+    with state_lock:
+        # Channel busy if a web client is actively transmitting
+        if web_ptt_active:
+            return True
+
+        # Channel busy if hub is already transmitting (TTS in progress)
+        if current_state == "transmitting":
+            return True
+
+        # Channel busy if receiving audio
+        if current_state == "receiving":
+            # Double-check with timeout (receive_thread may not have updated yet)
+            if time.time() - last_rx_time > rx_timeout:
+                return False
+            # Priority preemption: if our priority beats the current RX priority, not blocked
+            if our_priority > current_rx_priority:
+                return False
+            return True
+
         return False
 
-    # Double-check with timeout (receive_thread may not have updated yet)
-    if time.time() - last_rx_time > rx_timeout:
-        return False
 
-    return True
-
-
-def wait_for_channel(timeout=None):
+def wait_for_channel(timeout=None, our_priority=None):
     """Wait for the channel to be free before transmitting.
 
     Args:
         timeout: Max seconds to wait. Defaults to channel_wait_timeout.
+        our_priority: Our TX priority for preemption check. Defaults to current_tx_priority.
 
     Returns:
-        True if channel is free, False if timeout (will send anyway).
+        True if channel is free (or preemptable), False if timeout (will send anyway).
     """
     if timeout is None:
         timeout = channel_wait_timeout
+    if our_priority is None:
+        our_priority = current_tx_priority
 
-    if not is_channel_busy():
+    if not is_channel_busy(our_priority):
         return True
 
     log.debug("Channel busy - waiting for it to be free...")
     start = time.time()
 
     while time.time() - start < timeout:
-        if not is_channel_busy():
+        if not is_channel_busy(our_priority):
             waited = time.time() - start
             log.debug(f"Channel free after {waited:.1f}s")
             return True
@@ -292,7 +744,7 @@ def wait_for_channel(timeout=None):
 
 def receive_thread():
     """Thread to receive multicast audio from ESP32 devices."""
-    global current_state, last_rx_time, rx_socket
+    global current_state, last_rx_time, rx_socket, current_audio_sender, current_rx_priority
 
     log.debug("Receive thread started")
 
@@ -304,6 +756,10 @@ def receive_thread():
             log.debug("RX decoder created for web client forwarding")
         except Exception as e:
             log.error(f"Failed to create RX decoder: {e}")
+
+    # Sequence tracking for PLC/FEC
+    rx_last_seq = None
+    rx_last_sender = None
 
     while True:
         try:
@@ -320,33 +776,114 @@ def receive_thread():
                 continue
 
             sender_id_str = sender_id.hex()
-            opus_frame = data[12:]  # Skip ID (8) + sequence (4)
+            sequence = struct.unpack('>I', data[8:12])[0]
+
+            # Extract priority byte (byte 12, added in v2.5.0)
+            # Old firmware (12-byte header) also handled gracefully
+            if len(data) >= PACKET_HEADER_SIZE:
+                incoming_priority = data[12]
+                if incoming_priority > PRIORITY_EMERGENCY:
+                    incoming_priority = PRIORITY_NORMAL  # Clamp unknown values
+                opus_frame = data[PACKET_HEADER_SIZE:]  # 13-byte header
+            else:
+                incoming_priority = PRIORITY_NORMAL
+                opus_frame = data[12:]  # Old 12-byte header (legacy)
+
+            # Hub DND check: only EMERGENCY plays through
+            if hub_dnd_enabled and incoming_priority < PRIORITY_EMERGENCY:
+                continue
+
+            # Update current RX priority (used for preemption decisions)
+            current_rx_priority = incoming_priority
+
+            # Track current sender for audio routing
+            current_audio_sender = sender_id_str
+
+            # Get target room for this sender
+            sender_mqtt_id = f"intercom_{sender_id_str[-8:]}"
+            target = esp32_targets.get(sender_mqtt_id)
 
             # Update state to receiving if we weren't already
             now = time.time()
-            if current_state != "receiving" and current_state != "transmitting":
-                current_state = "receiving"
-                publish_state()
-                log.debug(f"Receiving audio from {sender_id_str}")
+            with state_lock:
+                state_changed = (current_state != "receiving" and current_state != "transmitting")
+                if state_changed:
+                    current_state = "receiving"
+                last_rx_time = now
 
-            last_rx_time = now
+            if state_changed:
+                # Publish MQTT state (for HA integration) - outside lock to avoid blocking
+                if mqtt_client and mqtt_client.is_connected():
+                    mqtt_client.publish(STATE_TOPIC, "receiving", retain=True)
 
-            # Decode and forward to web clients
+                # Notify web clients - targeted if specific target, broadcast if "all rooms"
+                is_broadcast = not target or target.lower() in ("all", "all rooms", "unknown")
+                if not is_broadcast:
+                    # Targeted transmission - only notify the specific web client
+                    notify_targeted_web_client_state(target, "receiving")
+                    log.info(f"Receiving audio from {sender_mqtt_id} -> {target}")
+                else:
+                    # Broadcast to all rooms - notify all web clients
+                    notify_web_clients_state(state="receiving", source="hub")
+                    log.info(f"Receiving broadcast audio from {sender_mqtt_id}")
+
+            # Decode and forward to web clients (with PLC/FEC for packet loss recovery)
             if rx_decoder and web_clients and len(opus_frame) > 0:
                 try:
+                    # Reset tracking when sender changes (new transmission)
+                    if sender_id_str != rx_last_sender:
+                        rx_last_sender = sender_id_str
+                        rx_last_seq = None
+                        # Reset decoder so stale prediction state doesn't produce
+                        # ghost audio in the first frames of the new stream
+                        try:
+                            rx_decoder.reset_state()
+                        except Exception:
+                            rx_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+
+                    # Gap detection for PLC/FEC
+                    if rx_last_seq is not None:
+                        gap = (sequence - rx_last_seq - 1) & 0xFFFFFFFF
+                        if 0 < gap <= 4:
+                            if gap == 1:
+                                # FEC: recover missing frame using data embedded in next packet
+                                try:
+                                    fec_pcm = rx_decoder.decode(opus_frame, FRAME_SIZE, decode_fec=True)
+                                    if fec_pcm:
+                                        forward_audio_to_web_clients(fec_pcm)
+                                except Exception:
+                                    pass
+                            else:
+                                # PLC: generate concealment audio for each missing frame
+                                for _ in range(gap):
+                                    try:
+                                        plc_pcm = rx_decoder.decode(None, FRAME_SIZE)
+                                        if plc_pcm:
+                                            forward_audio_to_web_clients(plc_pcm)
+                                    except Exception:
+                                        break
+
+                    rx_last_seq = sequence
+
+                    # Decode current frame normally
                     pcm = rx_decoder.decode(opus_frame, FRAME_SIZE)
                     if pcm:
-                        forward_audio_to_web_clients(pcm)
+                        forward_audio_to_web_clients(pcm, priority=incoming_priority)
                 except Exception as e:
                     pass  # Ignore decode errors
 
         except socket.timeout:
             # Check if we should go back to idle
-            if current_state == "receiving":
-                if time.time() - last_rx_time > rx_timeout:
+            with state_lock:
+                should_go_idle = (current_state == "receiving" and
+                                  time.time() - last_rx_time > rx_timeout)
+                if should_go_idle:
                     current_state = "idle"
-                    publish_state()
-                    log.debug("Receive ended, back to idle")
+                    current_audio_sender = None  # Clear sender when idle
+                    current_rx_priority = PRIORITY_NORMAL  # Reset for next sender
+            if should_go_idle:
+                publish_state(state="idle")
+                log.debug("Receive ended, back to idle")
         except Exception as e:
             log.error(f"RX error: {e}")
             time.sleep(0.1)
@@ -391,14 +928,28 @@ def text_to_speech(text):
 
             return audio_data, sample_rate
 
-        # Run async function
-        audio_data, sample_rate = asyncio.run(do_tts())
+        # Run async function on the existing event loop (thread-safe)
+        # Using run_coroutine_threadsafe avoids creating a new event loop each call
+        if web_event_loop is not None and web_event_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(do_tts(), web_event_loop)
+            try:
+                audio_data, sample_rate = future.result(timeout=30)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                log.warning("TTS timed out after 30 seconds")
+                return None
+        else:
+            # Fallback if web server hasn't started yet.
+            # This is safe: text_to_speech() is only called from _announce(),
+            # which runs in its own daemon thread (not the MQTT thread), so
+            # blocking here with asyncio.run() won't cause MQTT keepalive timeout.
+            audio_data, sample_rate = asyncio.run(do_tts())
 
         if len(audio_data) == 0:
             log.warning("No audio data received from TTS")
             return None
 
-        log.debug(f"TTS complete: {len(audio_data)} bytes at {sample_rate}Hz")
+        log.info(f"TTS raw: {len(audio_data)} bytes at {sample_rate}Hz ({len(audio_data)//2} samples, {len(audio_data)/2/sample_rate:.2f}s)")
 
         # Convert to our target format (16kHz mono 16-bit)
         if sample_rate != SAMPLE_RATE:
@@ -411,10 +962,11 @@ def text_to_speech(text):
             ]
             result = subprocess.run(cmd, input=audio_data, capture_output=True, timeout=30)
             if result.returncode == 0:
+                log.info(f"TTS resampled: {len(result.stdout)} bytes at {SAMPLE_RATE}Hz ({len(result.stdout)//2} samples, {len(result.stdout)/2/SAMPLE_RATE:.2f}s)")
                 return result.stdout
             else:
                 log.error(f"Resample error: {result.stderr.decode()}")
-                return audio_data
+                return None  # Don't return wrong sample rate data
 
         return audio_data
 
@@ -460,17 +1012,344 @@ def fetch_and_convert_audio(url):
         return None
 
 
+def get_tts_encoder():
+    """Get or create the reusable Opus encoder for TTS/media broadcast.
+
+    Lazily initializes on first call. Reuses the same encoder across calls
+    to avoid the overhead of creating a new opuslib.Encoder each time.
+    Caller should call encoder.reset_state() before each use to clear
+    stale prediction data between broadcasts.
+    """
+    global tts_encoder
+
+    if tts_encoder is None and opuslib:
+        tts_encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
+        tts_encoder.bitrate = OPUS_BITRATE
+        try:
+            tts_encoder.inband_fec = 1
+            tts_encoder.packet_loss_perc = 10
+        except (TypeError, AttributeError):
+            pass  # opuslib version may have broken ctl_set property setters
+        log.info("TTS Opus encoder initialized")
+
+    return tts_encoder
+
+
+def _convert_wav_to_16k_mono_pcm(raw: bytes, nchannels: int, sampwidth: int, framerate: int) -> bytes:
+    """Convert raw WAV PCM bytes to 16kHz mono 16-bit signed little-endian PCM.
+
+    Uses only stdlib (struct) — no numpy/scipy/audioop.
+
+    Steps:
+      1. Convert sample width to 16-bit if needed.
+      2. Mix down to mono if stereo.
+      3. Resample to 16 kHz via linear interpolation.
+
+    Args:
+        raw: Raw PCM bytes from wave.readframes().
+        nchannels: Number of audio channels in raw (1 or 2).
+        sampwidth: Sample width in bytes (1=8-bit, 2=16-bit, 3=24-bit, 4=32-bit).
+        framerate: Source sample rate in Hz.
+
+    Returns:
+        Raw PCM bytes: 16-bit signed little-endian, mono, 16kHz.
+    """
+    import struct as _struct
+
+    n_frames = len(raw) // (nchannels * sampwidth)
+
+    # --- Step 1: Unpack to list of 16-bit mono samples ---
+    # Map sampwidth -> struct format char (all little-endian, signed)
+    if sampwidth == 1:
+        # 8-bit WAV is unsigned; shift to signed
+        fmt_in = f"{n_frames * nchannels}B"
+        raw_samples = list(_struct.unpack(fmt_in, raw))
+        # Convert unsigned 8-bit [0..255] to signed 16-bit [-32768..32767]
+        raw_samples = [(s - 128) << 8 for s in raw_samples]
+    elif sampwidth == 2:
+        fmt_in = f"<{n_frames * nchannels}h"
+        raw_samples = list(_struct.unpack(fmt_in, raw))
+    elif sampwidth == 3:
+        # 24-bit has no direct struct format; unpack manually
+        raw_samples = []
+        for i in range(n_frames * nchannels):
+            b = raw[i * 3:(i + 1) * 3]
+            val = b[0] | (b[1] << 8) | (b[2] << 16)
+            if val >= 0x800000:
+                val -= 0x1000000
+            raw_samples.append(val >> 8)  # Scale to 16-bit
+    elif sampwidth == 4:
+        fmt_in = f"<{n_frames * nchannels}i"
+        raw_samples = list(_struct.unpack(fmt_in, raw))
+        raw_samples = [s >> 16 for s in raw_samples]  # Scale to 16-bit
+    else:
+        raise ValueError(f"Unsupported sample width: {sampwidth} bytes")
+
+    # --- Step 2: Stereo -> mono (average channels) ---
+    if nchannels == 2:
+        mono = []
+        for i in range(0, len(raw_samples), 2):
+            avg = (raw_samples[i] + raw_samples[i + 1]) // 2
+            mono.append(max(-32768, min(32767, avg)))
+    elif nchannels == 1:
+        mono = raw_samples
+    else:
+        # Multi-channel: average all channels per frame
+        mono = []
+        for i in range(0, len(raw_samples), nchannels):
+            avg = sum(raw_samples[i:i + nchannels]) // nchannels
+            mono.append(max(-32768, min(32767, avg)))
+
+    # --- Step 3: Resample to 16kHz via linear interpolation ---
+    target_rate = SAMPLE_RATE  # 16000
+    if framerate == target_rate:
+        resampled = mono
+    else:
+        ratio = framerate / target_rate  # Source samples per output sample
+        n_out = int(len(mono) / ratio)
+        resampled = []
+        for i in range(n_out):
+            pos = i * ratio
+            lo = int(pos)
+            hi = lo + 1
+            frac = pos - lo
+            if hi >= len(mono):
+                resampled.append(mono[lo])
+            else:
+                val = int(mono[lo] * (1.0 - frac) + mono[hi] * frac)
+                resampled.append(max(-32768, min(32767, val)))
+
+    # --- Pack to bytes (16-bit signed little-endian) ---
+    return _struct.pack(f"<{len(resampled)}h", *resampled)
+
+
+def load_chime(filepath: Path) -> list:
+    """Load a WAV file and pre-encode it as a list of Opus frames.
+
+    Converts the WAV to 16kHz mono 16-bit PCM, then encodes each 20ms
+    frame (320 samples = 640 bytes) using a dedicated Opus encoder.
+    Returns a list of encoded bytes objects (one per 20ms frame).
+
+    A dedicated encoder is used (not tts_encoder) so chime state does not
+    contaminate the TTS encoder's prediction history.
+
+    Returns an empty list if opuslib is unavailable or the file is unreadable.
+    """
+    import wave as _wave
+
+    if not opuslib:
+        log.warning(f"opuslib not available — chime '{filepath.name}' will not be encoded")
+        return []
+
+    try:
+        with _wave.open(str(filepath), 'rb') as wf:
+            params = wf.getparams()
+            raw = wf.readframes(params.nframes)
+    except Exception as e:
+        log.error(f"Failed to read chime file '{filepath}': {e}")
+        return []
+
+    log.info(
+        f"Chime '{filepath.name}': {params.nchannels}ch, "
+        f"{params.sampwidth*8}-bit, {params.framerate}Hz, "
+        f"{params.nframes} frames ({params.nframes/params.framerate:.2f}s)"
+    )
+
+    try:
+        pcm = _convert_wav_to_16k_mono_pcm(
+            raw, params.nchannels, params.sampwidth, params.framerate
+        )
+    except Exception as e:
+        log.error(f"WAV conversion failed for '{filepath.name}': {e}")
+        return []
+
+    log.info(
+        f"Chime '{filepath.name}' converted: {len(pcm)} bytes PCM at 16kHz mono "
+        f"({len(pcm)//(FRAME_SIZE*2)} frames)"
+    )
+
+    # Dedicated encoder — isolated from TTS encoder to avoid state pollution
+    try:
+        enc = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
+        enc.bitrate = OPUS_BITRATE
+        try:
+            enc.inband_fec = 1
+            enc.packet_loss_perc = 10
+        except (TypeError, AttributeError):
+            pass  # Some opuslib builds have broken ctl_set property setters
+    except Exception as e:
+        log.error(f"Failed to create Opus encoder for chime: {e}")
+        return []
+
+    frame_bytes = FRAME_SIZE * 2  # 640 bytes per 20ms frame
+    frames = []
+    offset = 0
+    while offset < len(pcm):
+        chunk = pcm[offset:offset + frame_bytes]
+        if len(chunk) < frame_bytes:
+            # Pad last frame to a full 20ms with silence
+            chunk = chunk + b'\x00' * (frame_bytes - len(chunk))
+        try:
+            encoded = enc.encode(chunk, FRAME_SIZE)
+            frames.append(encoded)
+        except Exception as e:
+            log.warning(f"Opus encode failed at frame {len(frames)}: {e}")
+            break
+        offset += frame_bytes
+
+    log.info(f"Chime '{filepath.name}' encoded: {len(frames)} Opus frames")
+    return frames
+
+
+def load_all_chimes() -> None:
+    """Scan the chimes directory and pre-encode all WAV files into memory.
+
+    The chime name is the filename stem (e.g., 'doorbell' for 'doorbell.wav').
+    Results are stored in the module-level `loaded_chimes` dict.
+    """
+    global loaded_chimes
+
+    if not CHIMES_PATH.exists():
+        log.warning(f"Chimes directory not found: {CHIMES_PATH}")
+        return
+
+    wav_files = sorted(CHIMES_PATH.glob('*.wav'))
+    if not wav_files:
+        log.warning(f"No WAV files found in {CHIMES_PATH}")
+        return
+
+    for wav_path in wav_files:
+        name = wav_path.stem  # e.g. "doorbell"
+        frames = load_chime(wav_path)
+        if frames:
+            loaded_chimes[name] = frames
+            log.info(f"Chime loaded: '{name}' ({len(frames)} frames)")
+        else:
+            log.warning(f"Chime '{name}' failed to load — skipped")
+
+    log.info(f"Total chimes loaded: {len(loaded_chimes)} ({', '.join(loaded_chimes.keys())})")
+
+
+async def stream_chime_to_target(target_ip: Optional[str], chime_name: str = "") -> None:
+    """Stream pre-encoded chime frames to a target device (or multicast).
+
+    Sends each Opus frame as a normal audio packet at 20ms intervals (slightly
+    faster at 18ms to avoid gaps caused by scheduling jitter). Uses
+    PRIORITY_HIGH so the chime preempts any ongoing NORMAL transmission on the
+    target device, but does not use PRIORITY_EMERGENCY to avoid forcing max
+    volume.
+
+    Args:
+        target_ip: Unicast destination IP, or None for multicast (All Rooms).
+        chime_name: Which chime to play. Falls back to 'doorbell' if not found.
+    """
+    # Resolve chime: try requested name, then first available, then give up
+    frames = loaded_chimes.get(chime_name)
+    if not frames:
+        frames = next(iter(loaded_chimes.values()), None)
+    if not frames:
+        log.warning(f"No chime frames available (chime='{chime_name}') — skipping chime stream")
+        return
+
+    log.info(
+        f"Streaming chime '{chime_name}' ({len(frames)} frames) -> "
+        f"{'multicast' if target_ip is None else target_ip}"
+    )
+
+    # Use a sequence counter isolated from the main sequence_num so chime
+    # packets don't disrupt the TTS/PTT sequence continuity
+    chime_seq = 0
+
+    frame_interval = 0.018  # 18ms — slightly fast to avoid inter-frame gaps
+
+    for i, opus_frame in enumerate(frames):
+        # Build packet: device_id (8) + sequence (4, big-endian) + priority (1) + opus
+        packet = DEVICE_ID + struct.pack('>IB', chime_seq, PRIORITY_HIGH) + opus_frame
+        chime_seq += 1
+
+        try:
+            if target_ip:
+                tx_socket.sendto(packet, (target_ip, MULTICAST_PORT))
+            else:
+                tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
+        except Exception as e:
+            log.error(f"Chime send error at frame {i}: {e}")
+            break
+
+        await asyncio.sleep(frame_interval)
+
+    log.debug(f"Chime stream complete: {len(frames)} frames sent")
+
+
+def get_chime_options() -> list:
+    """Return sorted list of available chime names for HA select entity."""
+    if not loaded_chimes:
+        return ["doorbell"]  # Fallback label even if loading failed
+    return sorted(loaded_chimes.keys())
+
+
+def publish_chime_select() -> None:
+    """Publish HA MQTT discovery config for the chime selector."""
+    if not mqtt_client or not mqtt_client.is_connected():
+        return
+
+    device_info = {
+        "identifiers": [DEVICE_ID_STR],
+        "name": DEVICE_NAME,
+        "model": "Intercom Hub",
+        "manufacturer": "guywithacomputer",
+        "sw_version": VERSION
+    }
+
+    options = get_chime_options()
+
+    chime_config = {
+        "name": f"{DEVICE_NAME} Chime",
+        "unique_id": f"{UNIQUE_ID}_chime",
+        "object_id": f"{UNIQUE_ID}_chime",
+        "device": device_info,
+        "state_topic": CHIME_STATE_TOPIC,
+        "command_topic": CHIME_CMD_TOPIC,
+        "availability_topic": AVAILABILITY_TOPIC,
+        "options": options,
+        "icon": "mdi:bell-ring"
+    }
+
+    mqtt_client.publish(
+        f"homeassistant/select/{UNIQUE_ID}_chime/config",
+        json.dumps(chime_config),
+        retain=True
+    )
+    log.debug(f"Published chime select discovery: {options}")
+
+
+def publish_chime() -> None:
+    """Publish current chime selection to MQTT."""
+    if mqtt_client and mqtt_client.is_connected():
+        mqtt_client.publish(CHIME_STATE_TOPIC, current_chime, retain=True)
+
+
 def encode_and_broadcast(pcm_data):
     """Encode PCM to Opus and send via multicast or unicast based on target.
 
     Uses two-phase approach for consistent timing:
     1. Pre-encode all frames (variable time, doesn't affect playback)
     2. Send with precise timing (busy-wait for accuracy)
+
+    Also forwards raw PCM to web clients.
     """
     global current_state
 
     if len(pcm_data) == 0:
         return
+
+    # Prepare raw PCM frames for web clients (need to send from async context)
+    frame_bytes = FRAME_SIZE * 2
+    pcm_frames = []
+    offset = 0
+    while offset + frame_bytes <= len(pcm_data):
+        pcm_frames.append(pcm_data[offset:offset + frame_bytes])
+        offset += frame_bytes
 
     # Prevent concurrent transmissions
     if not tx_lock.acquire(blocking=False):
@@ -481,27 +1360,40 @@ def encode_and_broadcast(pcm_data):
         # Wait for channel to be free (first-to-talk collision avoidance)
         wait_for_channel()
 
+        # Mark as transmitting BEFORE encoding to prevent collisions during encode phase
+        with state_lock:
+            current_state = "transmitting"
+        publish_state(state="transmitting")
+
         # Get target IP (None = multicast to all)
         target_ip = get_target_ip()
         target_desc = f"to {current_target}" if target_ip else "to all rooms"
 
         frame_bytes = FRAME_SIZE * 2  # 16-bit samples = 640 bytes per frame
         audio_frames = len(pcm_data) // frame_bytes
-        log.debug(f"Encoding {audio_frames} frames of audio...")
+        audio_duration = audio_frames * FRAME_DURATION_MS / 1000.0
+        log.info(f"Broadcasting: {audio_frames} audio frames ({audio_duration:.2f}s) + 15 lead-in + 30 trail-out = {audio_frames+45} total frames")
 
         # === PHASE 1: PRE-ENCODE ALL FRAMES ===
         # This separates encoding time from transmission timing
-        encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
-        encoder.bitrate = OPUS_BITRATE
+        encoder = get_tts_encoder()
+        if encoder is None:
+            log.error("No Opus encoder available for broadcast")
+            return
+
+        # Reset encoder state to prevent stale prediction data between broadcasts
+        try:
+            encoder.reset_state()
+        except (AttributeError, Exception):
+            log.debug("Opus encoder reset_state not available — skipping")
 
         encoded_frames = []
-
-        # Create and encode silence for lead-in/trail-out
         silence_pcm = bytes(frame_bytes)
-        silence_opus = encoder.encode(silence_pcm, FRAME_SIZE)
 
-        # Lead-in silence (300ms = 15 frames) - lets ESP32 jitter buffer fully prime
+        # Lead-in silence (300ms = 15 frames) - lets ESP32 jitter buffer prime
+        # Encode each frame fresh to maintain encoder state continuity
         for _ in range(15):
+            silence_opus = encoder.encode(silence_pcm, FRAME_SIZE)
             encoded_frames.append(silence_opus)
 
         # Encode actual audio frames
@@ -512,21 +1404,37 @@ def encode_and_broadcast(pcm_data):
             encoded_frames.append(opus_data)
             offset += frame_bytes
 
-        # Trail-out silence (600ms = 30 frames) - flush all ESP32 DMA buffers
+        # Trail-out silence (600ms = 30 frames) - flush ESP32 buffers
+        # Must encode fresh to maintain decoder state continuity
         for _ in range(30):
+            silence_opus = encoder.encode(silence_pcm, FRAME_SIZE)
             encoded_frames.append(silence_opus)
 
         # === PHASE 2: SEND WITH PRECISE TIMING ===
         log.debug(f"Sending {len(encoded_frames)} frames {target_desc}...")
-        current_state = "transmitting"
-        publish_state()
 
         frame_interval = FRAME_DURATION_MS / 1000.0  # 0.02 seconds
         start_time = time.monotonic()
 
+        # PCM frame index for web client forwarding (skip lead-in silence)
+        pcm_frame_idx = 0
+
         for i, opus_data in enumerate(encoded_frames):
-            # Send packet immediately
+            # Send packet to ESP32s
             send_audio_packet(opus_data, target_ip)
+
+            # Forward PCM to web clients (skip lead-in/trail-out silence)
+            # Lead-in is first 15 frames, actual audio is next len(pcm_frames), trail-out is last 30
+            if 15 <= i < 15 + len(pcm_frames) and web_clients and web_event_loop:
+                pcm_frame = pcm_frames[pcm_frame_idx]
+                pcm_frame_idx += 1
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        broadcast_to_web_clients(pcm_frame),
+                        web_event_loop
+                    )
+                except Exception:
+                    pass
 
             # Calculate target time for next frame
             next_frame_time = start_time + ((i + 1) * frame_interval)
@@ -545,7 +1453,7 @@ def encode_and_broadcast(pcm_data):
         elapsed = time.monotonic() - start_time
         expected = len(encoded_frames) * frame_interval
         drift_ms = (elapsed - expected) * 1000
-        log.debug(f"Send complete: {len(encoded_frames)} frames in {elapsed:.2f}s (drift: {drift_ms:+.1f}ms)")
+        log.info(f"Broadcast complete: {len(encoded_frames)} frames in {elapsed:.2f}s (expected {expected:.2f}s, drift: {drift_ms:+.1f}ms)")
 
     except Exception as e:
         log.error(f"encoding/sending audio: {e}")
@@ -553,13 +1461,18 @@ def encode_and_broadcast(pcm_data):
         traceback.print_exc()
 
     finally:
-        current_state = "idle"
-        publish_state()
+        with state_lock:
+            current_state = "idle"
+        publish_state(state="idle")
         tx_lock.release()
 
 
 def play_media(url):
     """Handle play_media command - fetch, convert, broadcast."""
+    if not validate_url(url):
+        log.warning(f"play_media URL rejected: {url[:100]}")
+        return
+
     # Run in thread to not block MQTT
     def _play():
         pcm_data = fetch_and_convert_audio(url)
@@ -573,9 +1486,16 @@ def play_media(url):
 def announce(message):
     """Handle announce - either URL or text for TTS."""
     def _announce():
-        if message.startswith("http://") or message.startswith("https://"):
-            # It's a URL, fetch and play
+        if message.startswith(("http://", "https://")):
+            # It's a URL - validate before fetching
+            if not validate_url(message):
+                log.warning(f"Announce URL rejected by validation: {message[:100]}")
+                return
             pcm_data = fetch_and_convert_audio(message)
+        elif "://" in message:
+            # Block non-HTTP schemes (file://, rtmp://, ftp://, etc.)
+            log.warning(f"Announce blocked unsupported URL scheme: {message[:100]}")
+            return
         else:
             # It's text, use TTS
             pcm_data = text_to_speech(message)
@@ -603,7 +1523,7 @@ def publish_discovery():
     notify_config = {
         "name": DEVICE_NAME,
         "unique_id": f"{UNIQUE_ID}_notify",
-        "object_id": f"{UNIQUE_ID}",
+        "default_entity_id": f"notify.{UNIQUE_ID}",
         "device": device_info,
         "availability_topic": AVAILABILITY_TOPIC,
         "command_topic": NOTIFY_CMD_TOPIC,
@@ -627,7 +1547,7 @@ def publish_discovery():
     sensor_config = {
         "name": f"{DEVICE_NAME} Status",
         "unique_id": f"{UNIQUE_ID}_state",
-        "object_id": f"{UNIQUE_ID}_state",
+        "default_entity_id": f"sensor.{UNIQUE_ID}_state",
         "device": device_info,
         "state_topic": STATE_TOPIC,
         "availability_topic": AVAILABILITY_TOPIC,
@@ -644,7 +1564,7 @@ def publish_discovery():
     volume_config = {
         "name": f"{DEVICE_NAME} Volume",
         "unique_id": f"{UNIQUE_ID}_volume",
-        "object_id": f"{UNIQUE_ID}_volume",
+        "default_entity_id": f"number.{UNIQUE_ID}_volume",
         "device": device_info,
         "state_topic": VOLUME_STATE_TOPIC,
         "command_topic": VOLUME_CMD_TOPIC,
@@ -667,7 +1587,7 @@ def publish_discovery():
     mute_config = {
         "name": f"{DEVICE_NAME} Mute",
         "unique_id": f"{UNIQUE_ID}_mute",
-        "object_id": f"{UNIQUE_ID}_mute",
+        "default_entity_id": f"switch.{UNIQUE_ID}_mute",
         "device": device_info,
         "state_topic": MUTE_STATE_TOPIC,
         "command_topic": MUTE_CMD_TOPIC,
@@ -686,44 +1606,156 @@ def publish_discovery():
     # Target room select - will be updated when devices are discovered
     update_target_select_options()
 
+    # Priority select
+    priority_config = {
+        "name": f"{DEVICE_NAME} Priority",
+        "unique_id": f"{UNIQUE_ID}_priority",
+        "object_id": f"{UNIQUE_ID}_priority",
+        "device": device_info,
+        "state_topic": PRIORITY_STATE_TOPIC,
+        "command_topic": PRIORITY_CMD_TOPIC,
+        "availability_topic": AVAILABILITY_TOPIC,
+        "options": ["Normal", "High", "Emergency"],
+        "icon": "mdi:alert-circle-outline"
+    }
+    mqtt_client.publish(
+        f"homeassistant/select/{UNIQUE_ID}_priority/config",
+        json.dumps(priority_config),
+        retain=True
+    )
+
+    # DND switch
+    dnd_config = {
+        "name": f"{DEVICE_NAME} Do Not Disturb",
+        "unique_id": f"{UNIQUE_ID}_dnd",
+        "object_id": f"{UNIQUE_ID}_dnd",
+        "device": device_info,
+        "state_topic": DND_STATE_TOPIC,
+        "command_topic": DND_CMD_TOPIC,
+        "availability_topic": AVAILABILITY_TOPIC,
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "icon": "mdi:bell-sleep"
+    }
+    mqtt_client.publish(
+        f"homeassistant/switch/{UNIQUE_ID}_dnd/config",
+        json.dumps(dnd_config),
+        retain=True
+    )
+
     log.info("Published HA discovery configs")
 
 
-def publish_state():
-    """Publish current state to MQTT and web clients."""
+def publish_state(state=None, notify_web=True, source="hub"):
+    """Publish current state to MQTT and optionally web clients.
+
+    Args:
+        state: The state value to publish. If None, reads current_state (caller
+               must ensure thread safety). Callers that set current_state under
+               state_lock should pass the value to avoid a lockless read.
+        notify_web: If True, also notify web clients. Set False when handling
+                    web client notifications manually (e.g., in websocket_handler).
+        source: Who triggered the state change ("hub" for TTS, "webclient" for PTT)
+    """
+    if state is None:
+        state = current_state
+
     if mqtt_client and mqtt_client.is_connected():
-        mqtt_client.publish(STATE_TOPIC, current_state, retain=True)
+        mqtt_client.publish(STATE_TOPIC, state, retain=True)
 
-    # Also notify web clients (thread-safe)
-    notify_web_clients_state()
+    # Also notify web clients (thread-safe) unless caller handles it
+    if notify_web:
+        notify_web_clients_state(state=state, source=source)
 
 
-def notify_web_clients_state():
-    """Notify web clients of state change (thread-safe)."""
+def notify_web_clients_state(state=None, source="hub"):
+    """Notify web clients of state change (thread-safe).
+
+    Args:
+        state: The state value to broadcast. If None, reads current_state (caller
+               must ensure thread safety).
+        source: Who triggered the state change ("hub" or a client websocket)
+                When hub transmits (TTS), clients should receive, not transmit.
+    """
     global web_event_loop
 
     if not web_clients or web_event_loop is None:
         return
 
+    if state is None:
+        state = current_state
+
+    # When HUB is transmitting (TTS/media), web clients should be "receiving"
+    # Only when a specific web client is transmitting should THAT client be "transmitting"
+    web_state = state
+    if state == "transmitting" and source == "hub":
+        web_state = "receiving"  # Hub TX means clients RX
+
     try:
         asyncio.run_coroutine_threadsafe(
-            broadcast_to_web_clients({'type': 'state', 'status': current_state}),
+            broadcast_to_web_clients({'type': 'state', 'status': web_state}),
             web_event_loop
         )
     except Exception as e:
         log.error(f"notifying web clients: {e}")
 
 
-def forward_audio_to_web_clients(pcm_data):
-    """Forward audio to web clients (thread-safe)."""
+async def notify_single_web_client(target_device, state):
+    """Notify a specific web client of state change."""
+    if not web_clients or not target_device:
+        return
+
+    for client, client_id in list(web_client_ids.items()):
+        if client_id == target_device:
+            try:
+                await client.send_json({'type': 'state', 'status': state})
+                log.debug(f"Notified {client_id} of state: {state}")
+            except Exception:
+                web_clients.discard(client)
+                if client in web_client_ids:
+                    del web_client_ids[client]
+            return
+
+
+def notify_targeted_web_client_state(target_device, state):
+    """Notify a specific web client of state change (thread-safe).
+
+    Args:
+        target_device: The client_id to notify (e.g., "Brians_Phone")
+        state: The state to send ("receiving", "idle", etc.)
+    """
     global web_event_loop
+
+    if not web_clients or web_event_loop is None or not target_device:
+        return
+
+    try:
+        asyncio.run_coroutine_threadsafe(
+            notify_single_web_client(target_device, state),
+            web_event_loop
+        )
+    except Exception as e:
+        log.error(f"notifying targeted web client: {e}")
+
+
+def forward_audio_to_web_clients(pcm_data, priority=None):
+    """Forward audio to web clients (thread-safe).
+
+    Args:
+        pcm_data: Raw PCM bytes to forward.
+        priority: PRIORITY_* constant — sent to web clients for DND/emergency handling.
+    """
+    global web_event_loop
+
+    if priority is None:
+        priority = PRIORITY_NORMAL
 
     if not web_clients or web_event_loop is None:
         return
 
     try:
         asyncio.run_coroutine_threadsafe(
-            broadcast_audio_to_web_clients(pcm_data),
+            broadcast_audio_to_web_clients(pcm_data, priority=priority),
             web_event_loop
         )
     except Exception as e:
@@ -746,6 +1778,19 @@ def publish_target():
     """Publish current target."""
     if mqtt_client and mqtt_client.is_connected():
         mqtt_client.publish(TARGET_STATE_TOPIC, current_target, retain=True)
+
+
+def publish_priority():
+    """Publish current hub TX priority."""
+    if mqtt_client and mqtt_client.is_connected():
+        names = {PRIORITY_NORMAL: "Normal", PRIORITY_HIGH: "High", PRIORITY_EMERGENCY: "Emergency"}
+        mqtt_client.publish(PRIORITY_STATE_TOPIC, names.get(current_tx_priority, "Normal"), retain=True)
+
+
+def publish_dnd():
+    """Publish current hub DND state."""
+    if mqtt_client and mqtt_client.is_connected():
+        mqtt_client.publish(DND_STATE_TOPIC, "ON" if hub_dnd_enabled else "OFF", retain=True)
 
 
 def get_target_options():
@@ -776,7 +1821,7 @@ def update_target_select_options():
     target_config = {
         "name": "Target",
         "unique_id": f"{UNIQUE_ID}_target",
-        "object_id": f"{UNIQUE_ID}_target",
+        "default_entity_id": f"select.{UNIQUE_ID}_target",
         "device": device_info,
         "state_topic": TARGET_STATE_TOPIC,
         "command_topic": TARGET_CMD_TOPIC,
@@ -813,22 +1858,68 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     client.subscribe(DEVICE_INFO_TOPIC)
     log.info(f"Subscribed to device discovery: {DEVICE_INFO_TOPIC}")
 
+    # Subscribe to ESP32 state topics (for tracking targets)
+    client.subscribe("intercom/+/state")
+    log.info("Subscribed to ESP32 state topics")
+
+    # Subscribe to device availability (LWT online/offline)
+    client.subscribe("intercom/+/status")
+    log.info("Subscribed to device availability: intercom/+/status")
+
+    # Subscribe to call notifications (from ESP32s targeting mobile devices)
+    client.subscribe(MOBILE_CALL_TOPIC)
+    log.info(f"Subscribed to mobile call topic: {MOBILE_CALL_TOPIC}")
+
+    # Subscribe to priority and DND commands
+    client.subscribe(PRIORITY_CMD_TOPIC)
+    client.subscribe(DND_CMD_TOPIC)
+    log.info("Subscribed to priority and DND command topics")
+
+    # Subscribe to chime select command
+    client.subscribe(CHIME_CMD_TOPIC)
+    log.info("Subscribed to chime select command topic")
+
     # Publish discovery
     publish_discovery()
+
+    # Publish mobile devices as targets
+    publish_mobile_devices()
+
+    # Clear old "WebClients" aggregate device (replaced by individual web client tracking)
+    old_web_topic = f"intercom/devices/{UNIQUE_ID}_web/info"
+    old_web_status = f"intercom/{UNIQUE_ID}_web/status"
+    client.publish(old_web_topic, "", retain=True)
+    client.publish(old_web_status, "offline", retain=True)
+    log.info("Cleared old WebClients aggregate device")
+
+    # Clear any stale web client entries for mobile devices (they shouldn't exist)
+    for mobile in MOBILE_DEVICES:
+        safe_id = mobile["name"].replace(' ', '_').replace('/', '_').lower()
+        stale_topic = f"intercom/devices/{UNIQUE_ID}_web_{safe_id}/info"
+        stale_status = f"intercom/{UNIQUE_ID}_web_{safe_id}/status"
+        client.publish(stale_topic, "", retain=True)
+        client.publish(stale_status, "offline", retain=True)
+    if MOBILE_DEVICES:
+        log.info(f"Cleared stale web client entries for {len(MOBILE_DEVICES)} mobile device(s)")
 
     # Publish online status
     client.publish(AVAILABILITY_TOPIC, "online", retain=True)
 
     # Publish current state
-    publish_state()
+    publish_state(state="idle")
     publish_volume()
     publish_mute()
     publish_target()
+    publish_priority()
+    publish_dnd()
+    publish_chime_select()
+    publish_chime()
 
 
 def on_mqtt_message(client, userdata, msg):
     """Handle MQTT messages."""
     global current_volume, is_muted, current_target, discovered_devices
+    global current_tx_priority, hub_dnd_enabled
 
     topic = msg.topic
     payload = msg.payload.decode('utf-8')
@@ -850,20 +1941,51 @@ def on_mqtt_message(client, userdata, msg):
         publish_mute()
 
     elif topic == TARGET_CMD_TOPIC:
-        # Target room selection
-        current_target = payload
-        publish_target()
-        log.info(f"Target set to: {current_target}")
+        # Target room selection (sanitize input)
+        sanitized_target = sanitize_room_name(payload)
+        if sanitized_target:
+            current_target = sanitized_target
+            publish_target()
+            log.info(f"Target set to: {current_target}")
+        else:
+            log.warning(f"Invalid target rejected from MQTT: {repr(payload[:20])}")
+
+    elif topic == PRIORITY_CMD_TOPIC:
+        # Priority select: "Normal", "High", "Emergency"
+        priority_map = {"Normal": PRIORITY_NORMAL, "High": PRIORITY_HIGH, "Emergency": PRIORITY_EMERGENCY}
+        current_tx_priority = priority_map.get(payload, PRIORITY_NORMAL)
+        publish_priority()
+        log.info(f"Hub TX priority set to: {payload} ({current_tx_priority})")
+
+    elif topic == DND_CMD_TOPIC:
+        hub_dnd_enabled = (payload.upper() == "ON")
+        publish_dnd()
+        log.info(f"Hub DND {'enabled' if hub_dnd_enabled else 'disabled'}")
+
+    elif topic == CHIME_CMD_TOPIC:
+        # Chime selection: payload is the chime name (e.g. "doorbell")
+        global current_chime
+        new_chime = sanitize_string(payload, 64).strip()
+        if new_chime in loaded_chimes:
+            current_chime = new_chime
+            publish_chime()
+            log.info(f"Chime set to: {current_chime}")
+        elif loaded_chimes:
+            # Requested chime not available — use first loaded chime
+            current_chime = next(iter(loaded_chimes))
+            publish_chime()
+            log.warning(f"Chime '{new_chime}' not found, falling back to '{current_chime}'")
 
     elif topic.startswith("intercom/devices/") and topic.endswith("/info"):
-        # Device info from ESP32 intercoms
+        # Device info from ESP32 intercoms (validate inputs)
         try:
             data = json.loads(payload)
-            device_id = data.get("id", "")
-            room = data.get("room", "Unknown")
+            device_id = sanitize_string(data.get("id", ""), 64)
+            room = sanitize_room_name(data.get("room", ""))
             ip = data.get("ip", "")
 
-            if device_id and ip:
+            # Validate all fields before accepting
+            if device_id and room and validate_ip_address(ip):
                 old_devices = set(discovered_devices.keys())
                 discovered_devices[device_id] = {"room": room, "ip": ip}
 
@@ -871,6 +1993,8 @@ def on_mqtt_message(client, userdata, msg):
                 if device_id not in old_devices:
                     log.info(f"Discovered device: {room} ({device_id}) at {ip}")
                     update_target_select_options()
+            else:
+                log.warning(f"Invalid device info rejected: id={repr(device_id[:20] if device_id else '')}")
 
         except json.JSONDecodeError:
             pass
@@ -890,6 +2014,104 @@ def on_mqtt_message(client, userdata, msg):
 
         if message:
             announce(message)
+
+    elif topic == MOBILE_CALL_TOPIC:
+        # Call notification — stream chime audio to target, then handle mobile notification.
+        # The chime is streamed from the hub so ESP32 devices no longer need local PCM data.
+        try:
+            data = json.loads(payload)
+            target = sanitize_room_name(data.get("target", ""))
+            caller = sanitize_room_name(data.get("caller", "Intercom")) or "Intercom"
+
+            if not target:
+                return
+
+            log.info(f"Call: {caller} -> {target}")
+
+            # Resolve target IP for unicast chime delivery.
+            # 'All Rooms' / 'all' -> multicast (target_ip = None).
+            target_lower = target.lower()
+            if target_lower in ("all rooms", "all"):
+                chime_target_ip = None
+            else:
+                chime_target_ip = None  # Default to multicast if IP not found
+                for dev_info in discovered_devices.values():
+                    if dev_info.get("room") == target:
+                        chime_target_ip = dev_info.get("ip")
+                        break
+
+            # Stream chime in background (async coroutine scheduled on the web event loop).
+            # Capture chime_name and target_ip by value to avoid closure/late-binding issues.
+            if loaded_chimes and web_event_loop is not None:
+                _chime_name = current_chime   # Snapshot at dispatch time
+                _target_ip = chime_target_ip  # Already a local variable
+
+                def _schedule_chime(_cn=_chime_name, _ip=_target_ip):
+                    asyncio.run_coroutine_threadsafe(
+                        stream_chime_to_target(_ip, _cn),
+                        web_event_loop
+                    )
+
+                chime_thread = threading.Thread(target=_schedule_chime, daemon=True)
+                chime_thread.start()
+            else:
+                log.debug("Chime not streamed: no chimes loaded or event loop unavailable")
+
+            # Mobile notification (push alert) if target is a mobile device
+            if is_mobile_device(target):
+                send_mobile_notification(target, caller)
+
+        except json.JSONDecodeError:
+            pass
+
+    elif topic.startswith("intercom/") and topic.endswith("/state"):
+        # ESP32 state update - track target for audio routing
+        # Topic format: intercom/<device_id>/state
+        # Skip our own state topic
+        if topic == STATE_TOPIC:
+            return
+
+        parts = topic.split("/")
+        if len(parts) == 3:
+            device_id = parts[1]
+            try:
+                data = json.loads(payload)
+                state = data.get("state", "")
+                target = data.get("target", "")
+
+                if state == "transmitting" and target:
+                    # Track this ESP32's target
+                    esp32_targets[device_id] = target
+                    log.info(f"ESP32 {device_id} targeting: {target}")
+                elif state == "idle":
+                    # Clear target when idle
+                    if device_id in esp32_targets:
+                        del esp32_targets[device_id]
+                        log.debug(f"ESP32 {device_id} target cleared")
+            except json.JSONDecodeError:
+                # Might be plain string like "idle", not JSON
+                if payload == "idle" and device_id in esp32_targets:
+                    del esp32_targets[device_id]
+
+    elif topic.startswith("intercom/") and topic.endswith("/status"):
+        # Device availability (LWT) - remove offline devices from discovery list
+        # Topic: intercom/<unique_id>/status, payload: "online" or "offline"
+        parts = topic.split("/")
+        if len(parts) == 3:
+            device_id = parts[1]
+            if payload == "offline":
+                if device_id in discovered_devices:
+                    room = discovered_devices[device_id].get("room", device_id)
+                    del discovered_devices[device_id]
+                    log.info(f"Device offline, removed: {room} ({device_id})")
+                    update_target_select_options()
+                # Always clear retained device info to prevent zombie entries on broker.
+                # Devices re-publish their info on reconnect, so clearing on offline is safe.
+                client.publish(f"intercom/devices/{device_id}/info", "", retain=True, qos=1)
+                log.debug(f"Cleared retained info for offline device: {device_id}")
+            elif payload == "online":
+                # Device came back online - info will re-populate via /info topic
+                log.debug(f"Device online: {device_id}")
 
 
 def on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
@@ -913,27 +2135,44 @@ async def websocket_handler(request):
     web_clients.add(ws)
     log.info(f"Web PTT client connected ({len(web_clients)} total)")
 
-    # Publish web client as discoverable target
-    publish_web_client_info()
+    # Note: encoder is created fresh at ptt_start, not here.
+    # Creating it here caused crashes when opuslib's FEC property setter fails
+    # (opuslib 3.x has a broken ctl_set implementation in some builds).
 
-    # Create encoder for this session if needed
-    if opuslib and web_ptt_encoder is None:
-        web_ptt_encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
-        web_ptt_encoder.bitrate = OPUS_BITRATE
+    # Check if this is a mobile app connection (for auto-naming)
+    user_agent = request.headers.get('User-Agent', '')
+    suggested_name = None
+    if 'Home Assistant' in user_agent and MOBILE_DEVICES:
+        # Use the first mobile device's friendly name
+        suggested_name = MOBILE_DEVICES[0]["name"]
+        log.info(f"Mobile app detected, suggesting name: {suggested_name}")
 
     # Send current state, version, and target list
-    await ws.send_json({
+    init_msg = {
         'type': 'init',
         'version': VERSION,
         'status': current_state
-    })
+    }
+    if suggested_name:
+        init_msg['suggested_name'] = suggested_name
+    await ws.send_json(init_msg)
     await ws.send_json({
         'type': 'targets',
-        'rooms': sorted(set(d['room'] for d in discovered_devices.values() if d['room'] != 'WebClients'))
+        'rooms': sorted(set(d['room'] for d in discovered_devices.values() ))
     })
+
+    # Send recent call info if within timeout (for auto-select)
+    if recent_call["caller"] and time.time() - recent_call["timestamp"] < RECENT_CALL_TIMEOUT:
+        await ws.send_json({
+            'type': 'recent_call',
+            'caller': recent_call["caller"]
+        })
+        log.info(f"Sent recent call info to Web PTT: {recent_call['caller']}")
 
     ptt_active = False
     ptt_target = None
+    ptt_target_room = 'all'  # Track target room name for web client forwarding
+    ptt_priority = PRIORITY_NORMAL  # Web client's chosen TX priority
     frame_count = 0
     lead_in_sent = False
     holding_lock = False  # Track if we hold web_tx_lock
@@ -948,14 +2187,29 @@ async def websocket_handler(request):
                         silence_pcm = bytes(FRAME_SIZE * 2)
                         silence_opus = web_ptt_encoder.encode(silence_pcm, FRAME_SIZE)
                         for _ in range(15):  # 300ms lead-in
-                            send_audio_packet(silence_opus, ptt_target)
+                            send_audio_packet(silence_opus, ptt_target, priority=ptt_priority)
                             await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
                         lead_in_sent = True
 
-                    # Encode and send
+                    # Encode and send to ESP32s
                     opus_data = web_ptt_encoder.encode(msg.data, FRAME_SIZE)
-                    send_audio_packet(opus_data, ptt_target)
+                    send_audio_packet(opus_data, ptt_target, priority=ptt_priority)
                     frame_count += 1
+
+                    # Forward PCM to other web clients (respect target)
+                    # Prepend priority byte so receiver can apply DND filtering
+                    web_frame = bytes([ptt_priority]) + msg.data
+                    is_broadcast = ptt_target_room.lower() in ('all', 'all rooms')
+                    for other_client in web_clients.copy():
+                        if other_client == ws:
+                            continue
+                        # Check if this client should receive
+                        other_id = web_client_ids.get(other_client)
+                        if is_broadcast or other_id == ptt_target_room:
+                            try:
+                                await other_client.send_bytes(web_frame)
+                            except Exception:
+                                pass
 
             elif msg.type == web.WSMsgType.TEXT:
                 try:
@@ -963,6 +2217,11 @@ async def websocket_handler(request):
                     msg_type = data.get('type')
 
                     if msg_type == 'ptt_start':
+                        # Read priority from web client (defaults to Normal)
+                        raw_priority_str = data.get('priority', 'Normal')
+                        priority_map = {'Normal': PRIORITY_NORMAL, 'High': PRIORITY_HIGH, 'Emergency': PRIORITY_EMERGENCY}
+                        ptt_priority = priority_map.get(raw_priority_str, PRIORITY_NORMAL)
+
                         # Wait for any previous transmission to finish (including trail-out)
                         # This queues transmissions like TTS announcements do
                         if web_tx_lock:
@@ -970,14 +2229,15 @@ async def websocket_handler(request):
                             holding_lock = True
 
                         # Check if channel is busy (receiving from ESP32)
-                        if is_channel_busy():
+                        if is_channel_busy(our_priority=ptt_priority):
                             if holding_lock:
                                 web_tx_lock.release()
                                 holding_lock = False
                             await ws.send_json({'type': 'busy'})
                         else:
                             ptt_active = True
-                            web_ptt_active = True
+                            with state_lock:
+                                web_ptt_active = True
                             lead_in_sent = False
                             frame_count = 0
 
@@ -986,27 +2246,40 @@ async def websocket_handler(request):
                             if opuslib:
                                 web_ptt_encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
                                 web_ptt_encoder.bitrate = OPUS_BITRATE
+                                try:
+                                    web_ptt_encoder.inband_fec = 1
+                                    web_ptt_encoder.packet_loss_perc = 10
+                                except (TypeError, AttributeError):
+                                    pass  # opuslib version may have broken ctl_set property setters
 
-                            # Get target IP
-                            target_room = data.get('target', 'all')
-                            if target_room == 'all':
+                            # Get target IP (no automatic notifications - use Call button)
+                            raw_target = data.get('target', 'all')
+                            target_room = sanitize_room_name(raw_target) if raw_target != 'all' else 'all'
+                            if target_room == 'all' or not target_room:
                                 ptt_target = None
+                                ptt_target_room = 'all'
                             else:
                                 ptt_target = None
+                                ptt_target_room = target_room
                                 for dev in discovered_devices.values():
                                     if dev.get('room') == target_room:
                                         ptt_target = dev.get('ip')
                                         break
 
-                            current_state = "transmitting"
-                            publish_state()
+                            with state_lock:
+                                current_state = "transmitting"
+                            publish_state(state="transmitting", notify_web=False)  # MQTT only - we handle web clients below
                             log.info(f"Web PTT started -> {target_room}")
 
-                            # Notify all web clients
-                            await broadcast_to_web_clients({
-                                'type': 'state',
-                                'status': 'transmitting'
-                            })
+                            # Notify THIS client it's transmitting
+                            await ws.send_json({'type': 'state', 'status': 'transmitting'})
+                            # Notify OTHER web clients they're receiving
+                            for other_client in web_clients.copy():
+                                if other_client != ws:
+                                    try:
+                                        await other_client.send_json({'type': 'state', 'status': 'receiving'})
+                                    except Exception:
+                                        pass
 
                     elif msg_type == 'ptt_stop':
                         if ptt_active:
@@ -1020,11 +2293,12 @@ async def websocket_handler(request):
                                     await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
 
                             ptt_active = False
-                            web_ptt_active = False
+                            with state_lock:
+                                web_ptt_active = False
+                                current_state = "idle"
                             # Reset encoder - prevents state carryover to next session
                             web_ptt_encoder = None
-                            current_state = "idle"
-                            publish_state()
+                            publish_state(state="idle", notify_web=False)  # MQTT only - we handle web clients below
                             log.debug(f"Web PTT stopped ({frame_count} frames)")
 
                             # Gap for ESP32 jitter buffer to drain before next TX
@@ -1035,27 +2309,96 @@ async def websocket_handler(request):
                                 web_tx_lock.release()
                                 holding_lock = False
 
-                            await broadcast_to_web_clients({
-                                'type': 'state',
-                                'status': 'idle'
-                            })
+                            # All clients back to idle
+                            await broadcast_to_web_clients({'type': 'state', 'status': 'idle'})
 
                     elif msg_type == 'get_state':
                         await ws.send_json({
                             'type': 'state',
                             'status': current_state
                         })
+                        # Send targets excluding self
+                        my_id = web_client_ids.get(ws)
                         await ws.send_json({
                             'type': 'targets',
-                            'rooms': sorted(set(d['room'] for d in discovered_devices.values() if d['room'] != 'WebClients'))
+                            'rooms': sorted(set(d['room'] for d in discovered_devices.values() if d['room'] != my_id))
                         })
 
                     elif msg_type == 'set_target':
                         # Just acknowledge - actual target used at PTT start
                         pass
 
+                    elif msg_type == 'identify':
+                        # Client identifying itself (e.g., mobile device or Web_XXXX)
+                        raw_client_id = data.get('client_id')
+                        client_id = sanitize_client_id(raw_client_id)
+                        if client_id:
+                            # If this client had a different ID before, mark old one offline
+                            old_id = web_client_ids.get(ws)
+                            if old_id and old_id != client_id and not is_mobile_device(old_id):
+                                publish_web_client_offline(old_id)
+
+                            web_client_ids[ws] = client_id
+
+                            # Only publish as new web client if NOT an existing mobile device
+                            if is_mobile_device(client_id):
+                                log.info(f"Web client identified as mobile device: {client_id}")
+                            else:
+                                publish_web_client_online(client_id)
+                                log.info(f"Web client identified as: {client_id}")
+
+                            # Send updated targets list (excluding self)
+                            await ws.send_json({
+                                'type': 'targets',
+                                'rooms': sorted(set(d['room'] for d in discovered_devices.values() if d['room'] != client_id))
+                            })
+                        else:
+                            log.warning(f"Invalid client_id from {request.remote}")
+
+                    elif msg_type == 'call':
+                        # Call/notify a target device (or all rooms)
+                        raw_target = data.get('target')
+                        target = sanitize_room_name(raw_target)
+                        caller_name = web_client_ids.get(ws, "Web PTT")
+                        safe_caller = sanitize_string(caller_name, MAX_ROOM_NAME_LENGTH)
+
+                        if raw_target in ('all', 'All Rooms'):
+                            # Call all discovered rooms simultaneously, skipping the caller
+                            rooms_called = []
+                            for dev in list(discovered_devices.values()):
+                                room = dev.get('room', '')
+                                if not room or room == caller_name:
+                                    continue
+                                call_data = {
+                                    "target": room,
+                                    "caller": safe_caller
+                                }
+                                mqtt_client.publish(MOBILE_CALL_TOPIC, json.dumps(call_data))
+                                if is_mobile_device(room):
+                                    send_mobile_notification(room, caller_name)
+                                rooms_called.append(room)
+                            log.info(f"Call all rooms: {caller_name} -> {rooms_called}")
+                        elif target:
+                            # Send call notification via MQTT (ESP32s and hub listen)
+                            call_data = {
+                                "target": target,
+                                "caller": safe_caller
+                            }
+                            mqtt_client.publish(MOBILE_CALL_TOPIC, json.dumps(call_data))
+                            log.info(f"Call: {caller_name} -> {target}")
+
+                            # Also send mobile notification if target is mobile
+                            if is_mobile_device(target):
+                                send_mobile_notification(target, caller_name)
+                        elif raw_target:
+                            log.warning(f"Invalid call target rejected: {repr(str(raw_target)[:20])}")
+
                 except json.JSONDecodeError:
                     pass
+                except Exception as msg_err:
+                    # Catch send errors (e.g. connection closing mid-message) without
+                    # crashing the entire WebSocket handler.
+                    log.debug(f"WebSocket message handling error ({msg_type}): {msg_err}")
 
             elif msg.type == web.WSMsgType.ERROR:
                 log.error(f"WebSocket error: {ws.exception()}")
@@ -1066,19 +2409,23 @@ async def websocket_handler(request):
     finally:
         # Clean up on disconnect
         if ptt_active:
-            web_ptt_active = False
-            current_state = "idle"
-            publish_state()
+            with state_lock:
+                web_ptt_active = False
+                current_state = "idle"
+            publish_state(state="idle")
 
         # Release lock if still held (client disconnected while transmitting)
         if holding_lock and web_tx_lock:
             web_tx_lock.release()
 
         web_clients.discard(ws)
+        # Clean up client identity and mark offline (only for non-mobile devices)
+        if ws in web_client_ids:
+            client_id = web_client_ids[ws]
+            del web_client_ids[ws]
+            if not is_mobile_device(client_id):
+                publish_web_client_offline(client_id)
         log.info(f"Web PTT client disconnected ({len(web_clients)} remaining)")
-
-        # Update web client discovery (remove if no clients left)
-        publish_web_client_info()
 
     return ws
 
@@ -1098,16 +2445,61 @@ async def broadcast_to_web_clients(message):
             web_clients.discard(client)
 
 
-async def broadcast_audio_to_web_clients(pcm_data):
-    """Send audio PCM data to all connected web clients."""
+async def broadcast_audio_to_web_clients(pcm_data, priority=PRIORITY_NORMAL):
+    """Send audio PCM data to web clients (targeted based on sender's target).
+
+    Prepends a 1-byte priority marker so web clients can apply DND / emergency logic.
+    Binary frame format: [1 byte priority] [PCM bytes...]
+    """
     if not web_clients:
         return
 
-    for client in web_clients.copy():
+    # Prepend priority byte so the web client can handle it
+    frame = bytes([priority]) + pcm_data
+
+    # Determine target mobile device from the current sender
+    target_device = None
+
+    # Method 1: Check esp32_targets for the current sender
+    # The MQTT unique_id format is "intercom_<last 4 bytes of device_id>"
+    if current_audio_sender:
+        # Try to find matching device in esp32_targets
+        # Format: sender_id is full 8-byte hex, mqtt unique_id is intercom_<last 4 bytes>
+        sender_suffix = current_audio_sender[-8:]  # Last 4 bytes as hex (8 chars)
+        mqtt_unique_id = f"intercom_{sender_suffix}"
+
+        if mqtt_unique_id in esp32_targets:
+            target_device = esp32_targets[mqtt_unique_id]
+            log.debug(f"Audio from {mqtt_unique_id} targeting: {target_device}")
+
+    # "all", "All Rooms", or empty target means broadcast to all clients
+    if not target_device or target_device.lower() in ("all", "all rooms"):
+        clients_to_send = web_clients.copy()
+    else:
+        # Find the web client matching the target
+        target_client = None
+        for client, client_id in list(web_client_ids.items()):
+            if client_id == target_device:
+                target_client = client
+                log.debug(f"Routing audio to web client: {client_id}")
+                break
+
+        # If target specified but client not connected, don't send to anyone
+        if not target_client:
+            log.debug(f"Target {target_device} not connected, dropping audio")
+            return
+
+        clients_to_send = [target_client]
+
+    for client in clients_to_send:
+        if client is None:
+            continue
         try:
-            await client.send_bytes(pcm_data)
+            await client.send_bytes(frame)
         except Exception:
             web_clients.discard(client)
+            if client in web_client_ids:
+                del web_client_ids[client]
 
 
 async def index_handler(request):
@@ -1192,6 +2584,17 @@ def main():
     log.info(f"Log level: {LOG_LEVEL}")
     log.info("=" * 50)
 
+    # Pre-encode chime audio files for zero-latency streaming
+    global current_chime
+    load_all_chimes()
+    # Set initial chime to first available if the default ('doorbell') isn't loaded
+    if loaded_chimes and current_chime not in loaded_chimes:
+        current_chime = next(iter(loaded_chimes))
+        log.info(f"Default chime set to: {current_chime}")
+
+    # Load mobile device config
+    load_mobile_devices()
+
     # Create multicast sockets
     tx_socket = create_tx_socket()
     log.info(f"TX socket ready: {MULTICAST_GROUP}:{MULTICAST_PORT}")
@@ -1227,6 +2630,10 @@ def main():
     # Start MQTT loop in background thread
     mqtt_thread = threading.Thread(target=run_mqtt_loop, daemon=True)
     mqtt_thread.start()
+
+    # Start mobile device refresh thread (updates every 5 minutes)
+    mobile_thread = threading.Thread(target=mobile_refresh_thread, daemon=True)
+    mobile_thread.start()
 
     # Run web server in main thread (for ingress panel)
     log.info("Intercom Hub running...")

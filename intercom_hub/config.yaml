@@ -1,6 +1,6 @@
 name: "Intercom Hub"
 description: "Multicast intercom hub for HA - enables TTS announcements to ESP32 intercoms"
-version: "1.8.0"
+version: "2.1.0"
 slug: "intercom_hub"
 url: "https://github.com/Bri-J-C/ha-intercom"
 arch:
@@ -9,6 +9,7 @@ arch:
   - armv7
 init: false
 host_network: true
+homeassistant_api: true
 startup: application
 ingress: true
 ingress_port: 8099
@@ -25,6 +26,7 @@ options:
   piper_host: "core-piper"
   piper_port: 10200
   log_level: "info"
+  mobile_devices: []
 schema:
   mqtt_host: str
   mqtt_port: int
@@ -36,3 +38,6 @@ schema:
   piper_host: str
   piper_port: int
   log_level: list(debug|info|warning|error)?
+  mobile_devices:
+    - name: str
+      notify_service: str

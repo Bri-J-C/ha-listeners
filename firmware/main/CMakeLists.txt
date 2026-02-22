@@ -3,6 +3,7 @@ idf_component_register(
         "main.c"
         "audio_input.c"
         "audio_output.c"
+        "aec.c"
         "codec.c"
         "network.c"
         "discovery.c"
@@ -12,6 +13,7 @@ idf_component_register(
         "ha_mqtt.c"
         "diagnostics.c"
         "display.c"
+        "agc.c"
     INCLUDE_DIRS
         "."
     REQUIRES

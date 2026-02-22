@@ -2,9 +2,12 @@
  * Network Module
  *
  * UDP multicast/unicast for audio streaming.
+ * AP fallback mode now uses WPA2-PSK for security.
  */
 
 #include "network.h"
+#include "settings.h"
+#include "display.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -32,6 +35,11 @@ static int rx_socket = -1;
 static TaskHandle_t rx_task_handle = NULL;
 static network_rx_callback_t rx_callback = NULL;
 static bool rx_running = false;
+
+// TX packet statistics
+static uint32_t tx_packets_sent = 0;
+static uint32_t tx_packets_failed = 0;
+static int tx_last_errno = 0;
 
 // Forward declaration
 static void start_ap_mode(void);
@@ -73,7 +81,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     }
 }
 
-// Start AP mode for configuration
+// Start AP mode for configuration (now with WPA2-PSK security)
 static void start_ap_mode(void)
 {
     if (ap_mode_active) return;
@@ -94,16 +102,31 @@ static void start_ap_mode(void)
     char ap_ssid[32];
     snprintf(ap_ssid, sizeof(ap_ssid), "%s%02X%02X", AP_SSID_PREFIX, mac[4], mac[5]);
 
+    // Get or generate AP password
+    const settings_t *s = settings_get();
+    char ap_password[16];
+
+    if (strlen(s->ap_password) >= 8) {
+        // Use configured password
+        strncpy(ap_password, s->ap_password, sizeof(ap_password) - 1);
+        ap_password[sizeof(ap_password) - 1] = '\0';
+    } else {
+        // Use fixed default password for easy setup
+        strncpy(ap_password, "intercom1", sizeof(ap_password) - 1);
+        ap_password[sizeof(ap_password) - 1] = '\0';
+    }
+
     wifi_config_t ap_config = {
         .ap = {
             .channel = 1,
             .max_connection = 4,
-            .authmode = WIFI_AUTH_OPEN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = { .required = false },
         },
     };
     strncpy((char *)ap_config.ap.ssid, ap_ssid, sizeof(ap_config.ap.ssid));
     ap_config.ap.ssid_len = strlen(ap_ssid);
+    strncpy((char *)ap_config.ap.password, ap_password, sizeof(ap_config.ap.password));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
@@ -114,8 +137,11 @@ static void start_ap_mode(void)
     // Set AP IP as local_ip so webserver works
     local_ip.addr = esp_ip4addr_aton("192.168.4.1");
 
-    ESP_LOGI(TAG, "AP mode started: SSID='%s' (open), IP=192.168.4.1", ap_ssid);
+    ESP_LOGI(TAG, "AP mode started: SSID='%s' (WPA2), Password='%s', IP=192.168.4.1", ap_ssid, ap_password);
     ESP_LOGI(TAG, "Connect to this network and go to http://192.168.4.1 to configure");
+
+    // Show AP credentials on OLED for easy setup
+    display_show_ap_info(ap_ssid, ap_password);
 }
 
 esp_err_t network_init(const char *ssid, const char *password)
@@ -160,6 +186,10 @@ esp_err_t network_init(const char *ssid, const char *password)
     // Set multicast TTL
     uint8_t ttl = MULTICAST_TTL;
     setsockopt(tx_socket, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+
+    // Disable multicast loopback - prevent receiving our own packets
+    uint8_t loop = 0;
+    setsockopt(tx_socket, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
 
     ESP_LOGI(TAG, "Network initialized");
     return ESP_OK;
@@ -268,6 +298,25 @@ esp_err_t network_start_rx(void)
         }
     }
 
+    // Boot-time TX test: send a 1-byte probe to confirm the TX socket can
+    // actually send after WiFi is up.  The packet is too small to be a valid
+    // audio packet (< HEADER_LENGTH=12 bytes), so receivers silently ignore it.
+    {
+        uint8_t probe = 0xAA;
+        struct sockaddr_in probe_addr = {
+            .sin_family      = AF_INET,
+            .sin_port        = htons(AUDIO_PORT),
+            .sin_addr.s_addr = inet_addr(MULTICAST_GROUP),
+        };
+        int probe_sent = sendto(tx_socket, &probe, 1, 0,
+                                (struct sockaddr *)&probe_addr, sizeof(probe_addr));
+        if (probe_sent == 1) {
+            ESP_LOGI(TAG, "TX socket boot test OK");
+        } else {
+            ESP_LOGE(TAG, "TX socket boot test FAILED: sent=%d errno=%d", probe_sent, errno);
+        }
+    }
+
     // Set receive timeout
     struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};  // 100ms
     setsockopt(rx_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -276,9 +325,9 @@ esp_err_t network_start_rx(void)
     int rcvbuf = 32768;
     setsockopt(rx_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-    // Start RX task - needs larger stack for audio processing
+    // Start RX task - needs larger stack for Opus decoding
     rx_running = true;
-    xTaskCreate(rx_task, "network_rx", 8192, NULL, 5, &rx_task_handle);
+    xTaskCreate(rx_task, "network_rx", 16384, NULL, 5, &rx_task_handle);
 
     ESP_LOGI(TAG, "RX started on port %d, multicast group %s", AUDIO_PORT, MULTICAST_GROUP);
     return ESP_OK;
@@ -326,7 +375,14 @@ esp_err_t network_send_multicast(const audio_packet_t *packet, size_t len)
     int sent = sendto(tx_socket, packet, len, 0,
                       (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
-    return (sent == len) ? ESP_OK : ESP_FAIL;
+    if (sent != (int)len) {
+        tx_last_errno = errno;
+        tx_packets_failed++;
+        ESP_LOGW(TAG, "Multicast sendto failed: sent=%d expected=%d errno=%d", sent, (int)len, errno);
+        return ESP_FAIL;
+    }
+    tx_packets_sent++;
+    return ESP_OK;
 }
 
 esp_err_t network_send_unicast(const audio_packet_t *packet, size_t len, const char *dest_ip)
@@ -344,7 +400,14 @@ esp_err_t network_send_unicast(const audio_packet_t *packet, size_t len, const c
     int sent = sendto(tx_socket, packet, len, 0,
                       (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
-    return (sent == len) ? ESP_OK : ESP_FAIL;
+    if (sent != (int)len) {
+        tx_last_errno = errno;
+        tx_packets_failed++;
+        ESP_LOGW(TAG, "Unicast sendto %s failed: sent=%d expected=%d errno=%d", dest_ip, sent, (int)len, errno);
+        return ESP_FAIL;
+    }
+    tx_packets_sent++;
+    return ESP_OK;
 }
 
 esp_err_t network_start_mdns(const char *hostname)
@@ -372,6 +435,13 @@ esp_err_t network_start_mdns(const char *hostname)
 
     ESP_LOGI(TAG, "mDNS started: %s.local", hostname);
     return ESP_OK;
+}
+
+void network_get_tx_stats(uint32_t *sent, uint32_t *failed, int *last_errno)
+{
+    if (sent)       *sent       = tx_packets_sent;
+    if (failed)     *failed     = tx_packets_failed;
+    if (last_errno) *last_errno = tx_last_errno;
 }
 
 void network_deinit(void)

@@ -10,6 +10,9 @@
 
 #include <stdint.h>
 
+// Firmware version - bump with every firmware change
+#define FIRMWARE_VERSION        "2.7.0"
+
 // Network Configuration
 #define CONTROL_PORT        5004
 #define AUDIO_PORT          5005
@@ -21,13 +24,19 @@
 #define CHANNELS            1
 #define FRAME_DURATION_MS   20
 #define FRAME_SIZE          (SAMPLE_RATE * FRAME_DURATION_MS / 1000)  // 320 samples
-#define OPUS_BITRATE        12000  // 12kbps is sufficient for wideband speech
+#define OPUS_BITRATE        32000  // 32kbps VBR — matches codec.c and intercom_hub.py
 
 // Protocol Configuration
 #define HEARTBEAT_INTERVAL_MS   30000
 #define DEVICE_ID_LENGTH        8
 #define SEQUENCE_LENGTH         4
-#define HEADER_LENGTH           (DEVICE_ID_LENGTH + SEQUENCE_LENGTH)  // 12 bytes
+#define PRIORITY_LENGTH         1
+#define HEADER_LENGTH           (DEVICE_ID_LENGTH + SEQUENCE_LENGTH + PRIORITY_LENGTH)  // 13 bytes
+
+// Priority levels for preemption / DND override
+#define PRIORITY_NORMAL         0   // Default PTT (first-to-talk collision avoidance)
+#define PRIORITY_HIGH           1   // Override normal transmissions (parent override)
+#define PRIORITY_EMERGENCY      2   // Override everything, force max volume, bypass mute
 
 // Max packet size (header + max opus frame)
 #define MAX_PACKET_SIZE         256
@@ -51,6 +60,7 @@ typedef enum {
 typedef struct __attribute__((packed)) {
     uint8_t device_id[DEVICE_ID_LENGTH];
     uint32_t sequence;
+    uint8_t priority;     // PRIORITY_NORMAL / PRIORITY_HIGH / PRIORITY_EMERGENCY
     uint8_t opus_data[];  // Variable length
 } audio_packet_t;
 
@@ -72,6 +82,7 @@ typedef enum {
     LED_STATE_MUTED,        // Solid red - muted
     LED_STATE_ERROR,        // Blinking red - error
     LED_STATE_BUSY,         // Solid orange - channel busy (someone else talking)
+    LED_STATE_DND,          // Solid purple/violet - Do Not Disturb active
 } led_state_t;
 
 #endif // PROTOCOL_H

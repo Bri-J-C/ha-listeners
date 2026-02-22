@@ -18,6 +18,8 @@
 #define SETTINGS_MQTT_HOST_MAX  64
 #define SETTINGS_MQTT_USER_MAX  32
 #define SETTINGS_MQTT_PASS_MAX  64
+#define SETTINGS_WEB_PASS_MAX   32
+#define SETTINGS_AP_PASS_MAX    16
 
 // Settings structure
 typedef struct {
@@ -32,9 +34,18 @@ typedef struct {
     char mqtt_user[SETTINGS_MQTT_USER_MAX];
     char mqtt_password[SETTINGS_MQTT_PASS_MAX];
     bool mqtt_enabled;
+    bool mqtt_tls_enabled;  // Enable MQTT over TLS
     // Audio/LED settings
     bool muted;
     bool led_enabled;
+    // AGC settings
+    bool agc_enabled;
+    // Priority and DND
+    uint8_t priority;     // TX priority: PRIORITY_NORMAL / HIGH / EMERGENCY
+    bool dnd_enabled;     // Do Not Disturb: only EMERGENCY audio plays
+    // Security settings
+    char web_admin_password[SETTINGS_WEB_PASS_MAX];  // Web UI admin password
+    char ap_password[SETTINGS_AP_PASS_MAX];          // AP mode WPA2 password
 } settings_t;
 
 /**
@@ -92,6 +103,43 @@ esp_err_t settings_set_mute(bool muted);
  * Set LED enabled state and save to NVS.
  */
 esp_err_t settings_set_led_enabled(bool enabled);
+
+/**
+ * Set AGC enabled state and save to NVS.
+ */
+esp_err_t settings_set_agc_enabled(bool enabled);
+
+/**
+ * Set TX priority (PRIORITY_NORMAL / PRIORITY_HIGH / PRIORITY_EMERGENCY).
+ */
+esp_err_t settings_set_priority(uint8_t priority);
+
+/**
+ * Set Do Not Disturb enabled state and save to NVS.
+ * When enabled, only EMERGENCY priority audio plays.
+ */
+esp_err_t settings_set_dnd(bool enabled);
+
+/**
+ * Set web admin password and save to NVS.
+ */
+esp_err_t settings_set_web_admin_password(const char *password);
+
+/**
+ * Set AP mode password and save to NVS.
+ */
+esp_err_t settings_set_ap_password(const char *password);
+
+/**
+ * Set MQTT TLS enabled and save to NVS.
+ */
+esp_err_t settings_set_mqtt_tls_enabled(bool enabled);
+
+/**
+ * Verify web admin password.
+ * Returns true if password matches (or no password is set).
+ */
+bool settings_verify_web_password(const char *password);
 
 /**
  * Check and save pending settings to NVS.

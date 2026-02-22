@@ -9,7 +9,7 @@
 
 #include "esp_err.h"
 
-#define DIAG_LOG_ENTRIES 50
+#define DIAG_LOG_ENTRIES 100
 #define DIAG_LOG_ENTRY_SIZE 128
 
 /**
