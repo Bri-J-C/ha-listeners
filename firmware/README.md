@@ -31,6 +31,8 @@ PlatformIO-based firmware for the intercom satellite nodes.
 - Trail-out silence reduced from 30 frames (600ms) to 10 frames (200ms) for faster channel release after transmission ends
 - RX audio queue flushed via `xQueueReset()` on PTT press (both normal and preemption paths) to discard stale queued audio before transmitting
 - LED spinlock (`portMUX_TYPE`) in `button.c` makes `button_set_led_state()` safe to call from multiple tasks concurrently
+- FreeRTOS mutex in `audio_output.c` protects all I2S state transitions (start/stop/write) — eliminates TOCTOU race where `write()` could call `i2s_channel_write()` on a channel being concurrently disabled by `stop()`, causing "The channel is not enabled" errors
+- Incoming call chime: 150ms delay in `play_incoming_call_chime()` allows hub chime UDP packets to arrive before deciding whether to fall back to the local beep; `play_fallback_beep()` flushes the RX queue via `xQueueReset()` to prevent play task contention during beep playback
 - Webserver `max_open_sockets` reduced from 7 to 3, freeing lwIP socket slots for MQTT and UDP
 - `SPIRAM_MALLOC_ALWAYSINTERNAL` reduced from 16384 to 4096: prevents internal RAM exhaustion that caused MQTT cycling when many sockets were active
 - `LWIP_MAX_SOCKETS` increased from 10 to 16 to accommodate concurrent UDP, mDNS, HTTP, and MQTT sockets

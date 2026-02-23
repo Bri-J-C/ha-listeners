@@ -21,7 +21,7 @@ ESP32-S3-based multi-room intercom system with Home Assistant integration.
 - **OTA firmware updates** via web interface
 - **Reliable mDNS** with automatic re-enable on WiFi reconnect and 60-second periodic re-announcement
 - **DHCP hostname** registration so routers display the correct device name
-- **Audio reliability** improvements: decoupled RX receive/decode pipeline (15-deep queue + dedicated play task), reduced playback start latency (~40ms vs ~160ms), eliminated TX/RX buffer race conditions, silence-gated trail-out (200ms channel release vs 600ms), and queue flush on PTT press to discard stale audio before transmitting
+- **Audio reliability** improvements: decoupled RX receive/decode pipeline (15-deep queue + dedicated play task), reduced playback start latency (~40ms vs ~160ms), eliminated TX/RX buffer race conditions, silence-gated trail-out (200ms channel release vs 600ms), queue flush on PTT press to discard stale audio before transmitting, and thread-safe I2S state management via FreeRTOS mutex (eliminates TOCTOU race on start/stop/write)
 - **Mobile device** auto-discovery and notification routing
 - **TTS announcements** via Piper text-to-speech
 - **Home Assistant integration** with MQTT auto-discovery, services, and automations
@@ -115,7 +115,7 @@ packet-beta
 |-----------|-------------|
 | `firmware/` | ESP32-S3 firmware (PlatformIO/ESP-IDF) |
 | `intercom_hub/` | Home Assistant add-on for PTT hub, TTS, and routing |
-| `tools/` | Python test client for protocol development |
+| `tools/` | Python utilities: `test_node.py` (MQTT call + UDP audio test harness), `protocol.py` (shared protocol constants), `ptt_client.py` (desktop PTT client) |
 
 ## Quick Start
 

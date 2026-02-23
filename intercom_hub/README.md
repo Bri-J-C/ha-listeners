@@ -157,3 +157,4 @@ mode: single
 | Hub Python (`intercom_hub.py`) | 2.2.1 |
 | Hub Add-on (`config.yaml`) | 2.1.0 |
 | Lovelace PTT Card (`intercom-ptt-card.js`) | 1.2.0 |
+| Firmware (`protocol.h`) | 2.8.1 |
