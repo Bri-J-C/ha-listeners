@@ -649,13 +649,20 @@ static void play_incoming_call_chime(void)
              audio_playing, (unsigned)q_depth, has_current_sender,
              hub_chime_active ? "hub chime active, skipping beep" : "no hub audio, playing beep");
 
+    // Force full volume for incoming call — must be heard regardless of setting.
+    // Uses the emergency override mechanism (save/restore). Restored automatically
+    // in the idle timeout when the chime audio ends.
+    audio_output_force_unmute_max_volume();
+
     if (hub_chime_active) {
         // Hub chime is already playing through the normal RX path — don't disrupt it.
+        // Volume restored in idle timeout via audio_output_restore_volume().
         return;
     }
 
-    // No hub audio after 150ms — hub is likely unreachable. Play fallback beep.
+    // No hub audio after 150ms — hub is likely unreachable. Play fallback beep at full volume.
     play_fallback_beep();
+    audio_output_restore_volume();
 }
 
 /**
