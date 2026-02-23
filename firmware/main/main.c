@@ -175,7 +175,12 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         memcpy(item.data, packet, copy_len);
         item.len = copy_len;
         if (xQueueSend(rx_audio_queue, &item, 0) != pdTRUE) {
-            // Queue full — drop packet (expected under overload)
+            static uint32_t queue_full_count = 0;
+            queue_full_count++;
+            if ((queue_full_count % 50) == 1) {
+                ESP_LOGW(TAG, "RX queue full — dropped packet (total drops: %lu)",
+                         (unsigned long)queue_full_count);
+            }
         }
     }
 }
@@ -247,6 +252,7 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
 
     size_t opus_len = total_len - HEADER_LENGTH;
     if (opus_len == 0 || opus_len > MAX_PACKET_SIZE - HEADER_LENGTH) {
+        ESP_LOGW(TAG, "RX packet invalid opus_len=%u (total=%u)", (unsigned)opus_len, (unsigned)total_len);
         return;
     }
 
@@ -268,12 +274,13 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
 
     // Start audio output if not already playing (silence frames don't trigger state change)
     if (!audio_playing && !is_silence_frame) {
+        ESP_LOGI(TAG, "RX audio starting (opus_len=%u, seq=%lu, pri=%d)",
+                 (unsigned)opus_len, (unsigned long)ntohl(packet->sequence), incoming_priority);
         audio_output_start();
         audio_playing = true;
         button_set_led_state(LED_STATE_RECEIVING);
         display_set_state(DISPLAY_STATE_RECEIVING);
         ha_mqtt_set_state(HA_STATE_RECEIVING);
-        ESP_LOGI(TAG, "RX audio started");
     }
 
     uint32_t seq = ntohl(packet->sequence);
@@ -281,6 +288,10 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
     // Detect packet loss and apply PLC/FEC before decoding current packet
     if (sequence_initialized) {
         int32_t gap = (int32_t)(seq - last_sequence - 1);
+        if (gap > 4) {
+            ESP_LOGW(TAG, "RX sequence jump: last=%lu cur=%lu gap=%ld (too large for PLC)",
+                     (unsigned long)last_sequence, (unsigned long)seq, (long)gap);
+        }
         if (gap > 0 && gap <= 4) {
             if (gap == 1) {
                 // Single packet lost — try FEC recovery using current packet's embedded FEC
@@ -305,7 +316,14 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
     // Decode and play current packet (20ms timeout = one frame budget)
     int samples = codec_decode(packet->opus_data, opus_len, rx_pcm_buffer);
     if (samples > 0) {
-        audio_output_write(rx_pcm_buffer, samples, 20);
+        int written = audio_output_write(rx_pcm_buffer, samples, 20);
+        if (written == 0 && audio_playing) {
+            ESP_LOGW(TAG, "RX write returned 0 while audio_playing=true (seq=%lu, opus_len=%u)",
+                     (unsigned long)seq, (unsigned)opus_len);
+        }
+    } else {
+        ESP_LOGW(TAG, "RX decode failed: samples=%d (opus_len=%u, seq=%lu)",
+                 samples, (unsigned)opus_len, (unsigned long)seq);
     }
 }
 
@@ -529,14 +547,28 @@ static led_state_t get_idle_led_state(void)
  */
 static void play_fallback_beep(void)
 {
-    if (transmitting) return;
+    if (transmitting) {
+        ESP_LOGW(TAG, "Beep: skipped — currently transmitting");
+        return;
+    }
+
+    uint32_t beep_start = xTaskGetTickCount();
+
+    // Flush RX queue so play task doesn't wake up with stale packets during beep
+    UBaseType_t queued = rx_audio_queue ? uxQueueMessagesWaiting(rx_audio_queue) : 0;
+    if (rx_audio_queue) { xQueueReset(rx_audio_queue); }
+    ESP_LOGI(TAG, "Beep: flushed RX queue (%u packets discarded)", (unsigned)queued);
 
     // Stop any RX audio to free the output path
     if (audio_playing) {
+        ESP_LOGI(TAG, "Beep: stopping active RX audio (has_sender=%d, seq_init=%d)",
+                 has_current_sender, sequence_initialized);
         audio_output_stop();
         audio_playing = false;
         has_current_sender = false;
         sequence_initialized = false;  // Prevent stale sequence triggering false PLC
+    } else {
+        ESP_LOGI(TAG, "Beep: no active RX audio to stop");
     }
 
     // Generate one 20ms sine-wave frame and repeat it
@@ -546,14 +578,18 @@ static void play_fallback_beep(void)
         beep_frame[i] = (int16_t)(16384.0f * sinf(2.0f * M_PI * 800.0f * i / (float)SAMPLE_RATE));
     }
 
+    ESP_LOGI(TAG, "Beep: starting I2S output");
     audio_output_start();
     button_set_led_state(LED_STATE_RECEIVING);
 
     // Play 10 frames = 200ms of beep
+    int frames_written = 0;
     for (int frame = 0; frame < 10; frame++) {
-        audio_output_write(beep_frame, FRAME_SIZE, 50);
+        int written = audio_output_write(beep_frame, FRAME_SIZE, 50);
+        if (written > 0) frames_written++;
     }
 
+    ESP_LOGI(TAG, "Beep: stopping I2S output (%d/10 frames written)", frames_written);
     audio_output_stop();
 
     // Flush AEC reference: local beep audio must not contaminate the next TX's
@@ -562,7 +598,9 @@ static void play_fallback_beep(void)
     aec_flush_reference();
 
     button_set_led_state(get_idle_led_state());
-    ESP_LOGI(TAG, "Fallback beep complete (hub chime incoming via UDP)");
+
+    uint32_t beep_elapsed = (xTaskGetTickCount() - beep_start) * portTICK_PERIOD_MS;
+    ESP_LOGI(TAG, "Beep: complete in %lums (hub chime incoming via UDP)", (unsigned long)beep_elapsed);
 }
 
 /**
@@ -572,25 +610,52 @@ static void play_fallback_beep(void)
  * the MQTT call message.  The ESP32 plays the hub chime through the normal
  * on_audio_received() path (priority HIGH, so it preempts normal RX).
  *
- * This function provides an instant 200ms beep as local feedback (so the
- * user doesn't see silence while the hub chime is in transit) and sets the
- * LED to indicate an incoming call.
+ * Because UDP is faster than MQTT, the hub chime audio usually arrives BEFORE
+ * the ESP32 processes the MQTT call message. In that case the play task is
+ * already playing the chime — the fallback beep would disrupt it (stop I2S,
+ * flush the queue, fight the play task for the mutex).
+ *
+ * Strategy: only play the fallback beep if no hub audio has arrived yet.
+ * If hub chime is already playing or queued, just set the LED and let it play.
  */
 static void play_incoming_call_chime(void)
 {
-    if (transmitting) return;
+    if (transmitting) {
+        ESP_LOGW(TAG, "Call chime: skipped — currently transmitting");
+        return;
+    }
 
-    ESP_LOGI(TAG, "Incoming call — playing fallback beep, hub chime incoming via UDP");
-
-    // Flash the LED to signal an incoming call (RECEIVING colour)
+    // Set LED/display immediately for instant visual feedback.
     button_set_led_state(LED_STATE_RECEIVING);
+    display_set_state(DISPLAY_STATE_RECEIVING);
 
-    // Play short local beep for immediate audible feedback
+    // Wait 150ms for hub chime UDP frames to arrive.
+    //
+    // The hub publishes the MQTT call notification and starts streaming the
+    // chime audio over UDP almost simultaneously.  On the ESP32, MQTT sometimes
+    // arrives BEFORE the first UDP frame (broker delivery latency varies).
+    // Without this delay, audio_playing=false and q_depth=0, so we'd fall
+    // through to the beep — which stops I2S and races with the play task,
+    // destroying the hub chime audio.
+    //
+    // 150ms is generous: the first UDP frame normally arrives <25ms after the
+    // MQTT publish.  The delay is imperceptible to the user (LED is already on).
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    UBaseType_t q_depth = rx_audio_queue ? uxQueueMessagesWaiting(rx_audio_queue) : 0;
+    bool hub_chime_active = audio_playing || q_depth > 0;
+
+    ESP_LOGI(TAG, "Call chime: audio_playing=%d, q_depth=%u, has_sender=%d -> %s",
+             audio_playing, (unsigned)q_depth, has_current_sender,
+             hub_chime_active ? "hub chime active, skipping beep" : "no hub audio, playing beep");
+
+    if (hub_chime_active) {
+        // Hub chime is already playing through the normal RX path — don't disrupt it.
+        return;
+    }
+
+    // No hub audio after 150ms — hub is likely unreachable. Play fallback beep.
     play_fallback_beep();
-
-    // LED reverts inside play_fallback_beep() — nothing else to do here.
-    // The hub chime arrives as normal Opus/UDP packets and plays through
-    // on_audio_received() automatically (no special handling needed).
 }
 
 /**
@@ -1040,7 +1105,12 @@ void app_main(void)
         // Stop audio output after 500ms of no received packets
         if (audio_playing && !transmitting) {
             uint32_t now = xTaskGetTickCount();
-            if ((now - last_audio_rx_time) > pdMS_TO_TICKS(500)) {
+            uint32_t idle_ms = (now - last_audio_rx_time) * portTICK_PERIOD_MS;
+            if (idle_ms > 500) {
+                UBaseType_t q_remain = rx_audio_queue ? uxQueueMessagesWaiting(rx_audio_queue) : 0;
+                ESP_LOGI(TAG, "RX idle timeout: %lums since last packet (q_depth=%u, sender=%02x%02x, pri=%d)",
+                         (unsigned long)idle_ms, (unsigned)q_remain,
+                         current_sender[0], current_sender[1], current_rx_priority);
                 audio_output_stop();
                 audio_playing = false;
                 has_current_sender = false;  // Release channel
@@ -1053,7 +1123,7 @@ void app_main(void)
                 button_set_led_state(get_idle_led_state());  // White, red, or purple
                 display_set_state(DISPLAY_STATE_IDLE);
                 ha_mqtt_set_state(HA_STATE_IDLE);
-                ESP_LOGI(TAG, "RX audio stopped (idle), channel released");
+                ESP_LOGI(TAG, "RX audio stopped, channel released");
             }
         }
 

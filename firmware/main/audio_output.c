@@ -22,6 +22,13 @@ static volatile bool is_active = false;  // volatile for cross-task visibility
 static uint8_t current_volume = 100;
 static bool is_muted = false;
 
+// Mutex protecting I2S channel state transitions (start/stop/write).
+// Prevents TOCTOU race: write() checks is_active then calls i2s_channel_write(),
+// but stop() can disable the channel between those two steps, causing
+// "The channel is not enabled" errors from the I2S driver.
+// FreeRTOS mutex (not spinlock) because i2s_channel_write() blocks.
+static SemaphoreHandle_t output_lock = NULL;
+
 // Emergency override state
 static bool emergency_override_active = false;
 static uint8_t pre_emergency_volume = 100;
@@ -33,6 +40,13 @@ static int16_t *stereo_buffer = NULL;
 esp_err_t audio_output_init(void)
 {
     ESP_LOGI(TAG, "Initializing I2S speaker output");
+
+    // Create mutex for I2S channel state protection
+    output_lock = xSemaphoreCreateMutex();
+    if (!output_lock) {
+        ESP_LOGE(TAG, "Failed to create output mutex");
+        return ESP_ERR_NO_MEM;
+    }
 
     // I2S channel configuration
     //
@@ -107,7 +121,15 @@ esp_err_t audio_output_init(void)
 
 void audio_output_start(void)
 {
-    if (tx_handle && !is_active) {
+    if (!tx_handle || !output_lock) return;
+
+    xSemaphoreTake(output_lock, portMAX_DELAY);
+    if (is_active) {
+        ESP_LOGW(TAG, "start() called but already active — skipping");
+        xSemaphoreGive(output_lock);
+        return;
+    }
+    {
         esp_err_t ret = i2s_channel_enable(tx_handle);
         if (ret == ESP_OK) {
             is_active = true;
@@ -125,20 +147,28 @@ void audio_output_start(void)
                                   &written, pdMS_TO_TICKS(25));
             }
 
-            ESP_LOGI(TAG, "Audio output started");
+            ESP_LOGI(TAG, "Audio output started (vol=%d%%, muted=%d)",
+                     current_volume, is_muted);
         } else {
             ESP_LOGE(TAG, "Failed to start audio output: %s", esp_err_to_name(ret));
         }
     }
+    xSemaphoreGive(output_lock);
 }
 
 void audio_output_stop(void)
 {
-    if (tx_handle && is_active) {
-        is_active = false;  // Set this FIRST to prevent writes during shutdown
+    if (!tx_handle || !output_lock) return;
+
+    xSemaphoreTake(output_lock, portMAX_DELAY);
+    if (is_active) {
+        is_active = false;
         i2s_channel_disable(tx_handle);
         ESP_LOGI(TAG, "Audio output stopped");
+    } else {
+        ESP_LOGW(TAG, "stop() called but already inactive — skipping");
     }
+    xSemaphoreGive(output_lock);
 }
 
 bool audio_output_is_active(void)
@@ -148,12 +178,24 @@ bool audio_output_is_active(void)
 
 int audio_output_write(const int16_t *buffer, size_t samples, uint32_t timeout_ms)
 {
-    // Quick check - if not active, just return (don't log error)
-    if (!tx_handle || !is_active) {
+    // Quick check before taking mutex (avoid overhead when clearly inactive)
+    if (!tx_handle || !is_active || !stereo_buffer || !output_lock) {
         return 0;
     }
 
-    if (!stereo_buffer) return 0;
+    // Take mutex with timeout — if stop() is in progress, wait for it rather than
+    // writing to a channel that's about to be disabled. Timeout prevents deadlock.
+    if (xSemaphoreTake(output_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "write() mutex timeout (%lums) — dropping frame", (unsigned long)timeout_ms);
+        return 0;
+    }
+
+    // Re-check is_active under mutex — stop() may have run between the quick check and here
+    if (!is_active) {
+        ESP_LOGD(TAG, "write() channel stopped while waiting for mutex — dropping frame");
+        xSemaphoreGive(output_lock);
+        return 0;
+    }
 
     size_t count = samples < FRAME_SIZE ? samples : FRAME_SIZE;
 
@@ -181,8 +223,10 @@ int audio_output_write(const int16_t *buffer, size_t samples, uint32_t timeout_m
     esp_err_t ret = i2s_channel_write(tx_handle, stereo_buffer, count * 2 * sizeof(int16_t),
                                        &bytes_written, pdMS_TO_TICKS(timeout_ms));
 
+    xSemaphoreGive(output_lock);
+
     if (ret != ESP_OK) {
-        // Don't spam logs - just return 0
+        ESP_LOGW(TAG, "i2s_channel_write failed: %s", esp_err_to_name(ret));
         return 0;
     }
 
@@ -257,6 +301,10 @@ void audio_output_deinit(void)
     if (stereo_buffer) {
         free(stereo_buffer);
         stereo_buffer = NULL;
+    }
+    if (output_lock) {
+        vSemaphoreDelete(output_lock);
+        output_lock = NULL;
     }
     ESP_LOGI(TAG, "Audio output deinitialized");
 }
