@@ -21,6 +21,7 @@ ESP32-S3-based multi-room intercom system with Home Assistant integration.
 - **OTA firmware updates** via web interface
 - **Reliable mDNS** with automatic re-enable on WiFi reconnect and 60-second periodic re-announcement
 - **DHCP hostname** registration so routers display the correct device name
+- **Audio reliability** improvements: decoupled RX receive/decode pipeline, reduced playback start latency (~40ms vs ~160ms), and eliminated TX/RX buffer race conditions
 - **Mobile device** auto-discovery and notification routing
 - **TTS announcements** via Piper text-to-speech
 - **Home Assistant integration** with MQTT auto-discovery, services, and automations

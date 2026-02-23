@@ -7,7 +7,7 @@ A Home Assistant add-on that acts as the central hub for the HA Intercom system 
 - **Web PTT** — Browser-based push-to-talk via WebSocket (accessible through HA ingress)
 - **Per-client tracking** — Each web client gets a unique ID with independent state
 - **Audio routing** — ESP32↔ESP32, ESP32↔Web, Web↔Web, TTS→all
-- **Priority routing** — Normal, High, Emergency levels with preemption
+- **Priority routing** — Normal, High, Emergency levels with preemption; trail-out silence uses active PTT priority
 - **DND awareness** — Respects Do Not Disturb mode, allows emergency override
 - **Call notifications** — Ring/chime between all node types (ESP32, web, mobile)
 - **Mobile device support** — Auto-discovery from HA companion apps
@@ -153,6 +153,6 @@ mode: single
 
 | Component | Version |
 |-----------|---------|
-| Hub Python (`intercom_hub.py`) | 2.2.0 |
+| Hub Python (`intercom_hub.py`) | 2.2.1 |
 | Hub Add-on (`config.yaml`) | 2.1.0 |
 | Lovelace PTT Card (`intercom-ptt-card.js`) | 1.2.0 |

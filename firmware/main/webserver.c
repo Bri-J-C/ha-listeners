@@ -799,6 +799,7 @@ esp_err_t webserver_start(void)
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.recv_wait_timeout = 60;  // 60s for OTA uploads over slow WiFi
     config.send_wait_timeout = 60;
+    config.max_open_sockets = 3;  // Reduce from default 7 to free lwIP socket slots
 
     esp_err_t ret = httpd_start(&server, &config);
     if (ret != ESP_OK) {

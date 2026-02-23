@@ -655,6 +655,7 @@ class IntercomPTT {
 
         // Close audio context completely
         if (this.audioContext) {
+            this.nextPlayTime = 0;
             this.audioContext.close();
             this.audioContext = null;
         }
@@ -669,6 +670,7 @@ class IntercomPTT {
         if (!this.isInitialized) return;
 
         console.log('Resuming - app foregrounded');
+        this.nextPlayTime = 0;
 
         try {
             // Re-setup microphone and audio context

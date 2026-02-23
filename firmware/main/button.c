@@ -21,7 +21,8 @@ static const char *TAG = "button";
 static led_strip_handle_t led_strip = NULL;
 
 static button_callback_t button_callback = NULL;
-static led_state_t current_led_state = LED_STATE_OFF;
+static volatile led_state_t current_led_state = LED_STATE_OFF;
+static portMUX_TYPE led_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static bool button_pressed = false;
 static int64_t press_start_time = 0;
 static bool long_press_fired = false;
@@ -163,11 +164,14 @@ bool button_is_pressed(void)
 
 void button_set_led_state(led_state_t state)
 {
+    taskENTER_CRITICAL(&led_spinlock);
     if (state == current_led_state) {
+        taskEXIT_CRITICAL(&led_spinlock);
         return;
     }
 
     current_led_state = state;
+    taskEXIT_CRITICAL(&led_spinlock);
 
     // Stop any blinking
     if (led_blink_timer) {

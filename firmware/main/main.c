@@ -45,33 +45,50 @@ static volatile bool transmitting = false;
 static volatile bool broadcast_mode = false;
 static uint32_t tx_sequence = 0;
 
-// Audio buffers
-static int16_t pcm_buffer[FRAME_SIZE];
+// Audio buffers (separate per task to prevent race conditions)
+static int16_t rx_pcm_buffer[FRAME_SIZE];
 static uint8_t opus_buffer[MAX_PACKET_SIZE];
 static uint8_t tx_packet_buffer[MAX_PACKET_SIZE];
+
+// RX audio queue: decouples network receive from decode/play.
+// Without this, Opus decode + I2S write block the RX task, causing
+// incoming packets to pile up in the socket buffer and replay later.
+typedef struct {
+    uint8_t data[MAX_PACKET_SIZE];
+    size_t  len;
+} rx_queue_item_t;
+
+#define RX_QUEUE_DEPTH  15  // ~300ms at 20ms/frame
+static QueueHandle_t rx_audio_queue = NULL;
 
 // Task handles
 static TaskHandle_t tx_task_handle = NULL;
 static bool tx_task_running = false;
+static TaskHandle_t play_task_handle = NULL;
+static bool play_task_running = false;
 
 // TX task stack in PSRAM (saves ~32KB of scarce internal RAM).
 // CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y permits this.
 static EXT_RAM_BSS_ATTR StackType_t tx_task_stack[32768 / sizeof(StackType_t)];
 static StaticTask_t tx_task_tcb;
 
+// Audio play task stack in PSRAM (decode + I2S write)
+static EXT_RAM_BSS_ATTR StackType_t play_task_stack[16384 / sizeof(StackType_t)];
+static StaticTask_t play_task_tcb;
+
 // Audio playback state
-static uint32_t last_audio_rx_time = 0;
-static bool audio_playing = false;
+static volatile uint32_t last_audio_rx_time = 0;
+static volatile bool audio_playing = false;
 static uint32_t rx_packet_count = 0;
 
 // Sequence tracking for PLC/FEC
-static uint32_t last_sequence = 0;
-static bool sequence_initialized = false;
+static volatile uint32_t last_sequence = 0;
+static volatile bool sequence_initialized = false;
 
 // First-to-talk: track current sender to ignore others
 static uint8_t current_sender[DEVICE_ID_LENGTH] = {0};
-static bool has_current_sender = false;
-static uint8_t current_rx_priority = 0;  // Priority of current sender (PRIORITY_NORMAL = 0)
+static volatile bool has_current_sender = false;
+static volatile uint8_t current_rx_priority = 0;  // Priority of current sender (PRIORITY_NORMAL = 0)
 #define SENDER_TIMEOUT_MS 500  // Release channel after 500ms silence
 
 // Display room list tracking
@@ -121,15 +138,11 @@ static bool is_channel_busy(void)
 }
 
 /**
- * Handle received audio packets - direct playback.
+ * Network RX callback — lightweight enqueue only.
  *
- * Priority logic:
- * - EMERGENCY: bypass DND, force unmute + max volume, preempts any current sender
- * - HIGH: preempts NORMAL senders, blocked by other HIGH/EMERGENCY
- * - NORMAL: first-to-talk (existing behaviour)
- *
- * DND: when enabled, NORMAL and HIGH packets are silently discarded.
- *      EMERGENCY always plays regardless.
+ * Runs in the network_rx task. Must NOT block (no Opus decode, no I2S write).
+ * Performs only cheap checks (own packet, transmitting, DND) then copies the
+ * raw packet into the audio queue for the play task to handle.
  */
 static void on_audio_received(const audio_packet_t *packet, size_t total_len)
 {
@@ -145,16 +158,40 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         return;
     }
 
+    // Extract priority for DND check
+    uint8_t incoming_priority = packet->priority;
+    if (incoming_priority > 2) incoming_priority = 0;
+
+    // DND check: discard NORMAL and HIGH, let EMERGENCY through
+    const settings_t *cfg = settings_get();
+    if (cfg->dnd_enabled && incoming_priority < 2) {
+        return;
+    }
+
+    // Enqueue raw packet for the audio play task (non-blocking)
+    if (rx_audio_queue) {
+        rx_queue_item_t item;
+        size_t copy_len = (total_len <= MAX_PACKET_SIZE) ? total_len : MAX_PACKET_SIZE;
+        memcpy(item.data, packet, copy_len);
+        item.len = copy_len;
+        if (xQueueSend(rx_audio_queue, &item, 0) != pdTRUE) {
+            // Queue full — drop packet (expected under overload)
+        }
+    }
+}
+
+/**
+ * Process a received audio packet — decode and play.
+ *
+ * Runs in the audio_play_task. Handles first-to-talk, priority preemption,
+ * PLC/FEC, emergency override, and I2S output.
+ */
+static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
+{
     // Extract priority (added in v2.5.0 protocol; old senders omit it, default to NORMAL)
     uint8_t incoming_priority = packet->priority;
     if (incoming_priority > 2) {  // > PRIORITY_EMERGENCY
         incoming_priority = 0;    // Clamp unknown values to PRIORITY_NORMAL
-    }
-
-    // DND check: discard NORMAL and HIGH, let EMERGENCY through
-    const settings_t *cfg = settings_get();
-    if (cfg->dnd_enabled && incoming_priority < 2) {  // < PRIORITY_EMERGENCY
-        return;
     }
 
     // First-to-talk with priority-based preemption
@@ -213,13 +250,24 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         return;
     }
 
+    // Silence frames (trail-out from TX end) should not acquire the channel
+    // or trigger RECEIVING state. Opus encodes silence very small (~2-5 bytes
+    // at 32kbps VBR); real voice frames are 20+ bytes.
+    bool is_silence_frame = (opus_len < 10);
+
+    // Silence from unknown sender: don't acquire channel
+    if (is_silence_frame && !has_current_sender) return;
+    // Silence from a different sender: don't accept
+    if (is_silence_frame && has_current_sender &&
+        memcmp(packet->device_id, current_sender, DEVICE_ID_LENGTH) != 0) return;
+
     // Update timestamp FIRST — before setting audio_playing — to prevent the
     // main-loop idle timeout from seeing audio_playing=true with a stale timestamp
     // and immediately stopping playback (race condition causes start/stop flapping).
     last_audio_rx_time = xTaskGetTickCount();
 
-    // Start audio output if not already playing
-    if (!audio_playing) {
+    // Start audio output if not already playing (silence frames don't trigger state change)
+    if (!audio_playing && !is_silence_frame) {
         audio_output_start();
         audio_playing = true;
         button_set_led_state(LED_STATE_RECEIVING);
@@ -236,16 +284,16 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         if (gap > 0 && gap <= 4) {
             if (gap == 1) {
                 // Single packet lost — try FEC recovery using current packet's embedded FEC
-                int fec_samples = codec_decode_fec(packet->opus_data, opus_len, pcm_buffer);
+                int fec_samples = codec_decode_fec(packet->opus_data, opus_len, rx_pcm_buffer);
                 if (fec_samples > 0) {
-                    audio_output_write(pcm_buffer, fec_samples, 20);
+                    audio_output_write(rx_pcm_buffer, fec_samples, 20);
                 }
             } else {
                 // Multiple packets lost — PLC for each (up to 4)
                 for (int i = 0; i < gap; i++) {
-                    int plc_samples = codec_decode_plc(pcm_buffer);
+                    int plc_samples = codec_decode_plc(rx_pcm_buffer);
                     if (plc_samples > 0) {
-                        audio_output_write(pcm_buffer, plc_samples, 20);
+                        audio_output_write(rx_pcm_buffer, plc_samples, 20);
                     }
                 }
             }
@@ -254,11 +302,32 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
     last_sequence = seq;
     sequence_initialized = true;
 
-    // Decode and play current packet
-    int samples = codec_decode(packet->opus_data, opus_len, pcm_buffer);
+    // Decode and play current packet (20ms timeout = one frame budget)
+    int samples = codec_decode(packet->opus_data, opus_len, rx_pcm_buffer);
     if (samples > 0) {
-        audio_output_write(pcm_buffer, samples, 100);
+        audio_output_write(rx_pcm_buffer, samples, 20);
     }
+}
+
+/**
+ * Audio play task — dequeues packets and decodes/plays them.
+ *
+ * Decoupled from the network RX task so that blocking I2S writes don't
+ * cause incoming UDP packets to pile up in the socket buffer.
+ */
+static void audio_play_task(void *arg)
+{
+    ESP_LOGI(TAG, "Audio play task started");
+    rx_queue_item_t item;
+
+    while (play_task_running) {
+        if (xQueueReceive(rx_audio_queue, &item, pdMS_TO_TICKS(50)) == pdTRUE) {
+            process_rx_packet((audio_packet_t *)item.data, item.len);
+        }
+    }
+
+    ESP_LOGI(TAG, "Audio play task stopped");
+    vTaskDelete(NULL);
 }
 
 /**
@@ -271,6 +340,9 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
 static void audio_tx_task(void *arg)
 {
     ESP_LOGI(TAG, "Audio TX task started");
+
+    // TX-local PCM buffer (separate from rx_pcm_buffer to prevent race conditions)
+    int16_t tx_pcm_buffer[FRAME_SIZE];
 
     audio_packet_t *packet = (audio_packet_t *)tx_packet_buffer;
     memcpy(packet->device_id, device_id, DEVICE_ID_LENGTH);
@@ -354,9 +426,9 @@ static void audio_tx_task(void *arg)
         if (!transmitting && was_transmitting) {
             ESP_LOGI(TAG, "TX ended - sending trail-out silence");
 
-            // Send 30 frames of silence (600ms) to flush receiver DMA buffers
+            // Send 10 frames of silence (200ms) to flush receiver DMA buffers
             if (silence_opus_len > 0) {
-                for (int i = 0; i < 30; i++) {
+                for (int i = 0; i < 10; i++) {
                     packet->sequence = htonl(tx_sequence++);
                     memcpy(packet->opus_data, silence_opus, silence_opus_len);
 
@@ -380,7 +452,7 @@ static void audio_tx_task(void *arg)
         }
 
         // Read audio from microphone (320 samples = 20ms at 16kHz)
-        int samples = audio_input_read(pcm_buffer, FRAME_SIZE, 50);
+        int samples = audio_input_read(tx_pcm_buffer, FRAME_SIZE, 50);
         if (samples != FRAME_SIZE) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
@@ -392,12 +464,12 @@ static void audio_tx_task(void *arg)
         // within the same encoded frame, which causes audible quality artifacts.
         // Apply AGC to normalize microphone volume (before AEC and encode)
         if (settings_get()->agc_enabled) {
-            agc_process(pcm_buffer, samples);
+            agc_process(tx_pcm_buffer, samples);
         }
 
-        const int16_t *encode_buf = pcm_buffer;
+        const int16_t *encode_buf = tx_pcm_buffer;
         if (aec_is_ready()) {
-            aec_push_mic(pcm_buffer, samples);
+            aec_push_mic(tx_pcm_buffer, samples);
             int got = aec_pop_cleaned(aec_cleaned + aec_cleaned_fill,
                                       FRAME_SIZE - aec_cleaned_fill);
             aec_cleaned_fill += got;
@@ -405,7 +477,7 @@ static void audio_tx_task(void *arg)
                 encode_buf = aec_cleaned;
                 aec_cleaned_fill = 0;
             }
-            // If not enough cleaned yet, fall through with raw pcm_buffer for
+            // If not enough cleaned yet, fall through with raw tx_pcm_buffer for
             // this frame (happens during AEC priming, ~40ms at TX start)
         }
 
@@ -464,6 +536,7 @@ static void play_fallback_beep(void)
         audio_output_stop();
         audio_playing = false;
         has_current_sender = false;
+        sequence_initialized = false;  // Prevent stale sequence triggering false PLC
     }
 
     // Generate one 20ms sine-wave frame and repeat it
@@ -661,6 +734,8 @@ static void on_button_event(button_event_t event, bool is_broadcast)
                     }
                     has_current_sender = false;  // Release channel
                     current_rx_priority = 0;     // Reset priority
+                    // Flush RX queue so play task doesn't re-acquire channel from stale packets
+                    if (rx_audio_queue) { xQueueReset(rx_audio_queue); }
                     button_set_led_state(LED_STATE_TRANSMITTING);
                     display_set_state(DISPLAY_STATE_TRANSMITTING);
                     transmitting = true;
@@ -693,6 +768,8 @@ static void on_button_event(button_event_t event, bool is_broadcast)
                     audio_playing = false;
                     has_current_sender = false;
                 }
+                // Flush RX queue so play task doesn't re-acquire channel from stale packets
+                if (rx_audio_queue) { xQueueReset(rx_audio_queue); }
                 // Normal broadcast - works for all targets including mobile
                 // (Mobile users will hear audio when they open Web PTT)
                 button_set_led_state(LED_STATE_TRANSMITTING);  // Cyan
@@ -892,6 +969,27 @@ void app_main(void)
 
         // Start MQTT for Home Assistant integration
         ha_mqtt_start();
+    }
+
+    // Create RX audio queue in PSRAM (internal RAM allocation fragments heap,
+    // breaking MQTT TCP socket allocation — confirmed by isolation test)
+    rx_audio_queue = xQueueCreateWithCaps(RX_QUEUE_DEPTH, sizeof(rx_queue_item_t),
+                                           MALLOC_CAP_SPIRAM);
+    if (!rx_audio_queue) {
+        // Fallback to internal RAM if no PSRAM
+        rx_audio_queue = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_queue_item_t));
+    }
+    if (!rx_audio_queue) {
+        ESP_LOGE(TAG, "FATAL: Failed to create RX audio queue");
+    }
+
+    play_task_running = true;
+    play_task_handle = xTaskCreateStatic(audio_play_task, "audio_play",
+        sizeof(play_task_stack), NULL, 4,
+        play_task_stack, &play_task_tcb);
+    if (play_task_handle == NULL) {
+        ESP_LOGE(TAG, "FATAL: Failed to create audio play task");
+        play_task_running = false;
     }
 
     // Set up network callbacks and start receiving

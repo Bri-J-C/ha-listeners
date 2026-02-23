@@ -145,7 +145,7 @@ def html_escape(text: str) -> str:
 
 
 # Version - single source of truth
-VERSION = "2.2.0"  # Revert sync, keep hub-managed chime
+VERSION = "2.2.1"  # Trail-out priority fix, idle notification timing
 
 try:
     from aiohttp import web
@@ -2289,7 +2289,7 @@ async def websocket_handler(request):
                                 silence_pcm = bytes(FRAME_SIZE * 2)
                                 for _ in range(30):  # 600ms trail-out
                                     silence_opus = web_ptt_encoder.encode(silence_pcm, FRAME_SIZE)
-                                    send_audio_packet(silence_opus, ptt_target)
+                                    send_audio_packet(silence_opus, ptt_target, priority=ptt_priority)
                                     await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
 
                             ptt_active = False
@@ -2301,6 +2301,9 @@ async def websocket_handler(request):
                             publish_state(state="idle", notify_web=False)  # MQTT only - we handle web clients below
                             log.debug(f"Web PTT stopped ({frame_count} frames)")
 
+                            # Notify web clients immediately - don't make them wait for the jitter drain gap
+                            await broadcast_to_web_clients({'type': 'state', 'status': 'idle'})
+
                             # Gap for ESP32 jitter buffer to drain before next TX
                             await asyncio.sleep(0.75)
 
@@ -2308,9 +2311,6 @@ async def websocket_handler(request):
                             if holding_lock and web_tx_lock:
                                 web_tx_lock.release()
                                 holding_lock = False
-
-                            # All clients back to idle
-                            await broadcast_to_web_clients({'type': 'state', 'status': 'idle'})
 
                     elif msg_type == 'get_state':
                         await ws.send_json({

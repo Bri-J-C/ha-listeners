@@ -23,6 +23,10 @@ PlatformIO-based firmware for the intercom satellite nodes.
 - Lead-in/trail-out silence frames for clean audio start/stop
 - mDNS reliability fixes: initialized before WiFi connect, re-enabled on reconnect via `MDNS_EVENT_ENABLE_IP4`, disabled on disconnect, 60-second periodic re-announcement as safety net
 - DHCP hostname registration via `esp_netif_set_hostname()` so routers display the correct device name
+- Separate TX/RX PCM buffers to eliminate shared-buffer race condition between TX and RX tasks
+- RX audio queue (15-deep FreeRTOS queue) with dedicated `audio_play_task` on PSRAM stack — decouples network receive from Opus decode/I2S write
+- Reduced DMA pre-fill on audio start: 2 descriptors (~40ms latency) instead of 8 (~160ms)
+- I2S write timeout capped at 20ms (one frame budget) to prevent RX task stalls
 
 ## Hardware Requirements
 
