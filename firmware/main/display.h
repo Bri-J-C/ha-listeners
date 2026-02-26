@@ -36,7 +36,7 @@
  */
 typedef struct {
     char name[MAX_ROOM_NAME_LEN];
-    char ip[16];  // IP address or "224.0.0.100" for multicast
+    char ip[16];  // IP address or "239.255.0.100" for multicast
     bool is_multicast;
     bool is_mobile;  // Mobile device (needs notification)
 } room_target_t;

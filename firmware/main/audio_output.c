@@ -147,10 +147,10 @@ void audio_output_start(void)
                                   &written, pdMS_TO_TICKS(25));
             }
 
-            ESP_LOGI(TAG, "Audio output started (vol=%d%%, muted=%d)",
+            ESP_LOGI(TAG, "[I2S] output_start (vol=%d%%, muted=%d)",
                      current_volume, is_muted);
         } else {
-            ESP_LOGE(TAG, "Failed to start audio output: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "[I2S] output_start failed: err=%s", esp_err_to_name(ret));
         }
     }
     xSemaphoreGive(output_lock);
@@ -164,7 +164,7 @@ void audio_output_stop(void)
     if (is_active) {
         is_active = false;
         i2s_channel_disable(tx_handle);
-        ESP_LOGI(TAG, "Audio output stopped");
+        ESP_LOGI(TAG, "[I2S] output_stop");
     } else {
         ESP_LOGW(TAG, "stop() called but already inactive — skipping");
     }
@@ -226,7 +226,7 @@ int audio_output_write(const int16_t *buffer, size_t samples, uint32_t timeout_m
     xSemaphoreGive(output_lock);
 
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "i2s_channel_write failed: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "[I2S] write_error: err=%d (%s)", ret, esp_err_to_name(ret));
         return 0;
     }
 

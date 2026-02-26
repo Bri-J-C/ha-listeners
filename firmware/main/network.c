@@ -97,6 +97,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
         connection_retries = 0;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&local_ip));
 
+        // Log WiFi RSSI at connection time
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            ESP_LOGI(TAG, "[NET] wifi_rssi=%d", ap_info.rssi);
+        }
+
         // Re-enable mDNS on this interface after WiFi reconnect
         // ENABLE_IP4 (not ANNOUNCE_IP4) is needed because DISABLE_IP4
         // on disconnect tears down the PCB — ANNOUNCE only works on a running PCB
@@ -201,6 +207,8 @@ esp_err_t network_init(const char *ssid, const char *password)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "WiFi power save disabled for multicast reliability");
 
     // Create TX socket
     tx_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -260,6 +268,13 @@ static void rx_task(void *arg)
     struct sockaddr_in src_addr;
     socklen_t addr_len = sizeof(src_addr);
 
+    // Periodic RX stats (logged every 10 seconds)
+    uint32_t rx_stat_packets = 0;
+    uint32_t rx_stat_bytes = 0;
+    char rx_stat_last_src[16] = "none";
+    TickType_t last_stats_tick = xTaskGetTickCount();
+    const TickType_t stats_interval = pdMS_TO_TICKS(10000);
+
     ESP_LOGI(TAG, "RX task started");
 
     while (rx_running) {
@@ -268,7 +283,23 @@ static void rx_task(void *arg)
 
         if (len > 0 && rx_callback && len >= HEADER_LENGTH) {
             audio_packet_t *packet = (audio_packet_t *)rx_buffer;
+
+            rx_stat_packets++;
+            rx_stat_bytes += (uint32_t)len;
+            inet_ntoa_r(src_addr.sin_addr, rx_stat_last_src, sizeof(rx_stat_last_src));
+
             rx_callback(packet, len);
+        }
+
+        // Log periodic RX stats every 10 seconds
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_stats_tick) >= stats_interval) {
+            ESP_LOGI(TAG, "[NET] rx_stats: packets=%lu bytes=%lu last_src=%s",
+                     (unsigned long)rx_stat_packets, (unsigned long)rx_stat_bytes,
+                     rx_stat_last_src);
+            rx_stat_packets = 0;
+            rx_stat_bytes = 0;
+            last_stats_tick = now;
         }
     }
 
@@ -323,6 +354,7 @@ esp_err_t network_start_rx(void)
             return ESP_FAIL;
         }
     }
+    ESP_LOGI(TAG, "[NET] multicast_join: group=%s port=%d", MULTICAST_GROUP, AUDIO_PORT);
 
     // Boot-time TX test: send a 1-byte probe to confirm the TX socket can
     // actually send after WiFi is up.  The packet is too small to be a valid

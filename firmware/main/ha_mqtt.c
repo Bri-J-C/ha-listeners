@@ -20,6 +20,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <strings.h>
 
 static const char *TAG = "ha_mqtt";
 
@@ -70,6 +71,7 @@ static const char *call_topic = "intercom/call";  // Call notifications
 // Incoming call state
 static bool incoming_call_pending = false;
 static char incoming_call_caller[32] = "";
+static char incoming_call_chime[64] = "";  // Chime name from call payload (e.g. "doorbell")
 
 // Callback for settings changes from HA
 static ha_mqtt_callback_t user_callback = NULL;
@@ -819,8 +821,12 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
                              strstr(topic, "/status") != NULL &&
                              strncmp(topic, "intercom/devices/", 17) != 0);
 
+    // Structured MQTT RX logging (truncate payload to 128 chars for safety)
+    // Skip device_info and device_status topics — those are high-frequency and logged elsewhere
     if (!is_device_info && !is_device_status) {
-        ESP_LOGI(TAG, "MQTT cmd: %s = %s", topic, data);
+        int log_len = (int)data_len;
+        if (log_len > 128) log_len = 128;
+        ESP_LOGI(TAG, "[MQTT] rx topic=%s payload=%.*s", topic, log_len, data);
     }
 
     // Volume command
@@ -936,11 +942,21 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
             const settings_t *cfg = settings_get();
             ESP_LOGI(TAG, "Call target='%s', our room='%s'", target, cfg->room_name);
 
-            // Check if we're the target
-            if (strcmp(target, cfg->room_name) == 0) {
-                ESP_LOGI(TAG, "Incoming call from: %s - triggering chime", caller);
+            // Check if we're the target (case-insensitive, also match "All Rooms" broadcast)
+            if (strcasecmp(target, cfg->room_name) == 0 ||
+                strcasecmp(target, "All Rooms") == 0) {
+                ESP_LOGI(TAG, "[CALL] incoming: caller=%s target=%s", caller, target);
                 strncpy(incoming_call_caller, caller, sizeof(incoming_call_caller) - 1);
                 incoming_call_pending = true;
+
+                // Extract optional chime name from call payload
+                incoming_call_chime[0] = '\0';
+                char chime_name[64] = {0};
+                if (extract_json_string(data, "chime", chime_name, sizeof(chime_name)) && chime_name[0]) {
+                    strncpy(incoming_call_chime, chime_name, sizeof(incoming_call_chime) - 1);
+                    incoming_call_chime[sizeof(incoming_call_chime) - 1] = '\0';
+                    ESP_LOGI(TAG, "Expected chime: '%s'", incoming_call_chime);
+                }
 
                 if (user_callback) {
                     user_callback(HA_CMD_CALL, 0);
@@ -967,25 +983,36 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             // Publish discovery configs
             publish_discovery();
 
-            // Publish online status
-            esp_mqtt_client_publish(mqtt_client, availability_topic, "online", 0, 1, true);
-
             // Subscribe to command topics
             esp_mqtt_client_subscribe(mqtt_client, volume_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", volume_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, mute_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", mute_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, led_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", led_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, target_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", target_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, agc_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", agc_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, priority_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", priority_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, dnd_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", dnd_cmd_topic);
 
             // Subscribe to device discovery to learn about other intercoms
             esp_mqtt_client_subscribe(mqtt_client, device_discovery_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", device_discovery_topic);
             esp_mqtt_client_subscribe(mqtt_client, device_status_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", device_status_topic);
 
             // Subscribe to call notifications
             esp_mqtt_client_subscribe(mqtt_client, call_topic, 0);
-            ESP_LOGI(TAG, "Subscribed to command topics, device discovery, status, and calls");
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", call_topic);
+            ESP_LOGI(TAG, "Subscribed to all %d topics", 10);
+
+            // Publish online AFTER subscribes so HA sees us as available
+            // only once we're ready to receive commands
+            esp_mqtt_client_publish(mqtt_client, availability_topic, "online", 0, 1, true);
 
             // Publish current states
             publish_all_states();
@@ -1328,6 +1355,8 @@ void ha_mqtt_send_call(const char *target_room)
 
     const settings_t *cfg = settings_get();
 
+    ESP_LOGI(TAG, "[CALL] outgoing: target=%s", target_room);
+
     // Publish call notification
     cJSON *call = cJSON_CreateObject();
     cJSON_AddStringToObject(call, "target", target_room);
@@ -1336,7 +1365,7 @@ void ha_mqtt_send_call(const char *target_room)
     char *json_str = cJSON_PrintUnformatted(call);
     if (json_str) {
         esp_mqtt_client_publish(mqtt_client, "intercom/call", json_str, 0, 0, 0);
-        ESP_LOGI(TAG, "Sent call to %s", target_room);
+        ESP_LOGI(TAG, "[MQTT] publish: topic=intercom/call");
         free(json_str);
     }
     cJSON_Delete(call);
@@ -1346,20 +1375,39 @@ int ha_mqtt_send_call_all_rooms(void)
 {
     if (!mqtt_connected || !mqtt_client) return 0;
 
-    int call_count = 0;
+    // Check if any devices are discovered — caller shows "No devices online" when 0
+    bool has_available = false;
     for (int i = 0; i < discovered_count; i++) {
-        if (!discovered_devices[i].active) continue;
-        if (!discovered_devices[i].available) continue;
+        if (discovered_devices[i].active && discovered_devices[i].available) {
+            has_available = true;
+            break;
+        }
+    }
+    if (!has_available) return 0;
 
-        // Skip self — don't ring our own chime
-        if (strcmp(discovered_devices[i].id, unique_id) == 0) continue;
+    const settings_t *cfg = settings_get();
 
-        ha_mqtt_send_call(discovered_devices[i].room);
-        call_count++;
+    cJSON *call = cJSON_CreateObject();
+    if (!call) {
+        ESP_LOGE(TAG, "Failed to create call JSON");
+        return 0;
+    }
+    cJSON_AddStringToObject(call, "target", "All Rooms");
+    cJSON_AddStringToObject(call, "caller", cfg->room_name);
+
+    char *json_str = cJSON_PrintUnformatted(call);
+    cJSON_Delete(call);
+
+    if (!json_str) {
+        ESP_LOGE(TAG, "Failed to print call JSON");
+        return 0;
     }
 
-    ESP_LOGI(TAG, "Sent call to all rooms (%d devices)", call_count);
-    return call_count;
+    esp_mqtt_client_publish(mqtt_client, "intercom/call", json_str, 0, 0, 0);
+    ESP_LOGI(TAG, "[CALL] outgoing: target=All Rooms");
+    free(json_str);
+
+    return 1;
 }
 
 bool ha_mqtt_check_incoming_call(char *caller_name)
@@ -1375,6 +1423,13 @@ bool ha_mqtt_check_incoming_call(char *caller_name)
     // Clear pending state
     incoming_call_pending = false;
     incoming_call_caller[0] = '\0';
+    incoming_call_chime[0] = '\0';
 
     return true;
 }
+
+/**
+ * Get the chime name from the most recently received call notification.
+ * Returns an empty string if no chime was specified.
+ */
+const char* ha_mqtt_get_incoming_chime(void) { return incoming_call_chime; }

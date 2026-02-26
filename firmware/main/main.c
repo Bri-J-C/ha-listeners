@@ -39,9 +39,9 @@ static const char *TAG = "main";
 #define DEFAULT_WIFI_SSID       "your_wifi_ssid"
 #define DEFAULT_WIFI_PASSWORD   "your_wifi_password"
 
-// Application state
-static uint8_t device_id[DEVICE_ID_LENGTH];
-static volatile bool transmitting = false;
+// Application state (non-static: accessed by webserver.c via extern)
+uint8_t device_id[DEVICE_ID_LENGTH];
+volatile bool transmitting = false;
 static volatile bool broadcast_mode = false;
 static uint32_t tx_sequence = 0;
 
@@ -78,8 +78,16 @@ static StaticTask_t play_task_tcb;
 
 // Audio playback state
 static volatile uint32_t last_audio_rx_time = 0;
-static volatile bool audio_playing = false;
+volatile bool audio_playing = false;  // non-static: accessed by webserver.c via extern
 static uint32_t rx_packet_count = 0;
+
+// QA observability counters (logging only — no functional effect)
+// Single-word counters: atomic on ESP32-S3 Xtensa, used for logging only
+static uint32_t rx_log_counter = 0;       // Downsample RX packet logs (every 50th)
+static uint32_t tx_log_counter = 0;       // Downsample TX packet logs (every 50th)
+static uint32_t rx_drop_total = 0;        // Accumulated RX queue drop count
+static uint32_t tx_frame_count = 0;       // Total frames sent in current PTT session
+static uint32_t tx_start_tick = 0;        // Tick when PTT started (for duration calc)
 
 // Sequence tracking for PLC/FEC
 static volatile uint32_t last_sequence = 0;
@@ -174,12 +182,27 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
         size_t copy_len = (total_len <= MAX_PACKET_SIZE) ? total_len : MAX_PACKET_SIZE;
         memcpy(item.data, packet, copy_len);
         item.len = copy_len;
+
+        UBaseType_t q_depth = uxQueueMessagesWaiting(rx_audio_queue);
+
         if (xQueueSend(rx_audio_queue, &item, 0) != pdTRUE) {
-            static uint32_t queue_full_count = 0;
-            queue_full_count++;
-            if ((queue_full_count % 50) == 1) {
-                ESP_LOGW(TAG, "RX queue full — dropped packet (total drops: %lu)",
-                         (unsigned long)queue_full_count);
+            rx_drop_total++;
+            uint32_t seq = ntohl(packet->sequence);
+            if ((rx_drop_total % 50) == 1) {
+                ESP_LOGW(TAG, "[RX] queue_full: dropped seq=%lu, total_drops=%lu",
+                         (unsigned long)seq, (unsigned long)rx_drop_total);
+            }
+        } else {
+            // Log every 50th accepted packet (~1/sec during audio)
+            rx_log_counter++;
+            if ((rx_log_counter % 50) == 1) {
+                uint32_t seq = ntohl(packet->sequence);
+                size_t opus_len = (total_len > HEADER_LENGTH) ? total_len - HEADER_LENGTH : 0;
+                ESP_LOGD(TAG, "[RX] src=%02x%02x%02x%02x seq=%lu pri=%d opus_len=%u q_depth=%u",
+                         packet->device_id[0], packet->device_id[1],
+                         packet->device_id[2], packet->device_id[3],
+                         (unsigned long)seq, incoming_priority,
+                         (unsigned)opus_len, (unsigned)(q_depth + 1));
             }
         }
     }
@@ -318,8 +341,16 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
     if (samples > 0) {
         int written = audio_output_write(rx_pcm_buffer, samples, 20);
         if (written == 0 && audio_playing) {
-            ESP_LOGW(TAG, "RX write returned 0 while audio_playing=true (seq=%lu, opus_len=%u)",
-                     (unsigned long)seq, (unsigned)opus_len);
+            ESP_LOGW(TAG, "RX write returned 0 while audio_playing=true — restarting I2S (seq=%lu)",
+                     (unsigned long)seq);
+            audio_output_stop();
+            audio_output_start();
+            if (audio_output_write(rx_pcm_buffer, samples, 20) == 0) {
+                ESP_LOGE(TAG, "RX write still 0 after I2S restart — stopping playback (seq=%lu)",
+                         (unsigned long)seq);
+                audio_playing = false;
+                has_current_sender = false;
+            }
         }
     } else {
         ESP_LOGW(TAG, "RX decode failed: samples=%d (opus_len=%u, seq=%lu)",
@@ -516,6 +547,16 @@ static void audio_tx_task(void *arg)
         } else {
             network_send_multicast(packet, HEADER_LENGTH + opus_len);
         }
+        tx_frame_count++;
+
+        // Log every 50th TX packet (~1/sec during audio)
+        tx_log_counter++;
+        if ((tx_log_counter % 50) == 1) {
+            ESP_LOGD(TAG, "[TX] seq=%lu opus_len=%u target=%s",
+                     (unsigned long)(tx_sequence - 1),
+                     (unsigned)opus_len,
+                     target_ip ? target_ip : "multicast");
+        }
     }
 
     ESP_LOGI(TAG, "Audio TX task stopped");
@@ -545,7 +586,7 @@ static led_state_t get_idle_led_state(void)
  * The beep is 200ms (10 × 20ms frames) at 800 Hz, 50% amplitude.
  * Keeping it brief minimises AEC reference contamination.
  */
-static void play_fallback_beep(void)
+void play_fallback_beep(void)
 {
     if (transmitting) {
         ESP_LOGW(TAG, "Beep: skipped — currently transmitting");
@@ -643,7 +684,7 @@ static void play_incoming_call_chime(void)
     vTaskDelay(pdMS_TO_TICKS(150));
 
     UBaseType_t q_depth = rx_audio_queue ? uxQueueMessagesWaiting(rx_audio_queue) : 0;
-    bool hub_chime_active = audio_playing || q_depth > 0;
+    bool hub_chime_active = audio_playing || q_depth > 0 || has_current_sender;
 
     ESP_LOGI(TAG, "Call chime: audio_playing=%d, q_depth=%u, has_sender=%d -> %s",
              audio_playing, (unsigned)q_depth, has_current_sender,
@@ -685,7 +726,7 @@ static void on_display_setting_changed(int index, int value)
                 button_set_led_state(get_idle_led_state());
             }
             ha_mqtt_publish_dnd();
-            ESP_LOGI(TAG, "Display: DND -> %s", dnd ? "ON" : "OFF");
+            ESP_LOGI(TAG, "[STATE] dnd=%d (via display)", dnd);
             break;
         }
         case SETTINGS_ITEM_PRIORITY: {
@@ -703,7 +744,7 @@ static void on_display_setting_changed(int index, int value)
                 button_set_led_state(get_idle_led_state());
             }
             ha_mqtt_publish_mute();
-            ESP_LOGI(TAG, "Display: Mute -> %s", muted ? "ON" : "OFF");
+            ESP_LOGI(TAG, "[STATE] mute=%d (via display)", muted);
             break;
         }
         case SETTINGS_ITEM_VOLUME: {
@@ -711,7 +752,7 @@ static void on_display_setting_changed(int index, int value)
             settings_set_volume(vol);
             audio_output_set_volume(vol);
             ha_mqtt_publish_volume();
-            ESP_LOGI(TAG, "Display: Volume -> %d%%", vol);
+            ESP_LOGI(TAG, "[STATE] volume=%d (via display)", vol);
             break;
         }
         case SETTINGS_ITEM_AGC: {
@@ -749,7 +790,7 @@ static void on_ha_command(ha_cmd_t cmd, int value)
             }
             // Sync display settings page if open
             display_sync_settings();
-            ESP_LOGI(TAG, "DND %s via HA", dnd ? "enabled" : "disabled");
+            ESP_LOGI(TAG, "[STATE] dnd=%d (via HA)", dnd);
             break;
         }
         case HA_CMD_MUTE:
@@ -758,7 +799,7 @@ static void on_ha_command(ha_cmd_t cmd, int value)
                 button_set_led_state(get_idle_led_state());
             }
             display_sync_settings();
-            ESP_LOGI(TAG, "Mute %s via HA", value ? "on" : "off");
+            ESP_LOGI(TAG, "[STATE] mute=%d (via HA)", value);
             break;
         case HA_CMD_PRIORITY:
             display_sync_settings();
@@ -766,6 +807,7 @@ static void on_ha_command(ha_cmd_t cmd, int value)
             break;
         case HA_CMD_VOLUME:
             display_sync_settings();
+            ESP_LOGI(TAG, "[STATE] volume=%d (via HA)", value);
             break;
         case HA_CMD_AGC:
             display_sync_settings();
@@ -811,7 +853,16 @@ static void on_button_event(button_event_t event, bool is_broadcast)
                     button_set_led_state(LED_STATE_TRANSMITTING);
                     display_set_state(DISPLAY_STATE_TRANSMITTING);
                     transmitting = true;
+                    tx_frame_count = 0;
+                    tx_start_tick = xTaskGetTickCount();
                     ha_mqtt_set_state(HA_STATE_TRANSMITTING);
+                    {
+                        const char *ptt_target = ha_mqtt_get_target_name();
+                        const char *ptt_ip = ha_mqtt_get_target_ip();
+                        ESP_LOGI(TAG, "[PTT] start: target_room=%s target_ip=%s mode=%s (preempt)",
+                                 ptt_target, ptt_ip ? ptt_ip : MULTICAST_GROUP,
+                                 ptt_ip ? "unicast" : "multicast");
+                    }
                 } else {
                     button_set_led_state(LED_STATE_BUSY);  // Orange - channel busy
                     display_set_state(DISPLAY_STATE_ERROR);
@@ -847,7 +898,16 @@ static void on_button_event(button_event_t event, bool is_broadcast)
                 button_set_led_state(LED_STATE_TRANSMITTING);  // Cyan
                 display_set_state(DISPLAY_STATE_TRANSMITTING);
                 transmitting = true;
+                tx_frame_count = 0;
+                tx_start_tick = xTaskGetTickCount();
                 ha_mqtt_set_state(HA_STATE_TRANSMITTING);
+                {
+                    const char *ptt_target = ha_mqtt_get_target_name();
+                    const char *ptt_ip = ha_mqtt_get_target_ip();
+                    ESP_LOGI(TAG, "[PTT] start: target_room=%s target_ip=%s mode=%s",
+                             ptt_target, ptt_ip ? ptt_ip : MULTICAST_GROUP,
+                             ptt_ip ? "unicast" : "multicast");
+                }
             }
             break;
         }
@@ -855,12 +915,21 @@ static void on_button_event(button_event_t event, bool is_broadcast)
         case BUTTON_EVENT_LONG_PRESS:
             break;
 
-        case BUTTON_EVENT_RELEASED:
+        case BUTTON_EVENT_RELEASED: {
+            // Only log PTT-end stats when a real session occurred; tx_frame_count is 0
+            // when PTT was suppressed (channel busy, call lockout) and duration/frames
+            // would be meaningless garbage.
+            if (tx_frame_count > 0) {
+                uint32_t duration_ms = (xTaskGetTickCount() - tx_start_tick) * portTICK_PERIOD_MS;
+                ESP_LOGI(TAG, "[PTT] end: total_frames=%lu duration_ms=%lu",
+                         (unsigned long)tx_frame_count, (unsigned long)duration_ms);
+            }
             button_set_led_state(get_idle_led_state());  // White, red, or purple if DND
             display_set_state(DISPLAY_STATE_IDLE);
             transmitting = false;
             ha_mqtt_set_state(HA_STATE_IDLE);
             break;
+        }
 
         default:
             break;
@@ -889,7 +958,7 @@ static void on_cycle_long_press(void)
         // Call all discovered rooms at once
         int count = ha_mqtt_send_call_all_rooms();
         if (count > 0) {
-            last_call_sent_time = xTaskGetTickCount();  // Start PTT lockout
+            last_call_sent_time = xTaskGetTickCount() | 1;  // Ensure non-zero for self-echo prevention
             display_show_message("Calling all...", 1500);
             ESP_LOGI(TAG, "Sent call to all rooms (%d devices)", count);
         } else {
@@ -901,7 +970,7 @@ static void on_cycle_long_press(void)
 
     // Send call to specific target (works for ESP32s and mobiles)
     ha_mqtt_send_call(target);
-    last_call_sent_time = xTaskGetTickCount();  // Start PTT lockout
+    last_call_sent_time = xTaskGetTickCount() | 1;  // Ensure non-zero for self-echo prevention
     display_show_message("Calling...", 1500);
     ESP_LOGI(TAG, "Sent call to %s", target);
 }
@@ -1178,6 +1247,7 @@ void app_main(void)
                 const char *mqtt_target = ha_mqtt_get_target_name();
                 if (strcmp(selected->name, mqtt_target) != 0) {
                     // Display selection changed - update MQTT
+                    ESP_LOGI(TAG, "[ROOM] selected=%s ip=%s", selected->name, selected->ip);
                     ha_mqtt_set_target(selected->name);
                 }
             }
@@ -1192,8 +1262,20 @@ void app_main(void)
         // Check for incoming calls
         char caller_name[32];
         if (ha_mqtt_check_incoming_call(caller_name)) {
-            ESP_LOGI(TAG, "Incoming call from: %s", caller_name);
-            play_incoming_call_chime();
+            // Self-exclusion guard: when "All Rooms" is selected and we just sent
+            // the call ourselves, our own MQTT message bounces back to us via the
+            // broker.  Suppress the chime for CALL_TX_LOCKOUT_MS (2s) so we don't
+            // ring our own chime.
+            uint32_t now_ticks = xTaskGetTickCount();
+            bool self_sent = (last_call_sent_time != 0) &&
+                             ((now_ticks - last_call_sent_time) * portTICK_PERIOD_MS < CALL_TX_LOCKOUT_MS);
+            if (self_sent) {
+                ESP_LOGI(TAG, "Ignoring call from '%s' — self-sent within %dms lockout",
+                         caller_name, CALL_TX_LOCKOUT_MS);
+            } else {
+                ESP_LOGI(TAG, "Incoming call from: %s", caller_name);
+                play_incoming_call_chime();
+            }
         }
 
         vTaskDelay(pdMS_TO_TICKS(100));

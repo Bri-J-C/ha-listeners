@@ -769,7 +769,7 @@ esp_err_t display_init(void)
     // Set default room
     rooms[0] = (room_target_t){
         .name = "All Rooms",
-        .ip = "224.0.0.100",
+        .ip = MULTICAST_GROUP,
         .is_multicast = true,
     };
     room_count = 1;

@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 #include "diagnostics.h"
 #include "network.h"
@@ -187,8 +188,9 @@ char* diagnostics_get_json(void)
     if (!json) return NULL;
 
     uint32_t uptime = diagnostics_get_uptime();
-    uint32_t heap = esp_get_free_heap_size();
-    uint32_t min_heap = esp_get_minimum_free_heap_size();
+    uint32_t heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t min_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    uint32_t total_heap = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
 
     uint32_t tx_sent = 0, tx_failed = 0;
     int tx_errno = 0;
@@ -211,7 +213,7 @@ char* diagnostics_get_json(void)
         uptime / 86400, (uptime % 86400) / 3600, (uptime % 3600) / 60, uptime % 60,
         heap,
         min_heap,
-        100.0 - (min_heap * 100.0 / 320000.0),  // Approximate total heap
+        total_heap > 0 ? 100.0 - (min_heap * 100.0 / total_heap) : 0.0,
         tx_sent,
         tx_failed,
         tx_errno
