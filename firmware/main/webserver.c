@@ -9,21 +9,64 @@
 #include "settings.h"
 #include "diagnostics.h"
 #include "protocol.h"
+#include "codec.h"
+#include "network.h"
+#include "ha_mqtt.h"
+#include "audio_output.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "esp_random.h"
+#include "esp_wifi.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "mbedtls/base64.h"
+#include "cJSON.h"
 #include <string.h>
 #include <ctype.h>
 #include <stdlib.h>
+#include <math.h>
+#include <arpa/inet.h>
+#include "lwip/sockets.h"
 
 static const char *TAG = "webserver";
 static httpd_handle_t server = NULL;
 
 // CSRF token (generated once at server start, stable for session)
 static char csrf_token[33] = {0};
+
+// Symbols from main.c (no main.h — extern at point of use)
+extern uint8_t device_id[DEVICE_ID_LENGTH];
+extern volatile bool transmitting;
+extern volatile bool audio_playing;
+extern void play_fallback_beep(void);
+
+// Test tone concurrency guard — prevents overlapping test_tone runs
+static volatile bool test_tone_active = false;
+
+// Test tone task stack in PSRAM (Opus encoding requires ~30KB stack,
+// HTTP server task has only 12KB — must run in a separate task)
+static EXT_RAM_BSS_ATTR StackType_t test_tone_stack[32768 / sizeof(StackType_t)];
+static StaticTask_t test_tone_tcb;
+
+// Get client IP address from HTTP request (for logging)
+static void get_client_ip(httpd_req_t *req, char *ip_buf, size_t ip_buf_len)
+{
+    int sockfd = httpd_req_to_sockfd(req);
+    struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getpeername(sockfd, (struct sockaddr *)&addr, &addr_len) == 0) {
+        inet_ntoa_r(addr.sin_addr, ip_buf, ip_buf_len);
+    } else {
+        strncpy(ip_buf, "unknown", ip_buf_len - 1);
+        ip_buf[ip_buf_len - 1] = '\0';
+    }
+}
 
 // Generate a random CSRF token
 static void generate_csrf_token(void)
@@ -372,6 +415,10 @@ static bool get_form_value(const char *body, const char *key, char *value, size_
 // GET / - serve config page
 static esp_err_t root_handler(httpd_req_t *req)
 {
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] GET / from %s", client_ip);
+
     // Check authentication
     if (!check_basic_auth(req)) {
         return send_auth_required(req);
@@ -427,6 +474,10 @@ static esp_err_t root_handler(httpd_req_t *req)
 // POST /save - save settings
 static esp_err_t save_handler(httpd_req_t *req)
 {
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] POST /save from %s", client_ip);
+
     // Check authentication
     if (!check_basic_auth(req)) {
         return send_auth_required(req);
@@ -522,6 +573,10 @@ static esp_err_t save_handler(httpd_req_t *req)
 // POST /reset - factory reset
 static esp_err_t reset_handler(httpd_req_t *req)
 {
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] POST /reset from %s", client_ip);
+
     // Check authentication
     if (!check_basic_auth(req)) {
         return send_auth_required(req);
@@ -529,15 +584,19 @@ static esp_err_t reset_handler(httpd_req_t *req)
 
     char body[256] = {0};
     int ret = httpd_req_recv(req, body, sizeof(body) - 1);
-    if (ret > 0) {
-        // Verify CSRF token
-        char csrf[64] = {0};
-        if (!get_form_value(body, "csrf", csrf, sizeof(csrf)) || !verify_csrf_token(csrf)) {
-            ESP_LOGW(TAG, "CSRF token validation failed for reset");
-            httpd_resp_set_status(req, "403 Forbidden");
-            httpd_resp_send(req, "CSRF validation failed", -1);
-            return ESP_FAIL;
-        }
+    if (ret <= 0) {
+        ESP_LOGW(TAG, "Reset: empty request body (CSRF bypass blocked)");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Empty request body");
+        return ESP_FAIL;
+    }
+
+    // Verify CSRF token
+    char csrf[64] = {0};
+    if (!get_form_value(body, "csrf", csrf, sizeof(csrf)) || !verify_csrf_token(csrf)) {
+        ESP_LOGW(TAG, "CSRF token validation failed for reset");
+        httpd_resp_set_status(req, "403 Forbidden");
+        httpd_resp_send(req, "CSRF validation failed", -1);
+        return ESP_FAIL;
     }
 
     settings_reset();
@@ -554,6 +613,10 @@ static esp_err_t reset_handler(httpd_req_t *req)
 // POST /update - OTA firmware update
 static esp_err_t ota_handler(httpd_req_t *req)
 {
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] POST /update from %s content_len=%d", client_ip, req->content_len);
+
     // Check authentication
     if (!check_basic_auth(req)) {
         return send_auth_required(req);
@@ -691,6 +754,10 @@ static esp_err_t ota_handler(httpd_req_t *req)
 // GET /diagnostics - system diagnostics page
 static esp_err_t diagnostics_handler(httpd_req_t *req)
 {
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] GET /diagnostics from %s", client_ip);
+
     // Check authentication
     if (!check_basic_auth(req)) {
         return send_auth_required(req);
@@ -766,6 +833,10 @@ static esp_err_t diagnostics_handler(httpd_req_t *req)
 // GET /diagnostics/json - diagnostics as JSON
 static esp_err_t diagnostics_json_handler(httpd_req_t *req)
 {
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] GET /diagnostics/json from %s", client_ip);
+
     // Check authentication
     if (!check_basic_auth(req)) {
         return send_auth_required(req);
@@ -784,6 +855,363 @@ static esp_err_t diagnostics_json_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/status — JSON device status for QA and diagnostics
+// ---------------------------------------------------------------------------
+static esp_err_t api_status_handler(httpd_req_t *req)
+{
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] GET /api/status from %s", client_ip);
+
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
+    const settings_t *cfg = settings_get();
+    char ip[16] = "0.0.0.0";
+    get_ip_string(ip, sizeof(ip));
+
+    // Get WiFi RSSI
+    wifi_ap_record_t ap_info;
+    int8_t rssi = 0;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        rssi = ap_info.rssi;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        ESP_LOGE(TAG, "API: /api/status cJSON_CreateObject failed (heap=%lu)",
+                 (unsigned long)esp_get_free_heap_size());
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON allocation failed");
+        return ESP_FAIL;
+    }
+
+    cJSON_AddStringToObject(root, "firmware_version", FIRMWARE_VERSION);
+    cJSON_AddStringToObject(root, "room", cfg->room_name);
+    cJSON_AddStringToObject(root, "ip", ip);
+    cJSON_AddNumberToObject(root, "free_heap", esp_get_free_heap_size());
+    cJSON_AddNumberToObject(root, "uptime_seconds", diagnostics_get_uptime());
+    cJSON_AddBoolToObject(root, "mqtt_connected", ha_mqtt_is_connected());
+    cJSON_AddNumberToObject(root, "wifi_rssi", rssi);
+    cJSON_AddBoolToObject(root, "transmitting", transmitting);
+    cJSON_AddBoolToObject(root, "receiving", audio_playing);
+    cJSON_AddNumberToObject(root, "volume", cfg->volume);
+    cJSON_AddBoolToObject(root, "muted", audio_output_is_muted());
+    cJSON_AddBoolToObject(root, "dnd", cfg->dnd_enabled);
+    cJSON_AddBoolToObject(root, "test_tone_active", test_tone_active);
+    cJSON_AddStringToObject(root, "last_chime", ha_mqtt_get_incoming_chime());
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!json) {
+        ESP_LOGE(TAG, "API: /api/status cJSON_PrintUnformatted failed");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON print failed");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "API: /api/status response: %s", json);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    free(json);
+
+    return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Test tone task — generates sine wave, Opus-encodes, sends via multicast.
+//
+// Runs in a dedicated FreeRTOS task with a 32KB PSRAM stack because Opus
+// encoding requires ~30KB of stack (the HTTP server task has only 12KB).
+// ---------------------------------------------------------------------------
+static void test_tone_task(void *arg)
+{
+    test_tone_params_t *params = (test_tone_params_t *)arg;
+    params->result = 0;  // assume success
+
+    const int total_frames = 50;
+    ESP_LOGI(TAG, "Test tone: starting %d frames, 440Hz, wall-clock scheduled", total_frames);
+
+    // Local buffers for tone generation and encoding
+    int16_t tone_pcm[FRAME_SIZE];
+    uint8_t opus_out[MAX_PACKET_SIZE];
+    uint8_t pkt_buf[MAX_PACKET_SIZE];
+    audio_packet_t *packet = (audio_packet_t *)pkt_buf;
+
+    memcpy(packet->device_id, params->device_id, DEVICE_ID_LENGTH);
+    packet->priority = PRIORITY_NORMAL;
+
+    uint32_t sequence = 0;
+    const float inv_sample_rate = 1.0f / (float)SAMPLE_RATE;
+
+    // Reset encoder state so test tone starts from clean prediction
+    codec_reset_encoder();
+
+    // Wall-clock scheduling: vTaskDelayUntil compensates for encode+send time
+    TickType_t next_wake = xTaskGetTickCount();
+
+    // Timing accumulators for periodic diagnostic logging
+    int64_t encode_time_accum = 0;
+    int64_t send_time_accum = 0;
+    int timing_sample_count = 0;
+    int64_t tone_start_us = esp_timer_get_time();
+
+    for (int frame = 0; frame < total_frames; frame++) {
+        // Check if PTT started — abort to avoid interfering with real audio
+        if (transmitting) {
+            ESP_LOGW(TAG, "test_tone: aborting at frame %d — PTT active", frame);
+            params->result = 1;
+            break;
+        }
+
+        int64_t frame_start = esp_timer_get_time();
+
+        // Generate 440Hz sine wave at 50% amplitude (16384 peak, matches play_fallback_beep)
+        // Phase-continuous across frames: use absolute sample index
+        int frame_start_sample = frame * FRAME_SIZE;
+        for (int s = 0; s < FRAME_SIZE; s++) {
+            float t = (float)(frame_start_sample + s) * inv_sample_rate;
+            tone_pcm[s] = (int16_t)(16384.0f * sinf(2.0f * M_PI * 440.0f * t));
+        }
+
+        // Opus encode through mutex-protected codec_encode()
+        int opus_len = codec_encode(tone_pcm, opus_out, sizeof(opus_out));
+        int64_t after_encode = esp_timer_get_time();
+
+        if (opus_len <= 0) {
+            ESP_LOGW(TAG, "test_tone: encode failed at frame %d (ret=%d)", frame, opus_len);
+            continue;  // skip this frame, try next
+        }
+
+        // Build and send packet
+        packet->sequence = htonl(sequence++);
+        memcpy(packet->opus_data, opus_out, opus_len);
+        network_send_multicast(packet, HEADER_LENGTH + opus_len);
+        int64_t after_send = esp_timer_get_time();
+
+        // Accumulate timing for periodic summary
+        encode_time_accum += (after_encode - frame_start);
+        send_time_accum += (after_send - after_encode);
+        timing_sample_count++;
+
+        // Log timing summary every 10 frames
+        if (timing_sample_count == 10) {
+            int batch_end = frame;
+            int batch_start = batch_end - 9;
+            ESP_LOGI(TAG, "Test tone frames %d-%d: encode_avg=%lldus send_avg=%lldus",
+                     batch_start, batch_end,
+                     (long long)(encode_time_accum / 10),
+                     (long long)(send_time_accum / 10));
+            encode_time_accum = 0;
+            send_time_accum = 0;
+            timing_sample_count = 0;
+        }
+
+        // Wall-clock pacing: sleep until next 20ms boundary
+        vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(FRAME_DURATION_MS));
+    }
+
+    int64_t tone_end_us = esp_timer_get_time();
+    int64_t total_ms = (tone_end_us - tone_start_us) / 1000;
+    int frames_sent = (int)sequence;
+
+    ESP_LOGI(TAG, "Test tone complete: %d/%d frames sent, total=%lldms",
+             frames_sent, total_frames, (long long)total_ms);
+
+    // Signal the waiting HTTP handler, then self-delete
+    xSemaphoreGive((SemaphoreHandle_t)params->semaphore);
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/test — trigger test actions (beep, test_tone)
+// ---------------------------------------------------------------------------
+static esp_err_t api_test_handler(httpd_req_t *req)
+{
+    char client_ip[16];
+    get_client_ip(req, client_ip, sizeof(client_ip));
+    ESP_LOGI(TAG, "[HTTP] POST /api/test from %s content_len=%d", client_ip, req->content_len);
+
+    if (!check_basic_auth(req)) {
+        return send_auth_required(req);
+    }
+
+    // Read JSON body
+    char body[256] = {0};
+    if (req->content_len >= sizeof(body)) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        const char *err = "{\"error\":\"request_body_too_large\"}";
+        httpd_resp_send(req, err, strlen(err));
+        return ESP_OK;
+    }
+    int ret = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (ret <= 0) {
+        ESP_LOGW(TAG, "API: /api/test empty request body");
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        const char *err = "{\"error\":\"empty_request_body\"}";
+        httpd_resp_send(req, err, strlen(err));
+        return ESP_OK;
+    }
+
+    // Parse JSON to extract "action" field
+    cJSON *root = cJSON_Parse(body);
+    if (!root) {
+        ESP_LOGW(TAG, "API: /api/test invalid JSON: %s", body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        const char *err = "{\"error\":\"invalid_json\"}";
+        httpd_resp_send(req, err, strlen(err));
+        return ESP_OK;
+    }
+
+    cJSON *action_item = cJSON_GetObjectItem(root, "action");
+    if (!action_item || !cJSON_IsString(action_item)) {
+        ESP_LOGW(TAG, "API: /api/test missing 'action' field");
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        httpd_resp_set_type(req, "application/json");
+        const char *err = "{\"error\":\"missing_action_field\"}";
+        httpd_resp_send(req, err, strlen(err));
+        return ESP_OK;
+    }
+
+    const char *action = action_item->valuestring;
+    ESP_LOGI(TAG, "API: /api/test action='%s'", action);
+
+    // ---- action: beep ----
+    if (strcmp(action, "beep") == 0) {
+        cJSON_Delete(root);
+
+        ESP_LOGI(TAG, "API: /api/test executing beep");
+        play_fallback_beep();
+        ESP_LOGI(TAG, "API: /api/test beep complete");
+
+        const char *resp = "{\"result\":\"ok\"}";
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, resp, strlen(resp));
+        return ESP_OK;
+    }
+
+    // ---- action: test_tone ----
+    if (strcmp(action, "test_tone") == 0) {
+        cJSON_Delete(root);
+
+        // Check preconditions: PTT active or test_tone already running
+        if (transmitting) {
+            ESP_LOGW(TAG, "API: /api/test test_tone rejected — PTT active");
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_set_type(req, "application/json");
+            const char *resp = "{\"error\":\"ptt_active\"}";
+            httpd_resp_send(req, resp, strlen(resp));
+            return ESP_OK;
+        }
+        if (test_tone_active) {
+            ESP_LOGW(TAG, "API: /api/test test_tone rejected — already running");
+            httpd_resp_set_status(req, "409 Conflict");
+            httpd_resp_set_type(req, "application/json");
+            const char *resp = "{\"error\":\"test_tone_already_running\"}";
+            httpd_resp_send(req, resp, strlen(resp));
+            return ESP_OK;
+        }
+
+        // Claim the test_tone slot before spawning the task (closes TOCTOU window)
+        test_tone_active = true;
+
+        // Heap-allocate params: the handler can return on timeout while the
+        // task is still running, so stack-allocated params would dangle.
+        test_tone_params_t *targ = malloc(sizeof(test_tone_params_t));
+        if (!targ) {
+            test_tone_active = false;
+            ESP_LOGE(TAG, "API: /api/test malloc failed for test_tone params");
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            const char *err = "{\"error\":\"out_of_memory\"}";
+            httpd_resp_send(req, err, strlen(err));
+            return ESP_OK;
+        }
+        memcpy(targ->device_id, device_id, DEVICE_ID_LENGTH);
+        targ->result = 0;
+
+        SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
+        if (!done_sem) {
+            free(targ);
+            test_tone_active = false;
+            ESP_LOGE(TAG, "API: /api/test semaphore creation failed");
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            const char *err = "{\"error\":\"semaphore_failed\"}";
+            httpd_resp_send(req, err, strlen(err));
+            return ESP_OK;
+        }
+        targ->semaphore = done_sem;
+
+        ESP_LOGI(TAG, "API: /api/test spawning test_tone task (32KB PSRAM stack)");
+
+        TaskHandle_t task = xTaskCreateStatic(
+            test_tone_task, "test_tone",
+            sizeof(test_tone_stack) / sizeof(StackType_t),
+            targ, 5, test_tone_stack, &test_tone_tcb);
+
+        if (!task) {
+            free(targ);
+            vSemaphoreDelete(done_sem);
+            test_tone_active = false;
+            ESP_LOGE(TAG, "API: /api/test task creation failed");
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            httpd_resp_set_type(req, "application/json");
+            const char *err = "{\"error\":\"task_creation_failed\"}";
+            httpd_resp_send(req, err, strlen(err));
+            return ESP_OK;
+        }
+
+        // Wait up to 3s for the task to complete (50 frames x 20ms = 1s nominal)
+        bool completed = (xSemaphoreTake(done_sem, pdMS_TO_TICKS(3000)) == pdTRUE);
+
+        httpd_resp_set_type(req, "application/json");
+
+        if (completed) {
+            // Task finished — safe to read result and free resources
+            int result = targ->result;
+            free(targ);
+            vSemaphoreDelete(done_sem);
+            test_tone_active = false;
+
+            if (result == 0) {
+                ESP_LOGI(TAG, "API: /api/test test_tone completed successfully");
+                const char *resp = "{\"result\":\"ok\"}";
+                httpd_resp_send(req, resp, strlen(resp));
+            } else {
+                ESP_LOGW(TAG, "API: /api/test test_tone aborted (result=%d)", result);
+                const char *resp = "{\"result\":\"aborted\",\"reason\":\"ptt_preempted\"}";
+                httpd_resp_send(req, resp, strlen(resp));
+            }
+        } else {
+            // Timeout — task is likely still running. Do NOT free targ (task owns it).
+            // Accept the small leak; device is in a bad state anyway.
+            ESP_LOGE(TAG, "API: /api/test test_tone timed out after 3s");
+            // Leave test_tone_active = true until task eventually finishes or device reboots
+            httpd_resp_set_status(req, "500 Internal Server Error");
+            const char *resp = "{\"error\":\"timeout\"}";
+            httpd_resp_send(req, resp, strlen(resp));
+        }
+
+        return ESP_OK;
+    }
+
+    // ---- unknown action ----
+    ESP_LOGW(TAG, "API: /api/test unknown action '%s'", action);
+    cJSON_Delete(root);
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    const char *err = "{\"error\":\"unknown_action\"}";
+    httpd_resp_send(req, err, strlen(err));
+    return ESP_OK;
+}
+
 esp_err_t webserver_start(void)
 {
     if (server) {
@@ -796,6 +1224,7 @@ esp_err_t webserver_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 12288;  // 12KB for complex page rendering
+    config.max_uri_handlers = 10;  // 6 existing + 2 API + headroom
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.recv_wait_timeout = 60;  // 60s for OTA uploads over slow WiFi
     config.send_wait_timeout = 60;
@@ -815,12 +1244,17 @@ esp_err_t webserver_start(void)
     httpd_uri_t diag = {.uri = "/diagnostics", .method = HTTP_GET, .handler = diagnostics_handler};
     httpd_uri_t diag_json = {.uri = "/diagnostics/json", .method = HTTP_GET, .handler = diagnostics_json_handler};
 
+    httpd_uri_t api_status = {.uri = "/api/status", .method = HTTP_GET, .handler = api_status_handler};
+    httpd_uri_t api_test = {.uri = "/api/test", .method = HTTP_POST, .handler = api_test_handler};
+
     httpd_register_uri_handler(server, &root);
     httpd_register_uri_handler(server, &save);
     httpd_register_uri_handler(server, &reset);
     httpd_register_uri_handler(server, &ota);
     httpd_register_uri_handler(server, &diag);
     httpd_register_uri_handler(server, &diag_json);
+    httpd_register_uri_handler(server, &api_status);
+    httpd_register_uri_handler(server, &api_test);
 
     ESP_LOGI(TAG, "Web server started");
     return ESP_OK;

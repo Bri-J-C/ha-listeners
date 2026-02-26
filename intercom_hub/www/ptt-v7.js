@@ -39,6 +39,23 @@ class IntercomPTT {
         this.priority = PRIORITY_NORMAL;  // Our TX priority
         this.dndEnabled = false;          // Client-side DND: only play EMERGENCY audio
 
+        // --- QA Logging: TX counters (reset on each PTT press) ---
+        this.txFrameCount = 0;
+        this.txBytesSent = 0;
+        this.txStartTime = 0;
+
+        // --- QA Logging: RX counters (reset on each new stream) ---
+        this.rxFrameCount = 0;
+        this.rxBytesSent = 0;
+        this.rxStreamActive = false;
+        this.rxStreamStartTime = 0;
+        this.rxLastFrameTime = 0;
+        this.rxStreamEndTimer = null;  // setTimeout handle for stream-end detection
+
+        // --- QA Logging: state machine tracking ---
+        this.currentState = 'idle';
+        this.stateEnteredAt = Date.now();
+
         // Parse caller and device identity from URL
         const params = new URLSearchParams(window.location.search);
         const callerParam = params.get('caller');
@@ -160,6 +177,16 @@ class IntercomPTT {
     }
 
     updateStatus(status) {
+        // --- QA Logging: state transition ---
+        const oldState = this.currentState;
+        const now = Date.now();
+        const elapsed = now - this.stateEnteredAt;
+        if (oldState !== status) {
+            console.log('[STATE] %s → %s (elapsed=%dms)', oldState, status, elapsed);
+            this.currentState = status;
+            this.stateEnteredAt = now;
+        }
+
         this.pttStatus.textContent = status.charAt(0).toUpperCase() + status.slice(1);
         this.pttStatus.className = 'status-value status-' + status;
 
@@ -199,6 +226,11 @@ class IntercomPTT {
 
                 // Create audio context for playback only
                 this.audioContext = new AudioContext({ sampleRate: 16000 });
+
+                // --- QA Logging: AudioContext state changes ---
+                this.audioContext.addEventListener('statechange', () => {
+                    console.log('[AUDIO] context_state=%s', this.audioContext.state);
+                });
             } else {
                 // Acquire microphone and set up audio
                 await this.setupMic();
@@ -226,6 +258,12 @@ class IntercomPTT {
             this.isInitialized = true;
             this.micEnabled = false;
             this.audioContext = new AudioContext({ sampleRate: 16000 });
+
+            // --- QA Logging: AudioContext state changes (receive-only fallback) ---
+            this.audioContext.addEventListener('statechange', () => {
+                console.log('[AUDIO] context_state=%s', this.audioContext.state);
+            });
+
             this.connectWebSocket();
         }
     }
@@ -244,6 +282,18 @@ class IntercomPTT {
 
         // Create audio context (16kHz to match protocol)
         this.audioContext = new AudioContext({ sampleRate: 16000 });
+
+        // --- QA Logging: mic granted ---
+        const track = this.mediaStream.getAudioTracks()[0];
+        const settings = track ? track.getSettings() : {};
+        console.log('[MIC] granted: sampleRate=%d channels=%d',
+            settings.sampleRate || this.audioContext.sampleRate,
+            settings.channelCount || 1);
+
+        // --- QA Logging: AudioContext state changes ---
+        this.audioContext.addEventListener('statechange', () => {
+            console.log('[AUDIO] context_state=%s', this.audioContext.state);
+        });
 
         // Load AudioWorklet
         await this.audioContext.audioWorklet.addModule('ptt-processor.js');
@@ -303,7 +353,8 @@ class IntercomPTT {
         this.websocket.binaryType = 'arraybuffer';
 
         this.websocket.onopen = () => {
-            console.log('WebSocket connected');
+            // --- QA Logging: WebSocket connected ---
+            console.log('[WS] connected: url=%s', wsUrl);
             this.isConnected = true;
             this.reconnectDelay = 1000;  // Reset backoff on successful connection
             this.connStatus.textContent = 'Connected';
@@ -314,19 +365,21 @@ class IntercomPTT {
 
             // Send client identity if known (from notification URL)
             if (this.clientId) {
-                this.websocket.send(JSON.stringify({
-                    type: 'identify',
-                    client_id: this.clientId
-                }));
+                const identifyMsg = { type: 'identify', client_id: this.clientId };
+                this.websocket.send(JSON.stringify(identifyMsg));
+                console.log('[WS] tx: type=%s client_id=%s', identifyMsg.type, identifyMsg.client_id);
                 console.log('Sent identity:', this.clientId);
             }
 
             // Request current state and target list
-            this.websocket.send(JSON.stringify({ type: 'get_state' }));
+            const getStateMsg = { type: 'get_state' };
+            this.websocket.send(JSON.stringify(getStateMsg));
+            console.log('[WS] tx: type=%s', getStateMsg.type);
         };
 
-        this.websocket.onclose = () => {
-            console.log('WebSocket disconnected');
+        this.websocket.onclose = (event) => {
+            // --- QA Logging: WebSocket disconnected ---
+            console.warn('[WS] disconnected: code=%d reason=%s', event.code, event.reason || '(none)');
             this.isConnected = false;
             this.connStatus.textContent = 'Disconnected';
             this.connStatus.className = 'status-value status-disconnected';
@@ -345,6 +398,8 @@ class IntercomPTT {
         };
 
         this.websocket.onerror = (error) => {
+            // --- QA Logging: WebSocket error ---
+            console.error('[WS] error: %s', error.message || 'unknown error');
             console.error('WebSocket error:', error);
             this.showError('Connection error. Retrying...');
         };
@@ -366,8 +421,10 @@ class IntercomPTT {
     }
 
     handleMessage(msg) {
+        // --- QA Logging: JSON message received from hub ---
         switch (msg.type) {
             case 'init':
+                console.log('[WS] rx: type=%s version=%s status=%s', msg.type, msg.version || '?', msg.status || '?');
                 // Initial connection - set version and status
                 if (msg.version) {
                     const versionEl = document.querySelector('.version');
@@ -385,16 +442,16 @@ class IntercomPTT {
                         console.log('Using suggested name from server:', this.clientId);
                         // Re-send identity with the suggested name
                         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-                            this.websocket.send(JSON.stringify({
-                                type: 'identify',
-                                client_id: this.clientId
-                            }));
+                            const identifyMsg = { type: 'identify', client_id: this.clientId };
+                            this.websocket.send(JSON.stringify(identifyMsg));
+                            console.log('[WS] tx: type=%s client_id=%s', identifyMsg.type, identifyMsg.client_id);
                         }
                     }
                 }
                 break;
 
             case 'state':
+                console.log('[WS] rx: type=%s status=%s', msg.type, msg.status || '?');
                 this.updateStatus(msg.status);
                 if (msg.status === 'receiving') {
                     this.isReceiving = true;
@@ -404,6 +461,7 @@ class IntercomPTT {
                 break;
 
             case 'targets':
+                console.log('[WS] rx: type=%s rooms=%s', msg.type, msg.rooms ? msg.rooms.join(',') : '(none)');
                 // Update target dropdown
                 this.targetSelect.innerHTML = '<option value="all">All Rooms</option>';
                 if (msg.rooms) {
@@ -428,6 +486,9 @@ class IntercomPTT {
                 break;
 
             case 'recent_call':
+                console.log('[WS] rx: type=%s caller=%s', msg.type, msg.caller || '?');
+                // --- QA Logging: incoming call notification ---
+                console.log('[CALL] incoming: from=%s', msg.caller || '?');
                 // Auto-select caller from recent notification
                 if (msg.caller) {
                     const callerOption = Array.from(this.targetSelect.options).find(
@@ -441,13 +502,19 @@ class IntercomPTT {
                 break;
 
             case 'busy':
+                console.log('[WS] rx: type=%s', msg.type);
                 // Channel is busy
                 this.pttButton.classList.add('busy');
                 this.updateStatus('busy');
                 break;
 
             case 'error':
+                console.log('[WS] rx: type=%s message=%s', msg.type, msg.message || '?');
                 this.showError(msg.message);
+                break;
+
+            default:
+                console.log('[WS] rx: type=%s', msg.type || '(unknown)');
                 break;
         }
     }
@@ -480,6 +547,15 @@ class IntercomPTT {
         this.updateStatus('transmitting');
         console.log('PTT started');
 
+        // --- QA Logging: reset TX counters on each PTT start ---
+        this.txFrameCount = 0;
+        this.txBytesSent = 0;
+        this.txStartTime = Date.now();
+        const priorityNames = ['Normal', 'High', 'Emergency'];
+        console.log('[PTT] start: target=%s priority=%s',
+            this.targetSelect.value,
+            priorityNames[this.priority] || 'Normal');
+
         // Tell worklet to start capturing
         if (this.workletNode) {
             this.workletNode.port.postMessage({ type: 'ptt', active: true });
@@ -487,12 +563,14 @@ class IntercomPTT {
 
         // Tell server we're transmitting — include selected priority
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-            const priorityNames = ['Normal', 'High', 'Emergency'];
-            this.websocket.send(JSON.stringify({
+            const pttStartMsg = {
                 type: 'ptt_start',
                 target: this.targetSelect.value,
                 priority: priorityNames[this.priority] || 'Normal'
-            }));
+            };
+            this.websocket.send(JSON.stringify(pttStartMsg));
+            console.log('[WS] tx: type=%s target=%s priority=%s',
+                pttStartMsg.type, pttStartMsg.target, pttStartMsg.priority);
         }
     }
 
@@ -510,6 +588,11 @@ class IntercomPTT {
         this.updateStatus('idle');
         console.log('PTT stopped');
 
+        // --- QA Logging: PTT end summary ---
+        const durationMs = Date.now() - this.txStartTime;
+        console.log('[PTT] end: total_frames=%d duration_ms=%d',
+            this.txFrameCount, durationMs);
+
         // Tell worklet to stop capturing
         if (this.workletNode) {
             this.workletNode.port.postMessage({ type: 'ptt', active: false });
@@ -517,22 +600,38 @@ class IntercomPTT {
 
         // Tell server we stopped
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-            this.websocket.send(JSON.stringify({ type: 'ptt_stop' }));
+            const pttStopMsg = { type: 'ptt_stop' };
+            this.websocket.send(JSON.stringify(pttStopMsg));
+            console.log('[WS] tx: type=%s', pttStopMsg.type);
         }
     }
 
     sendAudio(pcmBuffer) {
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
             this.websocket.send(pcmBuffer);
+
+            // --- QA Logging: TX frame counter (log every 50 frames = ~1s at 50fps) ---
+            this.txFrameCount++;
+            this.txBytesSent += pcmBuffer.byteLength || pcmBuffer.length || 0;
+            if (this.txFrameCount % 50 === 0) {
+                const elapsedMs = Date.now() - this.txStartTime;
+                const fps = elapsedMs > 0 ? Math.round(this.txFrameCount / (elapsedMs / 1000)) : 0;
+                console.log('[TX] frames=%d bytes_sent=%d elapsed_ms=%d fps=%d',
+                    this.txFrameCount, this.txBytesSent, elapsedMs, fps);
+            }
         }
     }
 
     sendTargetChange() {
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-            this.websocket.send(JSON.stringify({
+            const setTargetMsg = {
                 type: 'set_target',
                 target: this.targetSelect.value
-            }));
+            };
+            this.websocket.send(JSON.stringify(setTargetMsg));
+            console.log('[WS] tx: type=%s target=%s', setTargetMsg.type, setTargetMsg.target);
+            // --- QA Logging: target/room selection change ---
+            console.log('[STATE] target=%s', setTargetMsg.target);
         }
     }
 
@@ -543,10 +642,11 @@ class IntercomPTT {
         }
 
         if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
-            this.websocket.send(JSON.stringify({
-                type: 'call',
-                target: target
-            }));
+            const callMsg = { type: 'call', target: target };
+            this.websocket.send(JSON.stringify(callMsg));
+            console.log('[WS] tx: type=%s target=%s', callMsg.type, callMsg.target);
+            // --- QA Logging: call button pressed ---
+            console.log('[CALL] send: target=%s', target);
             console.log('Sent call to:', target);
             this.lastCallTime = Date.now();  // Start PTT lockout
 
@@ -573,6 +673,43 @@ class IntercomPTT {
         if (this.dndEnabled && incomingPriority < PRIORITY_EMERGENCY) {
             return;
         }
+
+        // --- QA Logging: RX stream tracking ---
+        const nowMs = Date.now();
+
+        // Detect new stream start (first frame, or resumed after >500ms gap)
+        if (!this.rxStreamActive) {
+            this.rxFrameCount = 0;
+            this.rxBytesSent = 0;
+            this.rxStreamActive = true;
+            this.rxStreamStartTime = nowMs;
+            // Source identifier: use priority as proxy since we don't have src IP in the browser
+            console.log('[RX] stream_start: src=priority-%d', incomingPriority);
+        }
+
+        // Accumulate RX stats
+        this.rxFrameCount++;
+        this.rxBytesSent += pcmBuffer.byteLength;
+        this.rxLastFrameTime = nowMs;
+
+        // Log every 50 frames (~1s at 50fps)
+        if (this.rxFrameCount % 50 === 0) {
+            console.log('[RX] frames=%d bytes_recv=%d', this.rxFrameCount, this.rxBytesSent);
+        }
+
+        // Reset the stream-end timer: fire 500ms after the last frame
+        if (this.rxStreamEndTimer !== null) {
+            clearTimeout(this.rxStreamEndTimer);
+        }
+        this.rxStreamEndTimer = setTimeout(() => {
+            if (this.rxStreamActive) {
+                const streamDuration = this.rxLastFrameTime - this.rxStreamStartTime;
+                console.log('[RX] stream_end: total_frames=%d duration_ms=%d',
+                    this.rxFrameCount, streamDuration);
+                this.rxStreamActive = false;
+                this.rxStreamEndTimer = null;
+            }
+        }, 500);
 
         // Resume context if needed (mobile browsers suspend it)
         if (this.audioContext.state === 'suspended') {
@@ -615,7 +752,10 @@ class IntercomPTT {
         const val = parseInt(this.prioritySelect.value, 10);
         if (val >= PRIORITY_NORMAL && val <= PRIORITY_EMERGENCY) {
             this.priority = val;
-            console.log('Priority set to:', ['Normal', 'High', 'Emergency'][val]);
+            const priorityName = ['Normal', 'High', 'Emergency'][val];
+            console.log('Priority set to:', priorityName);
+            // --- QA Logging: priority change ---
+            console.log('[STATE] priority=%s', priorityName);
             // Update UI styling to reflect the selected priority
             this.prioritySelect.className = 'priority-select priority-' + ['normal', 'high', 'emergency'][val];
         }
@@ -624,6 +764,8 @@ class IntercomPTT {
     onDndChange() {
         this.dndEnabled = this.dndToggle.checked;
         console.log('DND', this.dndEnabled ? 'enabled' : 'disabled');
+        // --- QA Logging: DND toggle ---
+        console.log('[STATE] dnd=%s', this.dndEnabled ? 'enabled' : 'disabled');
     }
 
     suspend() {
@@ -678,6 +820,11 @@ class IntercomPTT {
                 await this.setupMic();
             } else {
                 this.audioContext = new AudioContext({ sampleRate: 16000 });
+
+                // --- QA Logging: AudioContext state changes (receive-only on resume) ---
+                this.audioContext.addEventListener('statechange', () => {
+                    console.log('[AUDIO] context_state=%s', this.audioContext.state);
+                });
             }
 
             // Reset backoff so reconnect is immediate after resume
@@ -692,6 +839,12 @@ class IntercomPTT {
 
             // Try to at least connect for receive-only
             this.audioContext = new AudioContext({ sampleRate: 16000 });
+
+            // --- QA Logging: AudioContext state changes (error recovery on resume) ---
+            this.audioContext.addEventListener('statechange', () => {
+                console.log('[AUDIO] context_state=%s', this.audioContext.state);
+            });
+
             this.connectWebSocket();
         }
     }

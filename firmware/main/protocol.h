@@ -11,12 +11,12 @@
 #include <stdint.h>
 
 // Firmware version - bump with every firmware change
-#define FIRMWARE_VERSION        "2.8.1"
+#define FIRMWARE_VERSION        "2.8.4"
 
 // Network Configuration
 #define CONTROL_PORT        5004
 #define AUDIO_PORT          5005
-#define MULTICAST_GROUP     "224.0.0.100"
+#define MULTICAST_GROUP     "239.255.0.100"
 #define MULTICAST_TTL       1
 
 // Audio Configuration
@@ -84,5 +84,12 @@ typedef enum {
     LED_STATE_BUSY,         // Solid orange - channel busy (someone else talking)
     LED_STATE_DND,          // Solid purple/violet - Do Not Disturb active
 } led_state_t;
+
+// Parameters for the test_tone task spawned by /api/test
+typedef struct {
+    uint8_t device_id[DEVICE_ID_LENGTH];
+    int     result;     // 0 = success, 1 = aborted by PTT
+    void   *semaphore;  // SemaphoreHandle_t — signalled on completion
+} test_tone_params_t;
 
 #endif // PROTOCOL_H

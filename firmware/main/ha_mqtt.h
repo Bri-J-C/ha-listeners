@@ -196,4 +196,10 @@ int ha_mqtt_send_call_all_rooms(void);
  */
 bool ha_mqtt_check_incoming_call(char *caller_name);
 
+/**
+ * Get the chime name from the most recently received call notification.
+ * Returns an empty string if no chime was specified in the call payload.
+ */
+const char* ha_mqtt_get_incoming_chime(void);
+
 #endif // HA_MQTT_H
