@@ -708,13 +708,9 @@ void play_fallback_beep(void)
  * the MQTT call message.  The ESP32 plays the hub chime through the normal
  * on_audio_received() path (priority HIGH, so it preempts normal RX).
  *
- * Because UDP is faster than MQTT, the hub chime audio usually arrives BEFORE
- * the ESP32 processes the MQTT call message. In that case the play task is
- * already playing the chime — the fallback beep would disrupt it (stop I2S,
- * flush the queue, fight the play task for the mutex).
- *
- * Strategy: only play the fallback beep if no hub audio has arrived yet.
- * If hub chime is already playing or queued, just set the LED and let it play.
+ * Sets LED/display for visual feedback and forces full volume so the chime
+ * is heard regardless of the device volume setting.  Volume is restored
+ * automatically in the idle timeout when the chime audio ends.
  */
 static void play_incoming_call_chime(void)
 {
@@ -733,40 +729,12 @@ static void play_incoming_call_chime(void)
     button_set_led_state(LED_STATE_RECEIVING);
     display_set_state(DISPLAY_STATE_RECEIVING);
 
-    // Wait 150ms for hub chime UDP frames to arrive.
-    //
-    // The hub publishes the MQTT call notification and starts streaming the
-    // chime audio over UDP almost simultaneously.  On the ESP32, MQTT sometimes
-    // arrives BEFORE the first UDP frame (broker delivery latency varies).
-    // Without this delay, audio_playing=false and q_depth=0, so we'd fall
-    // through to the beep — which stops I2S and races with the play task,
-    // destroying the hub chime audio.
-    //
-    // 150ms is generous: the first UDP frame normally arrives <25ms after the
-    // MQTT publish.  The delay is imperceptible to the user (LED is already on).
-    vTaskDelay(pdMS_TO_TICKS(150));
-
-    UBaseType_t q_depth = rx_audio_queue ? uxQueueMessagesWaiting(rx_audio_queue) : 0;
-    bool hub_chime_active = audio_playing || q_depth > 0 || has_current_sender;
-
-    ESP_LOGI(TAG, "Call chime: audio_playing=%d, q_depth=%u, has_sender=%d -> %s",
-             audio_playing, (unsigned)q_depth, has_current_sender,
-             hub_chime_active ? "hub chime active, skipping beep" : "no hub audio, playing beep");
-
     // Force full volume for incoming call — must be heard regardless of setting.
     // Uses the emergency override mechanism (save/restore). Restored automatically
     // in the idle timeout when the chime audio ends.
     audio_output_force_unmute_max_volume();
 
-    if (hub_chime_active) {
-        // Hub chime is already playing through the normal RX path — don't disrupt it.
-        // Volume restored in idle timeout via audio_output_restore_volume().
-        return;
-    }
-
-    // No hub audio after 150ms — hub is likely unreachable. Play fallback beep at full volume.
-    play_fallback_beep();
-    audio_output_restore_volume();
+    ESP_LOGI(TAG, "Call chime: LED set, volume forced — hub chime arrives via UDP");
 }
 
 /**

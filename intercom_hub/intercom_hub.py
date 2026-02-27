@@ -29,6 +29,7 @@ import urllib.request
 import urllib.error
 import re
 import html
+import base64
 from pathlib import Path
 from typing import Optional, Dict, Any
 import paho.mqtt.client as mqtt
@@ -145,7 +146,7 @@ def html_escape(text: str) -> str:
 
 
 # Version - single source of truth
-VERSION = "2.5.5"  # Remove mobile devices from permanent target list (only show active web PTT sessions)
+VERSION = "2.5.7"  # Add AudioCaptureBuffer, /api/audio_capture, TX stats in audio_stats
 
 try:
     from aiohttp import web
@@ -467,6 +468,74 @@ class AudioRxStats:
 
 
 audio_rx_stats = AudioRxStats()
+
+
+class AudioCaptureBuffer:
+    """Ring buffer storing recent Opus frames for QA audio analysis.
+
+    Captures frames from both RX (receive_thread) and TX (send_audio_packet,
+    _stream_chime_blocking) paths. Disabled by default — QA enables via
+    POST /api/audio_capture {"action":"start"}.
+    """
+
+    def __init__(self, max_frames=2000):
+        self._lock = threading.Lock()
+        self._frames = []
+        self._max_frames = max_frames
+        self._enabled = False
+
+    @property
+    def enabled(self):
+        return self._enabled
+
+    def enable(self):
+        with self._lock:
+            self._enabled = True
+            self._frames.clear()
+
+    def disable(self):
+        with self._lock:
+            self._enabled = False
+
+    def clear(self):
+        with self._lock:
+            self._frames.clear()
+
+    def record(self, direction, device_id_hex, sequence, priority,
+               opus_data, src_ip=None, target_ip=None):
+        if not self._enabled:
+            return
+        frame = {
+            "ts": time.time(),
+            "dir": direction,
+            "dev": device_id_hex,
+            "seq": sequence,
+            "pri": priority,
+            "opus_b64": base64.b64encode(opus_data).decode('ascii'),
+            "opus_len": len(opus_data),
+        }
+        if src_ip:
+            frame["src_ip"] = src_ip
+        if target_ip:
+            frame["target_ip"] = target_ip
+        with self._lock:
+            self._frames.append(frame)
+            if len(self._frames) > self._max_frames:
+                self._frames = self._frames[-self._max_frames:]
+
+    def get_frames(self, direction=None, device_id=None, since=None, limit=500):
+        with self._lock:
+            frames = self._frames[:]
+        if direction:
+            frames = [f for f in frames if f["dir"] == direction]
+        if device_id:
+            frames = [f for f in frames if f["dev"] == device_id]
+        if since:
+            frames = [f for f in frames if f["ts"] >= since]
+        return frames[-limit:]
+
+
+audio_capture = AudioCaptureBuffer()
 
 
 # Chime state: pre-encoded chime frames, keyed by chime name (e.g. "doorbell")
@@ -842,6 +911,8 @@ def send_audio_packet(opus_data, target_ip=None, priority=None):
         else:
             tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
         mcast_metrics.record_tx(success=True)
+        audio_capture.record("tx", DEVICE_ID_STR, sequence_num - 1, priority,
+                            opus_data, target_ip=target_ip or MULTICAST_GROUP)
     except Exception as e:
         mcast_metrics.record_tx(success=False)
         mode = f"unicast to {target_ip}" if target_ip else "multicast"
@@ -994,7 +1065,7 @@ def receive_thread():
         try:
             data, addr = rx_socket.recvfrom(1024)
 
-            if len(data) < 12:  # Minimum: 8 byte ID + 4 byte seq
+            if len(data) < PACKET_HEADER_SIZE:  # 13 bytes: 8 byte ID + 4 byte seq + 1 byte priority
                 continue
 
             # Parse packet
@@ -1024,6 +1095,8 @@ def receive_thread():
 
             # Record per-sender RX stats (before DND filter — counts all arriving packets)
             audio_rx_stats.record(sender_id_str, sequence, incoming_priority)
+            audio_capture.record("rx", sender_id_str, sequence, incoming_priority,
+                                opus_frame, src_ip=addr[0])
 
             # Hub DND check: only EMERGENCY plays through
             if hub_dnd_enabled and incoming_priority < PRIORITY_EMERGENCY:
@@ -1488,55 +1561,84 @@ def _stream_chime_blocking(target_ip: Optional[str], frames: list, chime_name: s
     Uses the same coarse-sleep + busy-wait pattern as encode_and_broadcast()
     for <1ms timing accuracy.  Runs via loop.run_in_executor() so it doesn't
     block the asyncio event loop.
+
+    Acquires tx_lock and sets current_state to prevent concurrent TTS/chime
+    streams from interleaving packets on the same socket.
     """
-    chime_seq = 0
-    frame_interval = FRAME_DURATION_MS / 1000.0  # 0.020
-    start_time = time.monotonic()
-    consecutive_errors = 0
-    first_frame_sent = False
+    global current_state
 
-    for i, opus_frame in enumerate(frames):
-        packet = DEVICE_ID + struct.pack('>IB', chime_seq, PRIORITY_HIGH) + opus_frame
-        chime_seq += 1
+    # Prevent concurrent transmissions (same lock as encode_and_broadcast)
+    if not tx_lock.acquire(blocking=False):
+        log.warning(f"Chime '{chime_name}' skipped: transmission already in progress")
+        return
 
-        try:
-            if target_ip:
-                tx_socket.sendto(packet, (target_ip, MULTICAST_PORT))
-            else:
-                tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
-            if not first_frame_sent:
-                first_frame_sent = True
-                log.debug(
-                    f"Chime '{chime_name}' first frame sent at t+{(time.monotonic()-start_time)*1000:.1f}ms"
-                )
-            mcast_metrics.record_tx(success=True)
-            consecutive_errors = 0
-        except Exception as e:
-            mcast_metrics.record_tx(success=False)
-            consecutive_errors += 1
-            log.error(f"Chime send error at frame {i}: {e}")
-            if consecutive_errors >= 5:
-                log.error("Chime aborted: 5 consecutive send errors")
-                break
-            continue
+    try:
+        # Wait for channel to be free (chimes are PRIORITY_HIGH)
+        wait_for_channel(our_priority=PRIORITY_HIGH)
 
-        # Calculate target time for next frame
-        next_frame_time = start_time + ((i + 1) * frame_interval)
+        with state_lock:
+            current_state = "transmitting"
+        publish_state(state="transmitting")
 
-        # Coarse sleep (to within 3ms of target)
-        now = time.monotonic()
-        sleep_time = next_frame_time - now - 0.003
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+        chime_seq = 0
+        frame_interval = FRAME_DURATION_MS / 1000.0  # 0.020
+        start_time = time.monotonic()
+        consecutive_errors = 0
+        first_frame_sent = False
 
-        # Fine-grained busy-wait for precise timing
-        while time.monotonic() < next_frame_time:
-            pass
+        for i, opus_frame in enumerate(frames):
+            packet = DEVICE_ID + struct.pack('>IB', chime_seq, PRIORITY_HIGH) + opus_frame
+            chime_seq += 1
 
-    elapsed = time.monotonic() - start_time
-    expected = len(frames) * frame_interval
-    drift_ms = (elapsed - expected) * 1000
-    log.info(f"Chime '{chime_name}' complete: {chime_seq} frames in {elapsed:.2f}s (drift: {drift_ms:+.1f}ms)")
+            try:
+                if target_ip:
+                    tx_socket.sendto(packet, (target_ip, MULTICAST_PORT))
+                else:
+                    tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
+                if not first_frame_sent:
+                    first_frame_sent = True
+                    log.debug(
+                        f"Chime '{chime_name}' first frame sent at t+{(time.monotonic()-start_time)*1000:.1f}ms"
+                    )
+                mcast_metrics.record_tx(success=True)
+                audio_capture.record("tx", DEVICE_ID_STR, chime_seq - 1, PRIORITY_HIGH,
+                                    opus_frame, target_ip=target_ip or MULTICAST_GROUP)
+                consecutive_errors = 0
+            except Exception as e:
+                mcast_metrics.record_tx(success=False)
+                consecutive_errors += 1
+                log.error(f"Chime send error at frame {i}: {e}")
+                if consecutive_errors >= 5:
+                    log.error("Chime aborted: 5 consecutive send errors")
+                    break
+                continue
+
+            # Calculate target time for next frame
+            next_frame_time = start_time + ((i + 1) * frame_interval)
+
+            # Coarse sleep (to within 3ms of target)
+            now = time.monotonic()
+            sleep_time = next_frame_time - now - 0.003
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+            # Fine-grained busy-wait for precise timing
+            while time.monotonic() < next_frame_time:
+                pass
+
+        elapsed = time.monotonic() - start_time
+        expected = len(frames) * frame_interval
+        drift_ms = (elapsed - expected) * 1000
+        log.info(f"Chime '{chime_name}' complete: {chime_seq} frames in {elapsed:.2f}s (drift: {drift_ms:+.1f}ms)")
+
+    except Exception as e:
+        log.error(f"Chime '{chime_name}' error: {e}")
+
+    finally:
+        with state_lock:
+            current_state = "idle"
+        publish_state(state="idle")
+        tx_lock.release()
 
 
 async def stream_chime_to_target(target_ip: Optional[str], chime_name: str = "") -> None:
@@ -2169,13 +2271,26 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
 
     # Mobile devices are NOT published as selectable targets — sending audio
     # to a phone does nothing useful.  Notifications still work via automations.
-    # Clear any previously retained mobile device entries from the broker.
-    for i, device in enumerate(MOBILE_DEVICES):
+    # Clear any previously retained mobile device entries from the broker,
+    # including stale entries from previous runs with more devices.
+    prev_max_path = Path("/data/mobile_device_max_index")
+    prev_max = 0
+    try:
+        prev_max = int(prev_max_path.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        pass
+    clear_count = max(len(MOBILE_DEVICES), prev_max)
+    for i in range(clear_count):
         device_id = f"{UNIQUE_ID}_mobile_{i}"
         client.publish(f"intercom/devices/{device_id}/info", "", retain=True)
         client.publish(f"intercom/{device_id}/status", "offline", retain=True)
-    if MOBILE_DEVICES:
-        log.info(f"Cleared {len(MOBILE_DEVICES)} mobile device(s) from target list")
+    if clear_count > 0:
+        log.info(f"Cleared {clear_count} mobile device entries from target list")
+    # Persist current count for next restart
+    try:
+        prev_max_path.write_text(str(len(MOBILE_DEVICES)))
+    except Exception as e:
+        log.warning(f"Could not persist mobile device count: {e}")
 
     # Clear old "WebClients" aggregate device (replaced by individual web client tracking)
     old_web_topic = f"intercom/devices/{UNIQUE_ID}_web/info"
@@ -3082,6 +3197,10 @@ async def audio_stats_get_handler(request):
         "current_state": current_state,
         "current_sender": current_audio_sender,
         "senders": senders,
+        "tx": {
+            "packets": mcast_metrics.tx_packets,
+            "errors": mcast_metrics.tx_errors,
+        },
     })
 
 
@@ -3114,7 +3233,69 @@ async def audio_stats_post_handler(request):
             )
 
     cleared = audio_rx_stats.clear(older_than=older_than)
+    # Also reset TX counters
+    with mcast_metrics._lock:
+        mcast_metrics.tx_packets = 0
+        mcast_metrics.tx_errors = 0
     return web.json_response({"result": "ok", "cleared": cleared})
+
+
+async def audio_capture_get_handler(request):
+    """GET /api/audio_capture — fetch captured audio frames.
+
+    Query params:
+        direction: "rx" or "tx"
+        device_id: filter by device_id hex
+        since: unix timestamp float
+        limit: max frames (default 500)
+    """
+    direction = request.rel_url.query.get("direction")
+    device_id = request.rel_url.query.get("device_id")
+    since = None
+    since_raw = request.rel_url.query.get("since")
+    if since_raw:
+        try:
+            since = float(since_raw)
+        except (ValueError, TypeError):
+            return web.json_response({"error": "Invalid 'since'"}, status=400)
+    try:
+        limit = int(request.rel_url.query.get("limit", "500"))
+    except (ValueError, TypeError):
+        limit = 500
+
+    frames = audio_capture.get_frames(
+        direction=direction, device_id=device_id, since=since, limit=limit)
+    return web.json_response({
+        "enabled": audio_capture.enabled,
+        "frame_count": len(frames),
+        "frames": frames,
+    })
+
+
+async def audio_capture_post_handler(request):
+    """POST /api/audio_capture — control capture.
+
+    Body: {"action": "start"|"stop"|"clear"}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    action = body.get("action", "").lower() if isinstance(body, dict) else ""
+    if action == "start":
+        audio_capture.enable()
+        log.info("Audio capture enabled (QA)")
+        return web.json_response({"result": "ok", "enabled": True})
+    elif action == "stop":
+        audio_capture.disable()
+        log.info("Audio capture disabled")
+        return web.json_response({"result": "ok", "enabled": False})
+    elif action == "clear":
+        audio_capture.clear()
+        return web.json_response({"result": "ok", "cleared": True})
+    else:
+        return web.json_response({"error": "Unknown action. Use start/stop/clear."}, status=400)
 
 
 def create_web_app():
@@ -3129,6 +3310,8 @@ def create_web_app():
     app.router.add_delete('/api/chimes/{name}', chimes_delete_handler)
     app.router.add_get('/api/audio_stats', audio_stats_get_handler)
     app.router.add_post('/api/audio_stats', audio_stats_post_handler)
+    app.router.add_get('/api/audio_capture', audio_capture_get_handler)
+    app.router.add_post('/api/audio_capture', audio_capture_post_handler)
     app.router.add_get('/', index_handler)
     app.router.add_static('/static', WWW_PATH)
     app.router.add_get('/{filename:.*}', static_handler)
