@@ -145,7 +145,7 @@ def html_escape(text: str) -> str:
 
 
 # Version - single source of truth
-VERSION = "2.5.4"  # Fix MQTT handler crash: json.loads("null") → NoneType.get() killed MQTT thread
+VERSION = "2.5.5"  # Remove mobile devices from permanent target list (only show active web PTT sessions)
 
 try:
     from aiohttp import web
@@ -661,9 +661,8 @@ def load_mobile_devices():
             source = "manual" if dev["notify_service"] in manual_services else "auto"
             log.info(f"  - {dev['name']} -> {dev['notify_service']} ({source})")
 
-    # Re-publish mobile devices to MQTT if connected
-    if mqtt_client and mqtt_client.is_connected():
-        publish_mobile_devices()
+    # Mobile devices are discovered for notifications only — NOT published
+    # as selectable audio targets (sending audio to a phone is useless).
 
 
 def mobile_refresh_thread():
@@ -2168,8 +2167,15 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     # Publish discovery
     publish_discovery()
 
-    # Publish mobile devices as targets
-    publish_mobile_devices()
+    # Mobile devices are NOT published as selectable targets — sending audio
+    # to a phone does nothing useful.  Notifications still work via automations.
+    # Clear any previously retained mobile device entries from the broker.
+    for i, device in enumerate(MOBILE_DEVICES):
+        device_id = f"{UNIQUE_ID}_mobile_{i}"
+        client.publish(f"intercom/devices/{device_id}/info", "", retain=True)
+        client.publish(f"intercom/{device_id}/status", "offline", retain=True)
+    if MOBILE_DEVICES:
+        log.info(f"Cleared {len(MOBILE_DEVICES)} mobile device(s) from target list")
 
     # Clear old "WebClients" aggregate device (replaced by individual web client tracking)
     old_web_topic = f"intercom/devices/{UNIQUE_ID}_web/info"
@@ -2178,7 +2184,7 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     client.publish(old_web_status, "offline", retain=True)
     log.info("Cleared old WebClients aggregate device")
 
-    # Clear any stale web client entries for mobile devices (they shouldn't exist)
+    # Clear any stale web client entries for mobile devices
     for mobile in MOBILE_DEVICES:
         safe_id = mobile["name"].replace(' ', '_').replace('/', '_').lower()
         stale_topic = f"intercom/devices/{UNIQUE_ID}_web_{safe_id}/info"
@@ -2655,11 +2661,10 @@ async def websocket_handler(request):
 
                             web_client_ids[ws] = client_id
 
-                            # Only publish as new web client if NOT an existing mobile device
+                            publish_web_client_online(client_id)
                             if is_mobile_device(client_id):
                                 log.info(f"Web client identified as mobile device: {client_id}")
                             else:
-                                publish_web_client_online(client_id)
                                 log.info(f"Web client identified as: {client_id}")
 
                             # Send updated targets list (excluding self)
@@ -2783,12 +2788,11 @@ async def websocket_handler(request):
             web_tx_lock.release()
 
         web_clients.discard(ws)
-        # Clean up client identity and mark offline (only for non-mobile devices)
+        # Clean up client identity and mark offline
         if ws in web_client_ids:
             client_id = web_client_ids[ws]
             del web_client_ids[ws]
-            if not is_mobile_device(client_id):
-                publish_web_client_offline(client_id)
+            publish_web_client_offline(client_id)
         log.info(f"Web PTT client disconnected ({len(web_clients)} remaining)")
 
     return ws
