@@ -47,6 +47,7 @@ static settings_t current_settings = {
     .muted = false,
     .led_enabled = true,
     .agc_enabled = true,
+    .mic_gain = 50,
     .priority = 0,  // PRIORITY_NORMAL — defined in protocol.h
     .dnd_enabled = false,
     .web_admin_password = "",  // Empty = no password (first setup)
@@ -348,6 +349,12 @@ esp_err_t settings_init(void)
     nvs_get_u8(settings_nvs, "agc_en", &agc_en);
     current_settings.agc_enabled = (agc_en == 1);
 
+    // Load mic gain (default: 50 = 2x gain, matches original hardcoded behavior)
+    uint8_t mic_gain_val = 50;
+    nvs_get_u8(settings_nvs, "mic_gain", &mic_gain_val);
+    if (mic_gain_val > 100) mic_gain_val = 50;  // Clamp to valid range
+    current_settings.mic_gain = mic_gain_val;
+
     // Load priority (default: PRIORITY_NORMAL)
     uint8_t priority = 0;  // PRIORITY_NORMAL
     nvs_get_u8(settings_nvs, "priority", &priority);
@@ -370,11 +377,12 @@ esp_err_t settings_init(void)
     load_encrypted_str("ap_pass", current_settings.ap_password,
                        sizeof(current_settings.ap_password));
 
-    ESP_LOGI(TAG, "Settings loaded: room='%s', configured=%d, volume=%d, mqtt=%s (tls=%d), muted=%d, led=%d, web_auth=%s",
+    ESP_LOGI(TAG, "Settings loaded: room='%s', configured=%d, volume=%d, mqtt=%s (tls=%d), muted=%d, led=%d, web_auth=%s, mic_gain=%d",
              current_settings.room_name, current_settings.configured,
              current_settings.volume, current_settings.mqtt_enabled ? "on" : "off",
              current_settings.mqtt_tls_enabled, current_settings.muted, current_settings.led_enabled,
-             strlen(current_settings.web_admin_password) > 0 ? "enabled" : "disabled");
+             strlen(current_settings.web_admin_password) > 0 ? "enabled" : "disabled",
+             current_settings.mic_gain);
 
     return ESP_OK;
 }
@@ -468,6 +476,7 @@ esp_err_t settings_reset(void)
     current_settings.muted = false;
     current_settings.led_enabled = true;
     current_settings.agc_enabled = true;
+    current_settings.mic_gain = 50;
     current_settings.priority = 0;  // PRIORITY_NORMAL
     current_settings.dnd_enabled = false;
     current_settings.web_admin_password[0] = '\0';
@@ -572,6 +581,19 @@ esp_err_t settings_set_agc_enabled(bool enabled)
     return ESP_OK;
 }
 
+esp_err_t settings_set_mic_gain(uint8_t gain)
+{
+    if (gain > 100) gain = 100;
+    current_settings.mic_gain = gain;
+
+    // Mark for deferred save
+    save_pending = true;
+    last_change_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    ESP_LOGI(TAG, "Mic gain set to %d (%.1fx)", gain, (float)gain / 25.0f);
+
+    return ESP_OK;
+}
+
 esp_err_t settings_set_priority(uint8_t priority)
 {
     if (priority > 2) {  // PRIORITY_EMERGENCY = 2
@@ -616,15 +638,16 @@ void settings_save_if_needed(void)
     nvs_set_u8(settings_nvs, "muted", current_settings.muted ? 1 : 0);
     nvs_set_u8(settings_nvs, "led_en", current_settings.led_enabled ? 1 : 0);
     nvs_set_u8(settings_nvs, "agc_en", current_settings.agc_enabled ? 1 : 0);
+    nvs_set_u8(settings_nvs, "mic_gain", current_settings.mic_gain);
     nvs_set_u8(settings_nvs, "priority", current_settings.priority);
     nvs_set_u8(settings_nvs, "dnd_en", current_settings.dnd_enabled ? 1 : 0);
 
     esp_err_t ret = nvs_commit(settings_nvs);
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Settings saved (volume=%d, muted=%d, led=%d, agc=%d, priority=%d, dnd=%d)",
+        ESP_LOGI(TAG, "Settings saved (volume=%d, muted=%d, led=%d, agc=%d, mic_gain=%d, priority=%d, dnd=%d)",
                  current_settings.volume, current_settings.muted,
                  current_settings.led_enabled, current_settings.agc_enabled,
-                 current_settings.priority, current_settings.dnd_enabled);
+                 current_settings.mic_gain, current_settings.priority, current_settings.dnd_enabled);
     }
 }
 

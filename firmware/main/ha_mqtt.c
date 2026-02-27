@@ -60,6 +60,8 @@ static char target_state_topic[64];
 static char target_cmd_topic[64];
 static char agc_state_topic[64];
 static char agc_cmd_topic[64];
+static char mic_gain_state_topic[64];
+static char mic_gain_cmd_topic[64];
 static char priority_state_topic[64];
 static char priority_cmd_topic[64];
 static char dnd_state_topic[64];
@@ -302,6 +304,48 @@ static void publish_agc_discovery(void)
 }
 
 /**
+ * Publish discovery config for mic gain number.
+ */
+static void publish_mic_gain_discovery(void)
+{
+    const settings_t *cfg = settings_get();
+    char discovery_topic[128];
+    snprintf(discovery_topic, sizeof(discovery_topic),
+             "homeassistant/number/%s_mic_gain/config", unique_id);
+
+    cJSON *root = cJSON_CreateObject();
+
+    char name[64];
+    snprintf(name, sizeof(name), "%s Mic Sensitivity", cfg->room_name);
+    cJSON_AddStringToObject(root, "name", name);
+
+    char uid[48];
+    snprintf(uid, sizeof(uid), "%s_mic_gain", unique_id);
+    cJSON_AddStringToObject(root, "unique_id", uid);
+    char entity_id[64];
+    snprintf(entity_id, sizeof(entity_id), "number.%s", uid);
+    cJSON_AddStringToObject(root, "default_entity_id", entity_id);
+
+    cJSON_AddStringToObject(root, "state_topic", mic_gain_state_topic);
+    cJSON_AddStringToObject(root, "command_topic", mic_gain_cmd_topic);
+    cJSON_AddStringToObject(root, "availability_topic", availability_topic);
+    cJSON_AddNumberToObject(root, "min", 0);
+    cJSON_AddNumberToObject(root, "max", 100);
+    cJSON_AddNumberToObject(root, "step", 5);
+    cJSON_AddStringToObject(root, "unit_of_measurement", "%");
+    cJSON_AddStringToObject(root, "icon", "mdi:microphone-settings");
+    cJSON_AddStringToObject(root, "mode", "slider");
+    cJSON_AddItemToObject(root, "device", create_device_info());
+
+    char *payload = cJSON_PrintUnformatted(root);
+    if (payload) {
+        esp_mqtt_client_publish(mqtt_client, discovery_topic, payload, 0, 1, true);
+        free(payload);
+    }
+    cJSON_Delete(root);
+}
+
+/**
  * Publish current AGC state.
  */
 static void publish_agc(void)
@@ -311,6 +355,18 @@ static void publish_agc(void)
     const settings_t *cfg = settings_get();
     const char *state = cfg->agc_enabled ? "ON" : "OFF";
     esp_mqtt_client_publish(mqtt_client, agc_state_topic, state, 0, 0, true);
+}
+
+/**
+ * Publish current mic gain.
+ */
+static void publish_mic_gain(void)
+{
+    if (!mqtt_connected) return;
+
+    char val[8];
+    snprintf(val, sizeof(val), "%d", settings_get()->mic_gain);
+    esp_mqtt_client_publish(mqtt_client, mic_gain_state_topic, val, 0, 0, true);
 }
 
 /**
@@ -448,10 +504,11 @@ static void publish_discovery(void)
     publish_mute_discovery();
     publish_led_discovery();
     publish_agc_discovery();
+    publish_mic_gain_discovery();
     publish_target_discovery();
     publish_priority_discovery();
     publish_dnd_discovery();
-    ESP_LOGI(TAG, "Published HA discovery (sensor, volume, mute, led, agc, target, priority, dnd)");
+    ESP_LOGI(TAG, "Published HA discovery (sensor, volume, mute, led, agc, mic_gain, target, priority, dnd)");
 }
 
 /**
@@ -523,6 +580,7 @@ static void publish_all_states(void)
     publish_mute();
     publish_led();
     publish_agc();
+    publish_mic_gain();
     publish_target();
     publish_priority();
     publish_dnd();
@@ -874,6 +932,15 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
             user_callback(HA_CMD_AGC, enabled ? 1 : 0);
         }
     }
+    // Mic gain command
+    else if (strcmp(topic, mic_gain_cmd_topic) == 0) {
+        int gain = atoi(data);
+        if (gain >= 0 && gain <= 100) {
+            settings_set_mic_gain((uint8_t)gain);
+            publish_mic_gain();
+            ESP_LOGI(TAG, "[MQTT] Mic gain set to %d", gain);
+        }
+    }
     // Priority command ("Normal", "High", "Emergency")
     else if (strcmp(topic, priority_cmd_topic) == 0) {
         uint8_t priority;
@@ -999,6 +1066,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", target_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, agc_cmd_topic, 0);
             ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", agc_cmd_topic);
+            esp_mqtt_client_subscribe(mqtt_client, mic_gain_cmd_topic, 0);
+            ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", mic_gain_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, priority_cmd_topic, 0);
             ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", priority_cmd_topic);
             esp_mqtt_client_subscribe(mqtt_client, dnd_cmd_topic, 0);
@@ -1013,7 +1082,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             // Subscribe to call notifications
             esp_mqtt_client_subscribe(mqtt_client, call_topic, 0);
             ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", call_topic);
-            ESP_LOGI(TAG, "Subscribed to all %d topics", 10);
+            ESP_LOGI(TAG, "Subscribed to all %d topics", 11);
 
             // Publish online AFTER subscribes so HA sees us as available
             // only once we're ready to receive commands
@@ -1070,6 +1139,8 @@ esp_err_t ha_mqtt_init(const uint8_t *device_id)
     snprintf(target_cmd_topic, sizeof(target_cmd_topic), "%s/target/set", base_topic);
     snprintf(agc_state_topic, sizeof(agc_state_topic), "%s/agc", base_topic);
     snprintf(agc_cmd_topic, sizeof(agc_cmd_topic), "%s/agc/set", base_topic);
+    snprintf(mic_gain_state_topic, sizeof(mic_gain_state_topic), "%s/mic_gain", base_topic);
+    snprintf(mic_gain_cmd_topic, sizeof(mic_gain_cmd_topic), "%s/mic_gain/set", base_topic);
     snprintf(priority_state_topic, sizeof(priority_state_topic), "%s/priority", base_topic);
     snprintf(priority_cmd_topic, sizeof(priority_cmd_topic), "%s/priority/set", base_topic);
     snprintf(dnd_state_topic, sizeof(dnd_state_topic), "%s/dnd", base_topic);

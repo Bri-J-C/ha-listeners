@@ -40,6 +40,7 @@ typedef struct {
     bool led_enabled;
     // AGC settings
     bool agc_enabled;
+    uint8_t mic_gain;     // Mic sensitivity 0-100, default 50 (50 = 2x, matches original gain)
     // Priority and DND
     uint8_t priority;     // TX priority: PRIORITY_NORMAL / HIGH / EMERGENCY
     bool dnd_enabled;     // Do Not Disturb: only EMERGENCY audio plays
@@ -108,6 +109,11 @@ esp_err_t settings_set_led_enabled(bool enabled);
  * Set AGC enabled state and save to NVS.
  */
 esp_err_t settings_set_agc_enabled(bool enabled);
+
+/**
+ * Set mic gain (0-100) and save to NVS.
+ */
+esp_err_t settings_set_mic_gain(uint8_t gain);
 
 /**
  * Set TX priority (PRIORITY_NORMAL / PRIORITY_HIGH / PRIORITY_EMERGENCY).

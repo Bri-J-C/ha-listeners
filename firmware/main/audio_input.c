@@ -6,6 +6,7 @@
  */
 
 #include "audio_input.h"
+#include "settings.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -155,13 +156,14 @@ int audio_input_read(int16_t *buffer, size_t samples, uint32_t timeout_ms)
 
     size_t samples_read = bytes_read / sizeof(int32_t);
 
-    // Convert 32-bit to 16-bit with gain boost
+    // Convert 32-bit to 16-bit with configurable gain
     // INMP441 outputs 24-bit data left-justified in 32-bit word
-    // Optimized conversion: shift right 12 bits, apply 2x gain, clamp
+    // Mic gain: 0-100 scale. At 50 (default) = 2x gain = original behavior.
+    // Dividing by 25 maps: 0→0x, 25→1x, 50→2x, 75→3x, 100→4x
+    const int gain = settings_get()->mic_gain;
     for (size_t i = 0; i < samples_read; i++) {
-        int32_t sample = raw_buffer[i] >> 12;  // Less shift = more signal
-        // Apply 2x gain and clamp to 16-bit range
-        sample = sample * 2;
+        int32_t sample = raw_buffer[i] >> 12;
+        sample = sample * gain / 25;
         if (sample > 32767) sample = 32767;
         if (sample < -32768) sample = -32768;
         buffer[i] = (int16_t)sample;

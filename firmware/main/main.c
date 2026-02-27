@@ -238,10 +238,29 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
         incoming_priority = 0;    // Clamp unknown values to PRIORITY_NORMAL
     }
 
+    // Classify silence early — BEFORE channel acquisition.
+    // Opus encodes silence very small (~2-5 bytes at 32kbps VBR); real voice
+    // frames are 20+ bytes.  Silence frames (trail-out from TX end) must NOT
+    // acquire the channel because they never set audio_playing, which means
+    // the idle timeout never fires and has_current_sender gets stuck forever,
+    // blocking all subsequent RX from any sender.
+    size_t opus_len = total_len - HEADER_LENGTH;
+    if (opus_len == 0 || opus_len > MAX_PACKET_SIZE - HEADER_LENGTH) {
+        ESP_LOGW(TAG, "RX packet invalid opus_len=%u (total=%u)", (unsigned)opus_len, (unsigned)total_len);
+        return;
+    }
+    bool is_silence_frame = (opus_len < 10);
+
+    // Silence from unknown sender: don't acquire channel
+    if (is_silence_frame && !has_current_sender) return;
+
     // First-to-talk with priority-based preemption
     if (has_current_sender) {
         bool same_sender = (memcmp(packet->device_id, current_sender, DEVICE_ID_LENGTH) == 0);
         if (!same_sender) {
+            // Silence from a different sender: don't preempt, don't accept
+            if (is_silence_frame) return;
+
             // Different sender — check if incoming priority allows preemption
             if (incoming_priority > current_rx_priority) {
                 // Higher priority preempts the current sender
@@ -288,23 +307,6 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
         button_set_led_state(LED_STATE_BUSY);  // Orange LED for emergency
         ESP_LOGW(TAG, "EMERGENCY audio incoming - forced unmute + max volume");
     }
-
-    size_t opus_len = total_len - HEADER_LENGTH;
-    if (opus_len == 0 || opus_len > MAX_PACKET_SIZE - HEADER_LENGTH) {
-        ESP_LOGW(TAG, "RX packet invalid opus_len=%u (total=%u)", (unsigned)opus_len, (unsigned)total_len);
-        return;
-    }
-
-    // Silence frames (trail-out from TX end) should not acquire the channel
-    // or trigger RECEIVING state. Opus encodes silence very small (~2-5 bytes
-    // at 32kbps VBR); real voice frames are 20+ bytes.
-    bool is_silence_frame = (opus_len < 10);
-
-    // Silence from unknown sender: don't acquire channel
-    if (is_silence_frame && !has_current_sender) return;
-    // Silence from a different sender: don't accept
-    if (is_silence_frame && has_current_sender &&
-        memcmp(packet->device_id, current_sender, DEVICE_ID_LENGTH) != 0) return;
 
     // Update timestamp FIRST — before setting audio_playing — to prevent the
     // main-loop idle timeout from seeing audio_playing=true with a stale timestamp
@@ -1232,6 +1234,24 @@ void app_main(void)
                 display_set_state(DISPLAY_STATE_IDLE);
                 ha_mqtt_set_state(HA_STATE_IDLE);
                 ESP_LOGI(TAG, "RX audio stopped, channel released");
+            }
+        }
+
+        // Clear stale sender when audio never started playing.
+        // This catches the edge case where silence-only trail-out frames
+        // acquired the channel (has_current_sender=true) but never set
+        // audio_playing.  Without this, the device becomes permanently deaf
+        // until a PTT press clears the stale sender.
+        if (has_current_sender && !audio_playing && !transmitting) {
+            uint32_t now = xTaskGetTickCount();
+            uint32_t idle_ms = (now - last_audio_rx_time) * portTICK_PERIOD_MS;
+            if (idle_ms > SENDER_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "Stale sender cleared: %02x%02x%02x%02x idle %lums (no audio_playing)",
+                         current_sender[0], current_sender[1],
+                         current_sender[2], current_sender[3],
+                         (unsigned long)idle_ms);
+                has_current_sender = false;
+                current_rx_priority = 0;
             }
         }
 
