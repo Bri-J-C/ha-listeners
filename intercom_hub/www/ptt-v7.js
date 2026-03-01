@@ -96,6 +96,8 @@ class IntercomPTT {
         this.deviceNameInput = document.getElementById('deviceNameInput');
         this.prioritySelect = document.getElementById('prioritySelect');
         this.dndToggle = document.getElementById('dndToggle');
+        this.chimeSelect = document.getElementById('chimeSelect');
+        this.chimeUpload = document.getElementById('chimeUpload');
 
         // Pre-fill device name input from localStorage
         const savedName = localStorage.getItem('intercom_custom_name');
@@ -139,6 +141,16 @@ class IntercomPTT {
         // DND toggle
         if (this.dndToggle) {
             this.dndToggle.addEventListener('change', () => this.onDndChange());
+        }
+
+        // Chime selection
+        if (this.chimeSelect) {
+            this.chimeSelect.addEventListener('change', () => this.onChimeChange());
+        }
+
+        // Chime upload
+        if (this.chimeUpload) {
+            this.chimeUpload.addEventListener('change', (e) => this.uploadChime(e));
         }
 
         // Keyboard support (spacebar)
@@ -485,6 +497,24 @@ class IntercomPTT {
                 }
                 break;
 
+            case 'chimes':
+                console.log('[WS] rx: type=%s options=%s current=%s', msg.type,
+                    msg.options ? msg.options.join(',') : '(none)', msg.current || '?');
+                // Update chime dropdown
+                if (this.chimeSelect && msg.options) {
+                    this.chimeSelect.innerHTML = '';
+                    msg.options.forEach(name => {
+                        const option = document.createElement('option');
+                        option.value = name;
+                        option.textContent = name;
+                        this.chimeSelect.appendChild(option);
+                    });
+                    if (msg.current) {
+                        this.chimeSelect.value = msg.current;
+                    }
+                }
+                break;
+
             case 'recent_call':
                 console.log('[WS] rx: type=%s caller=%s', msg.type, msg.caller || '?');
                 // --- QA Logging: incoming call notification ---
@@ -766,6 +796,54 @@ class IntercomPTT {
         console.log('DND', this.dndEnabled ? 'enabled' : 'disabled');
         // --- QA Logging: DND toggle ---
         console.log('[STATE] dnd=%s', this.dndEnabled ? 'enabled' : 'disabled');
+    }
+
+    onChimeChange() {
+        if (this.websocket && this.websocket.readyState === WebSocket.OPEN && this.chimeSelect) {
+            const chime = this.chimeSelect.value;
+            const setChimeMsg = { type: 'set_chime', chime: chime };
+            this.websocket.send(JSON.stringify(setChimeMsg));
+            console.log('[WS] tx: type=%s chime=%s', setChimeMsg.type, setChimeMsg.chime);
+        }
+    }
+
+    async uploadChime(event) {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const uploadBtn = this.chimeUpload?.parentElement;
+        if (uploadBtn) uploadBtn.classList.add('uploading');
+
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            // Build upload URL relative to current page
+            const basePath = window.location.pathname.replace(/\/$/, '');
+            const url = `${window.location.origin}${basePath}/api/chimes/upload`;
+
+            const response = await fetch(url, { method: 'POST', body: formData });
+            const result = await response.json();
+
+            if (!response.ok) {
+                this.showError(result.error || 'Upload failed');
+                console.error('[CHIME] upload failed:', result.error);
+            } else {
+                console.log('[CHIME] uploaded: name=%s frames=%d duration=%s',
+                    result.name, result.frames, result.duration);
+                // Request fresh chime list from hub
+                if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+                    this.websocket.send(JSON.stringify({ type: 'get_state' }));
+                }
+            }
+        } catch (err) {
+            this.showError('Upload failed: ' + err.message);
+            console.error('[CHIME] upload error:', err);
+        } finally {
+            if (uploadBtn) uploadBtn.classList.remove('uploading');
+            // Reset file input so the same file can be re-selected
+            event.target.value = '';
+        }
     }
 
     suspend() {

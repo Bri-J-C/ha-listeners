@@ -2377,6 +2377,16 @@ def on_mqtt_message(client, userdata, msg):
             current_chime = new_chime
             publish_chime()
             log.info(f"Chime set to: {current_chime}")
+            # Notify web clients of chime change from MQTT
+            if web_event_loop:
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_to_web_clients({
+                        'type': 'chimes',
+                        'options': get_chime_options(),
+                        'current': current_chime
+                    }),
+                    web_event_loop
+                )
         elif loaded_chimes:
             # Requested chime not available — use first loaded chime
             current_chime = next(iter(loaded_chimes))
@@ -2592,6 +2602,11 @@ async def websocket_handler(request):
         'type': 'targets',
         'rooms': sorted(set(d['room'] for d in discovered_devices.values() ))
     })
+    await ws.send_json({
+        'type': 'chimes',
+        'options': get_chime_options(),
+        'current': current_chime
+    })
 
     # Send recent call info if within timeout (for auto-select)
     if recent_call["caller"] and time.time() - recent_call["timestamp"] < RECENT_CALL_TIMEOUT:
@@ -2759,6 +2774,12 @@ async def websocket_handler(request):
                             'type': 'targets',
                             'rooms': sorted(set(d['room'] for d in discovered_devices.values() if d['room'] != my_id))
                         })
+                        # Send chimes list
+                        await ws.send_json({
+                            'type': 'chimes',
+                            'options': get_chime_options(),
+                            'current': current_chime
+                        })
 
                     elif msg_type == 'set_target':
                         # Just acknowledge - actual target used at PTT start
@@ -2874,6 +2895,12 @@ async def websocket_handler(request):
                             current_chime = new_chime
                             publish_chime()
                             log.info(f"Chime set via web: {current_chime}")
+                            # Notify all web clients of the change
+                            await broadcast_to_web_clients({
+                                'type': 'chimes',
+                                'options': get_chime_options(),
+                                'current': current_chime
+                            })
                         else:
                             log.warning(f"Chime '{new_chime}' not found")
 
@@ -3086,6 +3113,17 @@ async def chimes_upload_handler(request):
 
     # Update HA select entity with new option
     publish_chime_select()
+
+    # Notify all web clients of updated chime list
+    if web_event_loop:
+        asyncio.run_coroutine_threadsafe(
+            broadcast_to_web_clients({
+                'type': 'chimes',
+                'options': get_chime_options(),
+                'current': current_chime
+            }),
+            web_event_loop
+        )
 
     duration = len(frames) * FRAME_DURATION_MS / 1000.0
     return web.json_response({

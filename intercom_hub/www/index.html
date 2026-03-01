@@ -293,6 +293,32 @@
             background: var(--purple);
         }
 
+        .upload-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            border: 1px solid var(--border);
+            background: var(--bg-card);
+            color: var(--text-dim);
+            cursor: pointer;
+            flex-shrink: 0;
+            transition: border-color 0.2s ease, color 0.2s ease;
+        }
+
+        .upload-btn:hover {
+            border-color: var(--cyan);
+            color: var(--text);
+        }
+
+        .upload-btn.uploading {
+            border-color: var(--warning);
+            color: var(--warning);
+            animation: pulse 1s ease-in-out infinite;
+        }
+
         .ptt-container {
             display: flex;
             justify-content: center;
@@ -579,6 +605,17 @@
                     <text class="call-text" x="256" y="310" text-anchor="middle" fill="url(#callGradientDim)" font-size="160" font-weight="700" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">Call</text>
                 </svg>
             </button>
+        </div>
+
+        <!-- Chime selector + upload -->
+        <div class="target-row">
+            <select id="chimeSelect" class="target-select" style="min-width: 0;">
+                <option value="doorbell">doorbell</option>
+            </select>
+            <label class="upload-btn" title="Upload WAV chime">
+                <input type="file" id="chimeUpload" accept=".wav" hidden>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            </label>
         </div>
 
         <!-- Priority selector + DND toggle -->
