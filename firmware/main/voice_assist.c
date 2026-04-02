@@ -377,12 +377,9 @@ esp_err_t voice_assist_init(void)
     }
 
 #ifdef CONFIG_SR_WN_WN9_ALEXA
-    // Initialize ESP-SR model partition
-    // TODO: Fix model partition format — esp_srmodel_init() crashes with current
-    // SPIFFS image. Need to debug SPIFFS format parameters or use packed binary
-    // format with srmodel_load(). For now, skip model loading to prevent boot loop.
-    ESP_LOGW(TAG, "WakeNet model loading disabled (model partition format TBD)");
-    srmodel_list_t *models = NULL;  // esp_srmodel_init("model");
+    // Initialize ESP-SR models from flash partition (mmap'd packed binary format)
+    ESP_LOGI(TAG, "Loading SR models from 'model' partition...");
+    srmodel_list_t *models = esp_srmodel_init("model");
     if (models && models->num > 0) {
         ESP_LOGI(TAG, "SR models loaded: %d models available", models->num);
 
