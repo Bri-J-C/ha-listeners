@@ -24,6 +24,7 @@
 
 #include <string.h>
 #include <math.h>
+#include <arpa/inet.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -42,15 +43,13 @@
 #include "ha_mqtt.h"
 #include "wake_chime_data.h"
 
-// WakeNet headers — only included when CONFIG_USE_WAKENET is defined in sdkconfig.
+// WakeNet headers — only included when CONFIG_SR_WN_WN9_ALEXA is defined in sdkconfig.
 // The guard lets this file compile cleanly before Task 7 (sdkconfig update).
-#ifdef CONFIG_USE_WAKENET
+#ifdef CONFIG_SR_WN_WN9_ALEXA
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
-// WakeNet9 quantised model — name resolved at link time from ESP-SR component
-extern const esp_wn_iface_t esp_sr_wakenet9_quantized;
-#define WAKENET_IFACE esp_sr_wakenet9_quantized
-extern const char *wakenet_model_name;
+// WakeNet model name for Alexa — matches the ESP-SR Kconfig selection
+#define WAKENET_MODEL_NAME "wn9_alexa"
 #endif
 
 static const char *TAG = "voice_assist";
@@ -95,8 +94,9 @@ static uint8_t *s_packet_buf = NULL;      // MAX_PACKET_SIZE bytes, PSRAM
 
 // ─── WakeNet handle ───────────────────────────────────────────────────────
 
-#ifdef CONFIG_USE_WAKENET
-static esp_wn_handle_t *s_wn_handle = NULL;
+#ifdef CONFIG_SR_WN_WN9_ALEXA
+static const esp_wn_iface_t *s_wn_iface = NULL;
+static model_iface_data_t *s_wn_handle = NULL;
 #endif
 
 // ─── Externs from main.c ─────────────────────────────────────────────────
@@ -211,7 +211,7 @@ static void voice_assist_task(void *arg)
 
         // ── IDLE: wake word detection ─────────────────────────────────────
         case VA_STATE_IDLE: {
-#ifdef CONFIG_USE_WAKENET
+#ifdef CONFIG_SR_WN_WN9_ALEXA
             if (!s_wn_handle) {
                 // WakeNet unavailable — just yield
                 vTaskDelay(pdMS_TO_TICKS(20));
@@ -226,8 +226,8 @@ static void voice_assist_task(void *arg)
             }
 
             // Feed to WakeNet
-            esp_wn_state_t wn_state = WAKENET_IFACE.detect(s_wn_handle, s_pcm_buf);
-            if (wn_state == ESP_WN_STATE_DETECTED) {
+            wakenet_state_t wn_state = s_wn_iface->detect(s_wn_handle, s_pcm_buf);
+            if (wn_state == WAKENET_DETECTED) {
                 ESP_LOGI(TAG, "Wake word detected!");
 
                 // Transition to active — set flag before chime so PTT can cancel
@@ -369,22 +369,29 @@ esp_err_t voice_assist_init(void)
         heap_caps_free(s_pcm_buf);
         heap_caps_free(s_opus_buf);
         heap_caps_free(s_packet_buf);
-        s_pcm_buf = s_opus_buf = s_packet_buf = NULL;
+        s_pcm_buf = NULL;
+        s_opus_buf = NULL;
+        s_packet_buf = NULL;
         return ESP_ERR_NO_MEM;
     }
 
-#ifdef CONFIG_USE_WAKENET
-    // Initialise WakeNet model
-    ESP_LOGI(TAG, "Loading WakeNet model: %s", wakenet_model_name);
-    s_wn_handle = WAKENET_IFACE.create(wakenet_model_name, DET_MODE_90);
-    if (!s_wn_handle) {
-        ESP_LOGE(TAG, "WakeNet create failed");
-        // Non-fatal: task runs but stays in DISABLED/IDLE silently
+#ifdef CONFIG_SR_WN_WN9_ALEXA
+    // Get WakeNet interface and create model
+    ESP_LOGI(TAG, "Loading WakeNet model: %s", WAKENET_MODEL_NAME);
+    s_wn_iface = esp_wn_handle_from_name(WAKENET_MODEL_NAME);
+    if (!s_wn_iface) {
+        ESP_LOGE(TAG, "WakeNet model '%s' not found", WAKENET_MODEL_NAME);
     } else {
-        ESP_LOGI(TAG, "WakeNet model loaded OK");
+        s_wn_handle = s_wn_iface->create(WAKENET_MODEL_NAME, DET_MODE_90);
+        if (!s_wn_handle) {
+            ESP_LOGE(TAG, "WakeNet create failed");
+        } else {
+            ESP_LOGI(TAG, "WakeNet model loaded OK (chunk=%d samples)",
+                     s_wn_iface->get_samp_chunksize(s_wn_handle));
+        }
     }
 #else
-    ESP_LOGW(TAG, "WakeNet disabled (CONFIG_USE_WAKENET not set) — "
+    ESP_LOGW(TAG, "WakeNet disabled (CONFIG_SR_WN_WN9_ALEXA not set) — "
                   "wake word detection inactive until Task 7 sdkconfig applied");
 #endif
 
