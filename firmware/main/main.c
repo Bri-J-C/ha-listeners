@@ -68,13 +68,14 @@ static bool tx_task_running = false;
 static TaskHandle_t play_task_handle = NULL;
 static bool play_task_running = false;
 
-// TX task stack in PSRAM (saves ~32KB of scarce internal RAM).
-// CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y permits this.
-static EXT_RAM_BSS_ATTR StackType_t tx_task_stack[32768 / sizeof(StackType_t)];
+// Task stacks allocated dynamically from PSRAM heap (not EXT_RAM_BSS_ATTR).
+// EXT_RAM_BSS_ATTR uses fixed .ext_ram.bss addresses that conflict with
+// esp_partition_mmap() used by WakeNet model loading.
+#define TX_TASK_STACK_SIZE   32768
+#define PLAY_TASK_STACK_SIZE 16384
+static StackType_t *tx_task_stack = NULL;
 static StaticTask_t tx_task_tcb;
-
-// Audio play task stack in PSRAM (decode + I2S write)
-static EXT_RAM_BSS_ATTR StackType_t play_task_stack[16384 / sizeof(StackType_t)];
+static StackType_t *play_task_stack = NULL;
 static StaticTask_t play_task_tcb;
 
 // Audio playback state
@@ -1088,13 +1089,7 @@ void app_main(void)
         ESP_LOGW(TAG, "AEC unavailable (%s) — raw mic audio", esp_err_to_name(aec_ret));
     }
 
-    // Initialize voice assistant (WakeNet)
-    esp_err_t va_ret = voice_assist_init();
-    if (va_ret == ESP_OK) {
-        ESP_LOGI(TAG, "Voice assistant initialized");
-    } else {
-        ESP_LOGW(TAG, "Voice assistant unavailable (%s)", esp_err_to_name(va_ret));
-    }
+    // Voice assistant init deferred until after RX queue/tasks (PSRAM allocation order matters)
 
     // Apply saved settings
     audio_output_set_volume(cfg->volume);
@@ -1165,9 +1160,6 @@ void app_main(void)
 
         // Start MQTT for Home Assistant integration
         ha_mqtt_start();
-
-        // Start voice assistant listening
-        voice_assist_start();
     }
 
     // Create RX audio queue in PSRAM (internal RAM allocation fragments heap,
@@ -1182,9 +1174,15 @@ void app_main(void)
         ESP_LOGE(TAG, "FATAL: Failed to create RX audio queue");
     }
 
+    // Allocate task stacks from PSRAM heap (not static BSS — avoids mmap conflict with WakeNet)
+    play_task_stack = heap_caps_malloc(PLAY_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM);
+    if (!play_task_stack) {
+        ESP_LOGE(TAG, "FATAL: Failed to allocate play task stack in PSRAM");
+    }
+
     play_task_running = true;
     play_task_handle = xTaskCreateStatic(audio_play_task, "audio_play",
-        sizeof(play_task_stack), NULL, 4,
+        PLAY_TASK_STACK_SIZE / sizeof(StackType_t), NULL, 4,
         play_task_stack, &play_task_tcb);
     if (play_task_handle == NULL) {
         ESP_LOGE(TAG, "FATAL: Failed to create audio play task");
@@ -1207,12 +1205,30 @@ void app_main(void)
 
     // Start audio TX task - stack in PSRAM to save ~32KB of internal RAM.
     // Encoder is in internal RAM (timing-critical); stack can be in PSRAM.
+    tx_task_stack = heap_caps_malloc(TX_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM);
+    if (!tx_task_stack) {
+        ESP_LOGE(TAG, "FATAL: Failed to allocate TX task stack in PSRAM");
+    }
+
     tx_task_running = true;
-    tx_task_handle = xTaskCreateStatic(audio_tx_task, "audio_tx", sizeof(tx_task_stack),
+    tx_task_handle = xTaskCreateStatic(audio_tx_task, "audio_tx",
+                                       TX_TASK_STACK_SIZE / sizeof(StackType_t),
                                        NULL, 5, tx_task_stack, &tx_task_tcb);
     if (tx_task_handle == NULL) {
         ESP_LOGE(TAG, "FATAL: Failed to create audio TX task - TX disabled");
         tx_task_running = false;
+    }
+
+    // Initialize voice assistant AFTER all intercom PSRAM allocations (RX queue, task stacks,
+    // Opus codec). WakeNet mmap consumes PSRAM address space and must not starve intercom buffers.
+    esp_err_t va_ret = voice_assist_init();
+    if (va_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Voice assistant initialized");
+        if (network_is_connected()) {
+            voice_assist_start();
+        }
+    } else {
+        ESP_LOGW(TAG, "Voice assistant unavailable (%s)", esp_err_to_name(va_ret));
     }
 
     ESP_LOGI(TAG, "Room: %s | Volume: %d%%", cfg->room_name, cfg->volume);

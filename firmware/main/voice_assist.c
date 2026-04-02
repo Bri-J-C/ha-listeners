@@ -81,7 +81,8 @@ static volatile bool s_cancel = false;    // PTT cancel signal
 // ─── Task stack ───────────────────────────────────────────────────────────
 
 // 16KB stack in PSRAM (mirrors pattern from main.c TX/play tasks)
-static EXT_RAM_BSS_ATTR StackType_t s_va_task_stack[49152 / sizeof(StackType_t)];
+#define VA_TASK_STACK_SIZE 49152
+static StackType_t *s_va_task_stack = NULL;
 static StaticTask_t s_va_task_tcb;
 static TaskHandle_t s_va_task_handle = NULL;
 
@@ -430,10 +431,17 @@ esp_err_t voice_assist_init(void)
     s_running = true;
     s_cancel  = false;
 
+    // Allocate task stack from PSRAM heap (not EXT_RAM_BSS_ATTR — avoids mmap conflict)
+    s_va_task_stack = heap_caps_malloc(VA_TASK_STACK_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_va_task_stack) {
+        ESP_LOGE(TAG, "Failed to allocate VA task stack in PSRAM");
+        return ESP_ERR_NO_MEM;
+    }
+
     s_va_task_handle = xTaskCreateStatic(
         voice_assist_task,
         "va_task",
-        sizeof(s_va_task_stack) / sizeof(StackType_t),
+        VA_TASK_STACK_SIZE / sizeof(StackType_t),
         NULL,
         3,              // Priority 3: below TX(5) and RX(4)
         s_va_task_stack,
