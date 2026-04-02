@@ -81,7 +81,7 @@ static volatile bool s_cancel = false;    // PTT cancel signal
 // ─── Task stack ───────────────────────────────────────────────────────────
 
 // 16KB stack in PSRAM (mirrors pattern from main.c TX/play tasks)
-static EXT_RAM_BSS_ATTR StackType_t s_va_task_stack[32768 / sizeof(StackType_t)];
+static EXT_RAM_BSS_ATTR StackType_t s_va_task_stack[49152 / sizeof(StackType_t)];
 static StaticTask_t s_va_task_tcb;
 static TaskHandle_t s_va_task_handle = NULL;
 
@@ -238,10 +238,12 @@ static void voice_assist_task(void *arg)
                 session_start_tick = xTaskGetTickCount();
                 silence_start_tick = 0;  // not in silence yet
 
-                // Visual + audio feedback
+                // Visual feedback
                 button_set_led_state(LED_STATE_VOICE_ASSIST);
                 display_set_state(DISPLAY_STATE_VOICE_ASSIST);
-                play_wake_chime();
+                // TODO: play_wake_chime() crashes (LoadProhibited) when called
+                // from va_task on Core 1 — I2S output not safe cross-core.
+                // Need to defer chime to audio_play_task or main loop.
 
                 // Reset encoder for clean session
                 codec_reset_encoder();
