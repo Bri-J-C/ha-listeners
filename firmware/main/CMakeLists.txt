@@ -31,6 +31,7 @@ idf_component_register(
         mqtt
         mdns
         espressif__esp-sr
+        spiffs
 )
 
 # Add libopus as a managed component

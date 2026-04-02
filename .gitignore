@@ -1,33 +1,117 @@
-# Build artifacts
+# ===== Build Artifacts =====
 firmware/.pio/
 firmware/build/
 firmware/managed_components/
 firmware/sdkconfig
 firmware/sdkconfig.old
 firmware/dependencies.lock
+*.o
+*.a
+*.elf
+*.bin
+*.map
+*.hex
 
-# Python
+# ===== Python =====
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
 venv/
 .venv/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
 
-# IDE
+# ===== IDE / Editor =====
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+.classpath
 
-# Secrets - don't commit credentials
+# ===== Secrets & Credentials =====
+# NEVER commit these
 *.env
+.env.*
 secrets.yaml
+secrets.json
+credentials.json
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+id_rsa*
+id_ed25519*
+*.keystore
+token.json
+oauth*.json
 
-# OS
+# WiFi / MQTT / API credentials
+wifi_credentials*
+mqtt_credentials*
+api_keys*
+
+# Home Assistant tokens
+.ha_token
+supervisor_token*
+
+# NVS encryption keys
+nvs_keys/
+encryption_keys/
+
+# ===== OS Files =====
 .DS_Store
+.DS_Store?
+._*
 Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
 
-# Sensitive / private files
+# ===== Project-specific Private Files =====
 CLAUDE.md
 .claude/
 automations/
 tools/
 tests/
 TESTING.md
+
+# ===== Logs & Debug =====
+*.log
+logs/
+crash_dumps/
+core.*
+
+# ===== Wake Word / ML Models (large binaries) =====
+# Track model configs, not the binary weights
+*.tflite
+*.onnx
+*.pb
+!models/README.md
+
+# ===== Audio Test Files =====
+*.wav
+*.mp3
+*.opus
+*.raw
+*.pcm
+!audio/README.md
+
+# ===== Temporary & Cache =====
+*.tmp
+*.temp
+*.cache
+.cache/
+tmp/
+temp/

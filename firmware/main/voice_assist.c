@@ -48,6 +48,7 @@
 #ifdef CONFIG_SR_WN_WN9_ALEXA
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
+#include "model_path.h"
 // WakeNet model name for Alexa — matches the ESP-SR Kconfig selection
 #define WAKENET_MODEL_NAME "wn9_alexa"
 #endif
@@ -376,19 +377,35 @@ esp_err_t voice_assist_init(void)
     }
 
 #ifdef CONFIG_SR_WN_WN9_ALEXA
-    // Get WakeNet interface and create model
-    ESP_LOGI(TAG, "Loading WakeNet model: %s", WAKENET_MODEL_NAME);
-    s_wn_iface = esp_wn_handle_from_name(WAKENET_MODEL_NAME);
-    if (!s_wn_iface) {
-        ESP_LOGE(TAG, "WakeNet model '%s' not found", WAKENET_MODEL_NAME);
-    } else {
-        s_wn_handle = s_wn_iface->create(WAKENET_MODEL_NAME, DET_MODE_90);
-        if (!s_wn_handle) {
-            ESP_LOGE(TAG, "WakeNet create failed");
+    // Initialize ESP-SR model partition
+    // TODO: Fix model partition format — esp_srmodel_init() crashes with current
+    // SPIFFS image. Need to debug SPIFFS format parameters or use packed binary
+    // format with srmodel_load(). For now, skip model loading to prevent boot loop.
+    ESP_LOGW(TAG, "WakeNet model loading disabled (model partition format TBD)");
+    srmodel_list_t *models = NULL;  // esp_srmodel_init("model");
+    if (models && models->num > 0) {
+        ESP_LOGI(TAG, "SR models loaded: %d models available", models->num);
+
+        // Find and create the WakeNet model
+        char *wn_name = esp_srmodel_filter(models, ESP_WN_PREFIX, "alexa");
+        if (!wn_name) {
+            ESP_LOGW(TAG, "WakeNet 'alexa' model not found in partition");
         } else {
-            ESP_LOGI(TAG, "WakeNet model loaded OK (chunk=%d samples)",
-                     s_wn_iface->get_samp_chunksize(s_wn_handle));
+            ESP_LOGI(TAG, "Loading WakeNet model: %s", wn_name);
+            s_wn_iface = esp_wn_handle_from_name(wn_name);
+            if (s_wn_iface) {
+                s_wn_handle = s_wn_iface->create(wn_name, DET_MODE_90);
+                if (s_wn_handle) {
+                    ESP_LOGI(TAG, "WakeNet loaded OK (chunk=%d)",
+                             s_wn_iface->get_samp_chunksize(s_wn_handle));
+                } else {
+                    ESP_LOGE(TAG, "WakeNet create failed");
+                }
+            }
         }
+    } else {
+        ESP_LOGW(TAG, "No SR models found — WakeNet disabled. "
+                      "Flash model partition with: esptool.py write_flash 0x3A0000 srmodels.bin");
     }
 #else
     ESP_LOGW(TAG, "WakeNet disabled (CONFIG_SR_WN_WN9_ALEXA not set) — "
