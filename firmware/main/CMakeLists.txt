@@ -14,6 +14,7 @@ idf_component_register(
         "diagnostics.c"
         "display.c"
         "agc.c"
+        "voice_assist.c"
     INCLUDE_DIRS
         "."
     REQUIRES
@@ -29,6 +30,7 @@ idf_component_register(
         app_update
         mqtt
         mdns
+        esp_sr
 )
 
 # Add libopus as a managed component
