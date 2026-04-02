@@ -81,7 +81,7 @@ static volatile bool s_cancel = false;    // PTT cancel signal
 // ─── Task stack ───────────────────────────────────────────────────────────
 
 // 16KB stack in PSRAM (mirrors pattern from main.c TX/play tasks)
-static EXT_RAM_BSS_ATTR StackType_t s_va_task_stack[16384 / sizeof(StackType_t)];
+static EXT_RAM_BSS_ATTR StackType_t s_va_task_stack[32768 / sizeof(StackType_t)];
 static StaticTask_t s_va_task_tcb;
 static TaskHandle_t s_va_task_handle = NULL;
 
@@ -258,6 +258,11 @@ static void voice_assist_task(void *arg)
 
         // ── ACTIVE: stream audio to hub ───────────────────────────────────
         case VA_STATE_ACTIVE: {
+            // Log first frame of each session
+            if (va_sequence == 0) {
+                ESP_LOGI(TAG, "VA ACTIVE: streaming to %s:%d", settings_get()->mqtt_host, AUDIO_PORT);
+            }
+
             // Check cancel flag (set by PTT press)
             if (s_cancel) {
                 ESP_LOGI(TAG, "VA cancelled by PTT");
@@ -322,8 +327,14 @@ static void voice_assist_task(void *arg)
             // Encode and transmit
             esp_err_t err = send_va_packet(s_pcm_buf, va_sequence++, cfg->mqtt_host);
             if (err != ESP_OK) {
-                ESP_LOGW(TAG, "VA send failed: %d", err);
+                // Log sparingly (every 50th failure)
+                if ((va_sequence % 50) == 1) {
+                    ESP_LOGW(TAG, "VA send failed: %d (seq=%lu)", err, (unsigned long)va_sequence);
+                }
             }
+
+            // Pace to ~50fps (20ms per frame) — yield for watchdog + rate limit
+            vTaskDelay(1);
             break;
         }
 
