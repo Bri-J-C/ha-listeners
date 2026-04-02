@@ -19,6 +19,7 @@ typedef enum {
     HA_STATE_IDLE,
     HA_STATE_TRANSMITTING,
     HA_STATE_RECEIVING,
+    HA_STATE_VOICE_ASSIST,
 } ha_state_t;
 
 // Command types from Home Assistant

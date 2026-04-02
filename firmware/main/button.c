@@ -216,6 +216,10 @@ void button_set_led_state(led_state_t state)
         case LED_STATE_DND:
             set_led_rgb(40, 0, 60);    // Purple/violet when Do Not Disturb active
             break;
+
+        case LED_STATE_VOICE_ASSIST:
+            set_led_rgb(0, 0, 64);  // Blue - voice assistant listening
+            break;
     }
 
     ESP_LOGI(TAG, "LED state: %d", state);

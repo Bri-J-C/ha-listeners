@@ -37,6 +37,7 @@
 #define PRIORITY_NORMAL         0   // Default PTT (first-to-talk collision avoidance)
 #define PRIORITY_HIGH           1   // Override normal transmissions (parent override)
 #define PRIORITY_EMERGENCY      2   // Override everything, force max volume, bypass mute
+#define PRIORITY_VOICE_ASSIST   3   // Voice assistant audio — hub routes to HA pipeline
 
 // Max packet size (header + max opus frame)
 #define MAX_PACKET_SIZE         256
@@ -83,6 +84,7 @@ typedef enum {
     LED_STATE_ERROR,        // Blinking red - error
     LED_STATE_BUSY,         // Solid orange - channel busy (someone else talking)
     LED_STATE_DND,          // Solid purple/violet - Do Not Disturb active
+    LED_STATE_VOICE_ASSIST, // Solid blue - voice assistant listening
 } led_state_t;
 
 // Parameters for the test_tone task spawned by /api/test
