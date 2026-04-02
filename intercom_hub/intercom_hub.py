@@ -146,7 +146,13 @@ def html_escape(text: str) -> str:
 
 
 # Version - single source of truth
-VERSION = "2.5.7"  # Add AudioCaptureBuffer, /api/audio_capture, TX stats in audio_stats
+VERSION = "2.6.0"  # Add voice assistant pipeline via Wyoming
+
+try:
+    from voice_pipeline import VoicePipelineManager
+except ImportError:
+    log.warning("voice_pipeline not available - voice assist disabled")
+    VoicePipelineManager = None
 
 try:
     from aiohttp import web
@@ -185,6 +191,7 @@ PACKET_HEADER_SIZE = 13  # Updated from 12 to include priority byte
 PRIORITY_NORMAL = 0
 PRIORITY_HIGH = 1
 PRIORITY_EMERGENCY = 2
+PRIORITY_VOICE_ASSIST = 3
 
 # Broadcast sync: delay added to multicast packets so all receivers play at the same time
 
@@ -286,6 +293,9 @@ current_audio_sender = None  # The device_id hex string of current transmitter
 
 # Reusable Opus encoder for TTS/media broadcast (lazily initialized)
 tts_encoder = None
+
+# Voice pipeline manager (initialized at startup)
+voice_pipeline: Optional[VoicePipelineManager] = None
 
 
 # =============================================================================
@@ -1086,7 +1096,7 @@ def receive_thread():
             # Old firmware (12-byte header) also handled gracefully
             if len(data) >= PACKET_HEADER_SIZE:
                 incoming_priority = data[12]
-                if incoming_priority > PRIORITY_EMERGENCY:
+                if incoming_priority > PRIORITY_VOICE_ASSIST:
                     incoming_priority = PRIORITY_NORMAL  # Clamp unknown values
                 opus_frame = data[PACKET_HEADER_SIZE:]  # 13-byte header
             else:
@@ -1097,6 +1107,17 @@ def receive_thread():
             audio_rx_stats.record(sender_id_str, sequence, incoming_priority)
             audio_capture.record("rx", sender_id_str, sequence, incoming_priority,
                                 opus_frame, src_ip=addr[0])
+
+            # Route PRIORITY_VOICE_ASSIST to voice pipeline instead of intercoms
+            if incoming_priority == PRIORITY_VOICE_ASSIST:
+                if voice_pipeline and rx_decoder and len(opus_frame) > 0:
+                    try:
+                        pcm = rx_decoder.decode(opus_frame, FRAME_SIZE)
+                        if pcm:
+                            voice_pipeline.feed_audio(sender_id_str, pcm)
+                    except Exception as e:
+                        log.debug(f"Voice assist decode error: {e}")
+                continue  # Don't process as normal intercom audio
 
             # Hub DND check: only EMERGENCY plays through
             if hub_dnd_enabled and incoming_priority < PRIORITY_EMERGENCY:
@@ -2180,6 +2201,15 @@ def publish_dnd():
         mqtt_client.publish(DND_STATE_TOPIC, "ON" if hub_dnd_enabled else "OFF", retain=True)
 
 
+def publish_voice_assist_done(device_mqtt_id: str):
+    """Signal ESP32 that voice assist TTS is complete."""
+    if mqtt_client and mqtt_client.is_connected():
+        topic = f"intercom/{device_mqtt_id}/voice_assist/response"
+        payload = json.dumps({"event": "tts_done"})
+        mqtt_client.publish(topic, payload, qos=1)
+        log.info(f"Voice assist done published to {device_mqtt_id}")
+
+
 def get_target_options():
     """Get list of target options for the select entity."""
     options = ["All Rooms"]
@@ -2265,6 +2295,10 @@ def on_mqtt_connect(client, userdata, flags, reason_code, properties=None):
     # Subscribe to chime select command
     client.subscribe(CHIME_CMD_TOPIC)
     log.info("Subscribed to chime select command topic")
+
+    # Subscribe to voice assist events from ESP32 devices
+    client.subscribe("intercom/+/voice_assist")
+    log.info("Subscribed to voice assist topics")
 
     # Publish discovery
     publish_discovery()
@@ -2503,6 +2537,36 @@ def on_mqtt_message(client, userdata, msg):
         except Exception as e:
             if not isinstance(e, json.JSONDecodeError):
                 log.warning(f"Error processing call message: {e}")
+
+    elif "/voice_assist" in topic and not topic.endswith("/response"):
+        # Handle voice assist events from ESP32 devices
+        # Topic format: intercom/{device_id}/voice_assist
+        try:
+            data = json.loads(payload)
+            event_type = data.get("event", "")
+            room = data.get("room", "unknown")
+            # Extract device ID from topic: intercom/{device_id}/voice_assist
+            parts = topic.split("/")
+            if len(parts) >= 2:
+                device_mqtt_id = parts[1]
+                if event_type == "start" and voice_pipeline:
+                    # Find source IP for this device
+                    source_ip = ""
+                    for dev_info in discovered_devices.values():
+                        if dev_info.get("mqtt_id") == device_mqtt_id:
+                            source_ip = dev_info.get("ip", "")
+                            break
+                    # Also check by matching unique_id key directly
+                    if not source_ip and device_mqtt_id in discovered_devices:
+                        source_ip = discovered_devices[device_mqtt_id].get("ip", "")
+                    voice_pipeline.on_voice_assist_start(device_mqtt_id, room, source_ip)
+                elif event_type == "stop" and voice_pipeline:
+                    voice_pipeline.on_voice_assist_stop(device_mqtt_id)
+                elif event_type == "cancel" and voice_pipeline:
+                    voice_pipeline.on_voice_assist_cancel(device_mqtt_id)
+        except (json.JSONDecodeError, Exception) as e:
+            log.error(f"Voice assist MQTT error: {e}")
+        return
 
     elif topic.startswith("intercom/") and topic.endswith("/state"):
         # ESP32 state update - track target for audio routing
@@ -3359,7 +3423,7 @@ def create_web_app():
 
 async def run_web_server():
     """Run the web server for ingress."""
-    global web_event_loop, web_tx_lock
+    global web_event_loop, web_tx_lock, voice_pipeline
 
     if web is None:
         log.warning("Web server not available (aiohttp not installed)")
@@ -3370,6 +3434,14 @@ async def run_web_server():
 
     # Create async lock for serializing web PTT transmissions
     web_tx_lock = asyncio.Lock()
+
+    # Initialize voice pipeline manager
+    if VoicePipelineManager is not None:
+        voice_pipeline = VoicePipelineManager(
+            send_mqtt_done=publish_voice_assist_done,
+            event_loop=web_event_loop,
+        )
+        log.info("Voice pipeline manager initialized")
 
     app = create_web_app()
     runner = web.AppRunner(app)
