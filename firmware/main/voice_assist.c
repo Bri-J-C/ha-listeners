@@ -61,9 +61,9 @@ static const char *TAG = "voice_assist";
 #define VA_MAX_SESSION_MS       30000  // Hard cap: 30s per session
 #define VA_SILENCE_RMS_THRESH   200    // RMS below this = silence
 
-// WakeNet requires 16ms chunks at 16kHz → 256 samples.
-// Use FRAME_SIZE (320) and let WakeNet's chunking handle it internally.
-#define VA_WAKEWORD_CHUNK       FRAME_SIZE
+// WakeNet chunk size — set at runtime from model's get_samp_chunksize().
+// WakeNet9 Alexa uses 512 samples (32ms at 16kHz).
+static int va_wakeword_chunk = 512;  // Default; updated in voice_assist_init()
 
 // ─── State ────────────────────────────────────────────────────────────────
 
@@ -220,7 +220,7 @@ static void voice_assist_task(void *arg)
             }
 
             // Read one frame from mic
-            int samples = audio_input_read(s_pcm_buf, VA_WAKEWORD_CHUNK, 50);
+            int samples = audio_input_read(s_pcm_buf, va_wakeword_chunk, 50);
             if (samples <= 0) {
                 vTaskDelay(pdMS_TO_TICKS(5));
                 break;
@@ -371,7 +371,9 @@ esp_err_t voice_assist_init(void)
     ESP_LOGI(TAG, "Initialising voice assist module");
 
     // Allocate audio buffers from PSRAM
-    s_pcm_buf    = (int16_t *)heap_caps_malloc(FRAME_SIZE * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    // Allocate for max of FRAME_SIZE (320, Opus encode) and WakeNet chunk (512)
+    size_t pcm_samples = (FRAME_SIZE > 512) ? FRAME_SIZE : 512;
+    s_pcm_buf    = (int16_t *)heap_caps_malloc(pcm_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_opus_buf   = (uint8_t *)heap_caps_malloc(MAX_PACKET_SIZE,               MALLOC_CAP_SPIRAM);
     s_packet_buf = (uint8_t *)heap_caps_malloc(MAX_PACKET_SIZE,               MALLOC_CAP_SPIRAM);
 
@@ -404,8 +406,8 @@ esp_err_t voice_assist_init(void)
             if (s_wn_iface) {
                 s_wn_handle = s_wn_iface->create(wn_name, DET_MODE_90);
                 if (s_wn_handle) {
-                    ESP_LOGI(TAG, "WakeNet loaded OK (chunk=%d)",
-                             s_wn_iface->get_samp_chunksize(s_wn_handle));
+                    va_wakeword_chunk = s_wn_iface->get_samp_chunksize(s_wn_handle);
+                    ESP_LOGI(TAG, "WakeNet loaded OK (chunk=%d)", va_wakeword_chunk);
                 } else {
                     ESP_LOGE(TAG, "WakeNet create failed");
                 }
