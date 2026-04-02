@@ -1236,18 +1236,15 @@ void app_main(void)
             }
         }
 
-        // Manage voice assist state based on device activity
+        // Voice assist pause/resume: only stop wake word during PTT TX
+        // (RX audio plays on separate I2S bus, doesn't conflict with mic reads)
         static bool va_was_paused = false;
-        bool should_pause = transmitting || audio_playing || has_current_sender;
-
-        if (should_pause && !va_was_paused) {
-            // Entering busy state — pause wake word detection
+        if (transmitting && !va_was_paused) {
             if (!voice_assist_is_active()) {
                 voice_assist_stop();
             }
             va_was_paused = true;
-        } else if (!should_pause && va_was_paused) {
-            // Returning to idle — resume wake word detection
+        } else if (!transmitting && va_was_paused) {
             voice_assist_start();
             va_was_paused = false;
         }
