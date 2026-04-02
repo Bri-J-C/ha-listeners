@@ -18,6 +18,7 @@ RUN pip3 install --no-cache-dir -r /requirements.txt
 
 # Copy application
 COPY intercom_hub.py /
+COPY voice_pipeline.py /
 COPY run.sh /
 COPY www/ /www/
 COPY chimes/ /chimes/
