@@ -1114,7 +1114,9 @@ def receive_thread():
                     try:
                         pcm = rx_decoder.decode(opus_frame, FRAME_SIZE)
                         if pcm:
-                            voice_pipeline.feed_audio(sender_id_str, pcm)
+                            # Use MQTT-style device ID to match session key
+                            sender_mqtt_id = f"intercom_{sender_id_str[-8:]}"
+                            voice_pipeline.feed_audio(sender_mqtt_id, pcm)
                     except Exception as e:
                         log.debug(f"Voice assist decode error: {e}")
                 continue  # Don't process as normal intercom audio

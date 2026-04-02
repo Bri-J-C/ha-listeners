@@ -50,6 +50,7 @@ class VoiceSession:
         self.active = True
         self.created_at = time.time()
         self._task: Optional[asyncio.Task] = None
+        self._chunks_sent = 0
 
     async def start(self):
         """Start the Wyoming session."""
@@ -61,7 +62,7 @@ class VoiceSession:
             log.info(f"[{self.room}] Opening Wyoming STT session ({WHISPER_HOST}:{WHISPER_PORT})")
             reader, writer = await asyncio.open_connection(WHISPER_HOST, WHISPER_PORT)
 
-            # Send audio start event
+            # Send audio start event (Transcribe comes AFTER AudioStop per Wyoming protocol)
             audio_start = AudioStart(
                 rate=SAMPLE_RATE,
                 width=SAMPLE_WIDTH,
@@ -85,13 +86,19 @@ class VoiceSession:
                         audio=pcm_data,
                     )
                     await async_write_event(chunk.event(), writer)
+                    self._chunks_sent += 1
+                    if self._chunks_sent == 1:
+                        log.info(f"[{self.room}] First audio chunk sent to Wyoming ({len(pcm_data)} bytes)")
                 except asyncio.TimeoutError:
                     if not self.active:
                         break
                     continue
 
-            # Send audio stop
+            # Send audio stop, then request transcription (Wyoming protocol order)
+            log.info(f"[{self.room}] Sending AudioStop after {self._chunks_sent} chunks")
             await async_write_event(AudioStop().event(), writer)
+            transcribe = Transcribe(language="en")
+            await async_write_event(transcribe.event(), writer)
 
             # Wait for transcript
             transcript_text = ""
@@ -133,21 +140,23 @@ class VoiceSession:
             log.error(f"[{self.room}] Voice session error: {e}")
             self.send_mqtt_done(self.device_id)
 
-    def feed_audio(self, pcm_data: bytes):
-        """Feed decoded PCM audio from ESP32 into the session."""
+    def feed_audio(self, pcm_data: bytes, loop: asyncio.AbstractEventLoop):
+        """Feed decoded PCM audio from ESP32 into the session.
+        Called from receive_thread (non-asyncio), so must use thread-safe method."""
         if self.active:
-            try:
-                self.audio_queue.put_nowait(pcm_data)
-            except asyncio.QueueFull:
-                pass  # Drop if queue full
+            loop.call_soon_threadsafe(self._put_audio, pcm_data)
 
-    def stop(self):
-        """Stop audio streaming (normal end — silence timeout)."""
-        self.active = False
+    def _put_audio(self, data):
+        """Thread-safe audio queue insertion (called via loop.call_soon_threadsafe)."""
         try:
-            self.audio_queue.put_nowait(None)  # Sentinel
+            self.audio_queue.put_nowait(data)
         except asyncio.QueueFull:
             pass
+
+    def stop(self, loop: asyncio.AbstractEventLoop):
+        """Stop audio streaming (normal end — silence timeout)."""
+        self.active = False
+        loop.call_soon_threadsafe(self._put_audio, None)  # Sentinel
 
     def cancel(self):
         """Cancel session immediately (PTT pressed)."""
@@ -189,7 +198,7 @@ class VoicePipelineManager:
     def on_voice_assist_stop(self, device_id: str):
         """Handle voice_assist stop event (silence timeout)."""
         if device_id in self.sessions:
-            self.sessions[device_id].stop()
+            self.sessions[device_id].stop(self.event_loop)
             log.info(f"Voice session stopped for {device_id}")
 
     def on_voice_assist_cancel(self, device_id: str):
@@ -202,7 +211,7 @@ class VoicePipelineManager:
     def feed_audio(self, device_id: str, pcm_data: bytes):
         """Feed decoded PCM to the appropriate session."""
         if device_id in self.sessions:
-            self.sessions[device_id].feed_audio(pcm_data)
+            self.sessions[device_id].feed_audio(pcm_data, self.event_loop)
 
     def cleanup_stale(self, max_age_s: float = 60.0):
         """Remove sessions older than max_age_s."""

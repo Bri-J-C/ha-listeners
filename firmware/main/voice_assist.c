@@ -57,9 +57,9 @@ static const char *TAG = "voice_assist";
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
 
-#define VA_SILENCE_TIMEOUT_MS   5000   // Stop streaming after 5s of silence
-#define VA_MAX_SESSION_MS       30000  // Hard cap: 30s per session
-#define VA_SILENCE_RMS_THRESH   200    // RMS below this = silence
+#define VA_SILENCE_TIMEOUT_MS   3000   // Stop streaming after 3s of silence
+#define VA_MAX_SESSION_MS       10000  // Hard cap: 10s per session
+#define VA_SILENCE_RMS_THRESH   1500   // RMS below this = silence (high due to mic_gain=100 amplification)
 
 // WakeNet chunk size — set at runtime from model's get_samp_chunksize().
 // WakeNet9 Alexa uses 512 samples (32ms at 16kHz).
@@ -329,10 +329,11 @@ static void voice_assist_task(void *arg)
             // Encode and transmit
             esp_err_t err = send_va_packet(s_pcm_buf, va_sequence++, cfg->mqtt_host);
             if (err != ESP_OK) {
-                // Log sparingly (every 50th failure)
                 if ((va_sequence % 50) == 1) {
-                    ESP_LOGW(TAG, "VA send failed: %d (seq=%lu)", err, (unsigned long)va_sequence);
+                    ESP_LOGW(TAG, "VA send failed (seq=%lu)", (unsigned long)va_sequence);
                 }
+            } else if (va_sequence == 1) {
+                ESP_LOGI(TAG, "VA first packet sent OK (rms=%lu)", (unsigned long)rms);
             }
 
             // Pace to ~50fps (20ms per frame) — yield for watchdog + rate limit
