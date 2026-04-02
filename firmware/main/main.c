@@ -30,6 +30,7 @@
 #include "display.h"
 #include "mdns.h"
 #include "agc.h"
+#include "voice_assist.h"
 #include "esp_heap_caps.h"
 #include "esp_attr.h"
 
@@ -148,6 +149,8 @@ static void generate_device_id(void)
  */
 static bool is_channel_busy(void)
 {
+    if (voice_assist_is_active()) return true;
+
     if (!has_current_sender) return false;
 
     // Check if sender timed out
@@ -180,6 +183,9 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
     if (transmitting) {
         return;
     }
+
+    // Skip if voice assistant is active (private session)
+    if (voice_assist_is_active()) return;
 
     // Extract priority for DND check
     uint8_t incoming_priority = packet->priority;
@@ -860,6 +866,13 @@ static void on_button_event(button_event_t event, bool is_broadcast)
 {
     switch (event) {
         case BUTTON_EVENT_PRESSED: {
+            // Cancel voice assist if active — PTT always wins
+            if (voice_assist_is_active()) {
+                ESP_LOGI(TAG, "PTT cancelling voice assist");
+                voice_assist_cancel();
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+
             const settings_t *cfg = settings_get();
             uint8_t my_priority = cfg->priority;
 
@@ -1075,6 +1088,14 @@ void app_main(void)
         ESP_LOGW(TAG, "AEC unavailable (%s) — raw mic audio", esp_err_to_name(aec_ret));
     }
 
+    // Initialize voice assistant (WakeNet)
+    esp_err_t va_ret = voice_assist_init();
+    if (va_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Voice assistant initialized");
+    } else {
+        ESP_LOGW(TAG, "Voice assistant unavailable (%s)", esp_err_to_name(va_ret));
+    }
+
     // Apply saved settings
     audio_output_set_volume(cfg->volume);
     audio_output_set_mute(cfg->muted);
@@ -1144,6 +1165,9 @@ void app_main(void)
 
         // Start MQTT for Home Assistant integration
         ha_mqtt_start();
+
+        // Start voice assistant listening
+        voice_assist_start();
     }
 
     // Create RX audio queue in PSRAM (internal RAM allocation fragments heap,
@@ -1210,6 +1234,22 @@ void app_main(void)
             } else {
                 ESP_LOGI(TAG, "TX stopped");
             }
+        }
+
+        // Manage voice assist state based on device activity
+        static bool va_was_paused = false;
+        bool should_pause = transmitting || audio_playing || has_current_sender;
+
+        if (should_pause && !va_was_paused) {
+            // Entering busy state — pause wake word detection
+            if (!voice_assist_is_active()) {
+                voice_assist_stop();
+            }
+            va_was_paused = true;
+        } else if (!should_pause && va_was_paused) {
+            // Returning to idle — resume wake word detection
+            voice_assist_start();
+            va_was_paused = false;
         }
 
         // Stop audio output after 500ms of no received packets
