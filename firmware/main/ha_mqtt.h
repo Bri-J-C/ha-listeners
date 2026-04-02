@@ -203,4 +203,22 @@ bool ha_mqtt_check_incoming_call(char *caller_name);
  */
 const char* ha_mqtt_get_incoming_chime(void);
 
+/**
+ * Publish voice assist start event to hub.
+ * Hub uses this to open a Wyoming session.
+ */
+void ha_mqtt_publish_voice_assist_start(void);
+
+/**
+ * Publish voice assist stop event (silence timeout, normal end).
+ * Hub should process accumulated audio and return TTS.
+ */
+void ha_mqtt_publish_voice_assist_stop(void);
+
+/**
+ * Publish voice assist cancel event (PTT pressed, user abort).
+ * Hub tears down Wyoming session immediately, no TTS response.
+ */
+void ha_mqtt_publish_voice_assist_cancel(void);
+
 #endif // HA_MQTT_H

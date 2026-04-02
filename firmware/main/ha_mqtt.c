@@ -528,6 +528,9 @@ static void publish_state(void)
         case HA_STATE_RECEIVING:
             snprintf(payload, sizeof(payload), "{\"state\":\"receiving\"}");
             break;
+        case HA_STATE_VOICE_ASSIST:
+            snprintf(payload, sizeof(payload), "{\"state\":\"voice_assist\"}");
+            break;
         default:
             snprintf(payload, sizeof(payload), "{\"state\":\"idle\"}");
             break;
@@ -1040,6 +1043,21 @@ static void handle_mqtt_data(esp_mqtt_event_handle_t event)
             ESP_LOGW(TAG, "Failed to parse call JSON");
         }
     }
+    // Voice assist response from hub
+    else if (strstr(topic, "/voice_assist/response")) {
+        cJSON *root = cJSON_Parse(data);
+        if (root) {
+            cJSON *event = cJSON_GetObjectItem(root, "event");
+            if (event && cJSON_IsString(event)) {
+                if (strcmp(event->valuestring, "tts_done") == 0) {
+                    ESP_LOGI(TAG, "Voice assist TTS done (from hub)");
+                    extern void voice_assist_tts_done(void);
+                    voice_assist_tts_done();
+                }
+            }
+            cJSON_Delete(root);
+        }
+    }
 }
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
@@ -1082,7 +1100,15 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             // Subscribe to call notifications
             esp_mqtt_client_subscribe(mqtt_client, call_topic, 0);
             ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", call_topic);
-            ESP_LOGI(TAG, "Subscribed to all %d topics", 11);
+
+            // Subscribe to voice assist response from hub
+            {
+                char va_topic[128];
+                snprintf(va_topic, sizeof(va_topic), "%s/voice_assist/response", base_topic);
+                esp_mqtt_client_subscribe(mqtt_client, va_topic, 1);
+                ESP_LOGI(TAG, "[MQTT] subscribe: topic=%s", va_topic);
+            }
+            ESP_LOGI(TAG, "Subscribed to all %d topics", 12);
 
             // Publish online AFTER subscribes so HA sees us as available
             // only once we're ready to receive commands
@@ -1267,6 +1293,46 @@ void ha_mqtt_publish_priority(void)
 void ha_mqtt_publish_dnd(void)
 {
     publish_dnd();
+}
+
+void ha_mqtt_publish_voice_assist_start(void)
+{
+    if (!mqtt_client || !mqtt_connected) return;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/voice_assist", base_topic);
+
+    const settings_t *cfg = settings_get();
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"event\":\"start\",\"room\":\"%s\"}", cfg->room_name);
+
+    esp_mqtt_client_enqueue(mqtt_client, topic, payload, 0, 1, 0, true);
+    ESP_LOGI(TAG, "Voice assist start published (room=%s)", cfg->room_name);
+}
+
+void ha_mqtt_publish_voice_assist_stop(void)
+{
+    if (!mqtt_client || !mqtt_connected) return;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/voice_assist", base_topic);
+
+    esp_mqtt_client_enqueue(mqtt_client, topic,
+                            "{\"event\":\"stop\"}", 0, 1, 0, true);
+    ESP_LOGI(TAG, "Voice assist stop published");
+}
+
+void ha_mqtt_publish_voice_assist_cancel(void)
+{
+    if (!mqtt_client || !mqtt_connected) return;
+
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/voice_assist", base_topic);
+
+    esp_mqtt_client_enqueue(mqtt_client, topic,
+                            "{\"event\":\"cancel\"}", 0, 1, 0, true);
+    ESP_LOGI(TAG, "Voice assist cancel published");
 }
 
 bool ha_mqtt_is_connected(void)
