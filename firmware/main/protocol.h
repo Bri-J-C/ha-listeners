@@ -24,8 +24,7 @@
 #define CHANNELS            1
 #define FRAME_DURATION_MS   20
 #define FRAME_SIZE          (SAMPLE_RATE * FRAME_DURATION_MS / 1000)  // 320 samples
-#define OPUS_BITRATE        32000  // 32kbps VBR — matches codec.c and intercom_hub.py
-
+#define PCM_FRAME_BYTES     (FRAME_SIZE * sizeof(int16_t))            // 640 bytes
 // Protocol Configuration
 #define HEARTBEAT_INTERVAL_MS   30000
 #define DEVICE_ID_LENGTH        8
@@ -39,8 +38,8 @@
 #define PRIORITY_EMERGENCY      2   // Override everything, force max volume, bypass mute
 #define PRIORITY_VOICE_ASSIST   3   // Voice assistant audio — hub routes to HA pipeline
 
-// Max packet size (header + max opus frame)
-#define MAX_PACKET_SIZE         256
+// Max packet size (header + raw PCM frame)
+#define MAX_PACKET_SIZE         672  // header (13) + raw PCM (640) + alignment
 
 // Message types (control plane)
 typedef enum {
@@ -62,7 +61,7 @@ typedef struct __attribute__((packed)) {
     uint8_t device_id[DEVICE_ID_LENGTH];
     uint32_t sequence;
     uint8_t priority;     // PRIORITY_NORMAL / PRIORITY_HIGH / PRIORITY_EMERGENCY
-    uint8_t opus_data[];  // Variable length
+    uint8_t pcm_data[];   // Raw 16-bit PCM (640 bytes = 320 samples)
 } audio_packet_t;
 
 // Device configuration (received from HA)

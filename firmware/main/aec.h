@@ -25,7 +25,7 @@
 #include "esp_err.h"
 
 /**
- * Initialize AEC. Call after audio_output_init() and codec_init().
+ * Initialize AEC. Call after audio_output_init().
  * Non-fatal: if esp-sr is unavailable or allocation fails, aec_is_ready()
  * returns false and the TX path falls back to raw mic audio.
  */

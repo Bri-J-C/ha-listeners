@@ -14,7 +14,7 @@
 
 /**
  * Initialize voice assistant (WakeNet model + task).
- * Call after audio_input_init() and codec_init().
+ * Call after audio_input_init().
  * @return ESP_OK on success
  */
 esp_err_t voice_assist_init(void);

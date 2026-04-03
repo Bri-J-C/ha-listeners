@@ -35,7 +35,6 @@
 #include "protocol.h"
 #include "audio_input.h"
 #include "audio_output.h"
-#include "codec.h"
 #include "network.h"
 #include "settings.h"
 #include "button.h"
@@ -91,7 +90,6 @@ static TaskHandle_t s_va_task_handle = NULL;
 // PCM capture buffer — declared static but lives on the task stack region;
 // uses heap allocation in PSRAM to keep internal SRAM free.
 static int16_t *s_pcm_buf = NULL;         // FRAME_SIZE int16_t, PSRAM
-static uint8_t *s_opus_buf = NULL;        // MAX_PACKET_SIZE bytes, PSRAM
 static uint8_t *s_packet_buf = NULL;      // MAX_PACKET_SIZE bytes, PSRAM
 
 // ─── WakeNet handle ───────────────────────────────────────────────────────
@@ -154,31 +152,17 @@ static void play_wake_chime(void)
 }
 
 /**
- * Build and transmit one Opus-encoded voice assist audio packet via unicast.
- *
- * @param pcm     PCM samples (FRAME_SIZE int16_t)
- * @param seq     Current sequence number (incremented by caller)
- * @param dest_ip Hub IP string from settings
- * @return ESP_OK on success
+ * Build and transmit one raw PCM voice assist audio packet via unicast.
  */
 static esp_err_t send_va_packet(const int16_t *pcm, uint32_t seq, const char *dest_ip)
 {
-    // Encode PCM → Opus
-    int opus_len = codec_encode(pcm, s_opus_buf, MAX_PACKET_SIZE - HEADER_LENGTH);
-    if (opus_len <= 0) {
-        ESP_LOGW(TAG, "Opus encode failed (%d)", opus_len);
-        return ESP_FAIL;
-    }
-
-    // Build packet header
     audio_packet_t *pkt = (audio_packet_t *)s_packet_buf;
     memcpy(pkt->device_id, device_id, DEVICE_ID_LENGTH);
     pkt->sequence = htonl(seq);
     pkt->priority = PRIORITY_VOICE_ASSIST;
-    memcpy(pkt->opus_data, s_opus_buf, (size_t)opus_len);
+    memcpy(pkt->pcm_data, pcm, PCM_FRAME_BYTES);
 
-    size_t total_len = HEADER_LENGTH + (size_t)opus_len;
-    return network_send_unicast(pkt, total_len, dest_ip);
+    return network_send_unicast(pkt, HEADER_LENGTH + PCM_FRAME_BYTES, dest_ip);
 }
 
 // ─── VA task ──────────────────────────────────────────────────────────────
@@ -245,9 +229,6 @@ static void voice_assist_task(void *arg)
                 // TODO: play_wake_chime() crashes (LoadProhibited) when called
                 // from va_task on Core 1 — I2S output not safe cross-core.
                 // Need to defer chime to audio_play_task or main loop.
-
-                // Reset encoder for clean session
-                codec_reset_encoder();
 
                 // Notify HA hub
                 ha_mqtt_publish_voice_assist_start();
@@ -378,17 +359,13 @@ esp_err_t voice_assist_init(void)
     // Allocate for max of FRAME_SIZE (320, Opus encode) and WakeNet chunk (512)
     size_t pcm_samples = (FRAME_SIZE > 512) ? FRAME_SIZE : 512;
     s_pcm_buf    = (int16_t *)heap_caps_malloc(pcm_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
-    s_opus_buf   = (uint8_t *)heap_caps_malloc(MAX_PACKET_SIZE,               MALLOC_CAP_SPIRAM);
     s_packet_buf = (uint8_t *)heap_caps_malloc(MAX_PACKET_SIZE,               MALLOC_CAP_SPIRAM);
 
-    if (!s_pcm_buf || !s_opus_buf || !s_packet_buf) {
+    if (!s_pcm_buf || !s_packet_buf) {
         ESP_LOGE(TAG, "Failed to allocate audio buffers in PSRAM");
-        // Free whatever was allocated before returning
         heap_caps_free(s_pcm_buf);
-        heap_caps_free(s_opus_buf);
         heap_caps_free(s_packet_buf);
         s_pcm_buf = NULL;
-        s_opus_buf = NULL;
         s_packet_buf = NULL;
         return ESP_ERR_NO_MEM;
     }

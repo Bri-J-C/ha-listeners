@@ -4,7 +4,6 @@ idf_component_register(
         "audio_input.c"
         "audio_output.c"
         "aec.c"
-        "codec.c"
         "network.c"
         "discovery.c"
         "button.c"
@@ -33,6 +32,3 @@ idf_component_register(
         espressif__esp-sr
         spiffs
 )
-
-# Add libopus as a managed component
-# Run: idf.py add-dependency "espressif/libopus"

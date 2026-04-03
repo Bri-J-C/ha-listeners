@@ -9,7 +9,6 @@
 #include "settings.h"
 #include "diagnostics.h"
 #include "protocol.h"
-#include "codec.h"
 #include "network.h"
 #include "ha_mqtt.h"
 #include "audio_output.h"
@@ -997,9 +996,8 @@ static void test_tone_task(void *arg)
     ESP_LOGI(TAG, "Test tone: starting %d frames (%.1fs), 440Hz, wall-clock scheduled",
              total_frames, (float)total_frames * FRAME_DURATION_MS / 1000.0f);
 
-    // Local buffers for tone generation and encoding
+    // Local buffers for tone generation
     int16_t tone_pcm[FRAME_SIZE];
-    uint8_t opus_out[MAX_PACKET_SIZE];
     uint8_t pkt_buf[MAX_PACKET_SIZE];
     audio_packet_t *packet = (audio_packet_t *)pkt_buf;
 
@@ -1009,16 +1007,9 @@ static void test_tone_task(void *arg)
     uint32_t sequence = 0;
     const float inv_sample_rate = 1.0f / (float)SAMPLE_RATE;
 
-    // Reset encoder state so test tone starts from clean prediction
-    codec_reset_encoder();
-
-    // Wall-clock scheduling: vTaskDelayUntil compensates for encode+send time
+    // Wall-clock scheduling: vTaskDelayUntil compensates for send time
     TickType_t next_wake = xTaskGetTickCount();
 
-    // Timing accumulators for periodic diagnostic logging
-    int64_t encode_time_accum = 0;
-    int64_t send_time_accum = 0;
-    int timing_sample_count = 0;
     int64_t tone_start_us = esp_timer_get_time();
 
     for (int frame = 0; frame < total_frames; frame++) {
@@ -1029,48 +1020,17 @@ static void test_tone_task(void *arg)
             break;
         }
 
-        int64_t frame_start = esp_timer_get_time();
-
-        // Generate 440Hz sine wave at 50% amplitude (16384 peak, matches play_fallback_beep)
-        // Phase-continuous across frames: use absolute sample index
+        // Generate 440Hz sine wave at 50% amplitude
         int frame_start_sample = frame * FRAME_SIZE;
         for (int s = 0; s < FRAME_SIZE; s++) {
             float t = (float)(frame_start_sample + s) * inv_sample_rate;
             tone_pcm[s] = (int16_t)(16384.0f * sinf(2.0f * M_PI * 440.0f * t));
         }
 
-        // Opus encode through mutex-protected codec_encode()
-        int opus_len = codec_encode(tone_pcm, opus_out, sizeof(opus_out));
-        int64_t after_encode = esp_timer_get_time();
-
-        if (opus_len <= 0) {
-            ESP_LOGW(TAG, "test_tone: encode failed at frame %d (ret=%d)", frame, opus_len);
-            continue;  // skip this frame, try next
-        }
-
-        // Build and send packet
+        // Pack raw PCM into packet and send
         packet->sequence = htonl(sequence++);
-        memcpy(packet->opus_data, opus_out, opus_len);
-        network_send_multicast(packet, HEADER_LENGTH + opus_len);
-        int64_t after_send = esp_timer_get_time();
-
-        // Accumulate timing for periodic summary
-        encode_time_accum += (after_encode - frame_start);
-        send_time_accum += (after_send - after_encode);
-        timing_sample_count++;
-
-        // Log timing summary every 10 frames
-        if (timing_sample_count == 10) {
-            int batch_end = frame;
-            int batch_start = batch_end - 9;
-            ESP_LOGI(TAG, "Test tone frames %d-%d: encode_avg=%lldus send_avg=%lldus",
-                     batch_start, batch_end,
-                     (long long)(encode_time_accum / 10),
-                     (long long)(send_time_accum / 10));
-            encode_time_accum = 0;
-            send_time_accum = 0;
-            timing_sample_count = 0;
-        }
+        memcpy(packet->pcm_data, tone_pcm, PCM_FRAME_BYTES);
+        network_send_multicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES);
 
         // Wall-clock pacing: sleep until next 20ms boundary
         vTaskDelayUntil(&next_wake, pdMS_TO_TICKS(FRAME_DURATION_MS));

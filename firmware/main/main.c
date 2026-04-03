@@ -19,7 +19,6 @@
 #include "audio_input.h"
 #include "audio_output.h"
 #include "aec.h"
-#include "codec.h"
 #include "network.h"
 #include "discovery.h"
 #include "button.h"
@@ -47,13 +46,10 @@ static volatile bool broadcast_mode = false;
 static uint32_t tx_sequence = 0;
 
 // Audio buffers (separate per task to prevent race conditions)
-static int16_t rx_pcm_buffer[FRAME_SIZE];
-static uint8_t opus_buffer[MAX_PACKET_SIZE];
 static uint8_t tx_packet_buffer[MAX_PACKET_SIZE];
 
-// RX audio queue: decouples network receive from decode/play.
-// Without this, Opus decode + I2S write block the RX task, causing
-// incoming packets to pile up in the socket buffer and replay later.
+// RX audio queue: decouples network receive from play.
+// Each item holds one raw PCM packet (~672 bytes).
 typedef struct {
     uint8_t data[MAX_PACKET_SIZE];
     size_t  len;
@@ -71,7 +67,7 @@ static bool play_task_running = false;
 // Task stacks allocated dynamically from PSRAM heap (not EXT_RAM_BSS_ATTR).
 // EXT_RAM_BSS_ATTR uses fixed .ext_ram.bss addresses that conflict with
 // esp_partition_mmap() used by WakeNet model loading.
-#define TX_TASK_STACK_SIZE   32768
+#define TX_TASK_STACK_SIZE   8192
 #define PLAY_TASK_STACK_SIZE 16384
 static StackType_t *tx_task_stack = NULL;
 static StaticTask_t tx_task_tcb;
@@ -232,31 +228,34 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
 }
 
 /**
- * Process a received audio packet — decode and play.
+ * Process a received audio packet — extract raw PCM and play.
  *
  * Runs in the audio_play_task. Handles first-to-talk, priority preemption,
- * PLC/FEC, emergency override, and I2S output.
+ * emergency override, and I2S output.
  */
 static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
 {
-    // Extract priority (added in v2.5.0 protocol; old senders omit it, default to NORMAL)
     uint8_t incoming_priority = packet->priority;
-    if (incoming_priority > 2) {  // > PRIORITY_EMERGENCY
-        incoming_priority = 0;    // Clamp unknown values to PRIORITY_NORMAL
+    if (incoming_priority > 2) {
+        incoming_priority = 0;
     }
 
-    // Classify silence early — BEFORE channel acquisition.
-    // Opus encodes silence very small (~2-5 bytes at 32kbps VBR); real voice
-    // frames are 20+ bytes.  Silence frames (trail-out from TX end) must NOT
-    // acquire the channel because they never set audio_playing, which means
-    // the idle timeout never fires and has_current_sender gets stuck forever,
-    // blocking all subsequent RX from any sender.
-    size_t opus_len = total_len - HEADER_LENGTH;
-    if (opus_len == 0 || opus_len > MAX_PACKET_SIZE - HEADER_LENGTH) {
-        ESP_LOGW(TAG, "RX packet invalid opus_len=%u (total=%u)", (unsigned)opus_len, (unsigned)total_len);
-        return;
+    // Extract PCM payload
+    size_t pcm_len = (total_len > HEADER_LENGTH) ? total_len - HEADER_LENGTH : 0;
+    if (pcm_len == 0 || pcm_len > PCM_FRAME_BYTES) {
+        return;  // Malformed packet
     }
-    bool is_silence_frame = (opus_len < 10);
+
+    // Silence detection: check if all PCM samples are zero
+    size_t samples = pcm_len / sizeof(int16_t);
+    const int16_t *pcm = (const int16_t *)packet->pcm_data;
+    bool is_silence_frame = true;
+    for (size_t i = 0; i < samples; i++) {
+        if (pcm[i] != 0) {
+            is_silence_frame = false;
+            break;
+        }
+    }
 
     // Silence from unknown sender: don't acquire channel
     if (is_silence_frame && !has_current_sender) return;
@@ -265,65 +264,51 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
     if (has_current_sender) {
         bool same_sender = (memcmp(packet->device_id, current_sender, DEVICE_ID_LENGTH) == 0);
         if (!same_sender) {
-            // Silence from a different sender: don't preempt, don't accept
             if (is_silence_frame) return;
 
-            // Different sender — check if incoming priority allows preemption
             if (incoming_priority > current_rx_priority) {
-                // Higher priority preempts the current sender
                 ESP_LOGI(TAG, "Priority preemption: incoming=%d > current=%d",
                          incoming_priority, current_rx_priority);
-                // Stop current playback and release channel to new sender
                 if (audio_playing) {
                     audio_output_stop();
                     audio_playing = false;
                 }
-                // Restore volume if emergency override was active
                 if (audio_output_is_emergency_override()) {
                     audio_output_restore_volume();
                 }
-                // Accept new sender
                 memcpy(current_sender, packet->device_id, DEVICE_ID_LENGTH);
                 current_rx_priority = incoming_priority;
                 sequence_initialized = false;
-                codec_reset_decoder();
                 ESP_LOGI(TAG, "Channel preempted by %02x%02x%02x%02x (priority=%d)",
                          current_sender[0], current_sender[1], current_sender[2],
                          current_sender[3], current_rx_priority);
             } else {
-                // Same or lower priority — first-to-talk wins, discard packet
                 return;
             }
         }
-        // Same sender — continue playing
     } else {
-        // No current sender - this sender gets the channel
         memcpy(current_sender, packet->device_id, DEVICE_ID_LENGTH);
         current_rx_priority = incoming_priority;
         has_current_sender = true;
         sequence_initialized = false;
-        codec_reset_decoder();
         ESP_LOGI(TAG, "Channel acquired by %02x%02x%02x%02x (priority=%d)",
                  current_sender[0], current_sender[1], current_sender[2],
                  current_sender[3], current_rx_priority);
     }
 
-    // Emergency override: force unmute + max volume on first packet of emergency stream
-    if (incoming_priority == 2 && !audio_playing) {  // 2 = PRIORITY_EMERGENCY
+    // Emergency override
+    if (incoming_priority == 2 && !audio_playing) {
         audio_output_force_unmute_max_volume();
-        button_set_led_state(LED_STATE_BUSY);  // Orange LED for emergency
+        button_set_led_state(LED_STATE_BUSY);
         ESP_LOGW(TAG, "EMERGENCY audio incoming - forced unmute + max volume");
     }
 
-    // Update timestamp FIRST — before setting audio_playing — to prevent the
-    // main-loop idle timeout from seeing audio_playing=true with a stale timestamp
-    // and immediately stopping playback (race condition causes start/stop flapping).
     last_audio_rx_time = xTaskGetTickCount();
 
-    // Start audio output if not already playing (silence frames don't trigger state change)
+    // Start audio output if not already playing
     if (!audio_playing && !is_silence_frame) {
-        ESP_LOGI(TAG, "RX audio starting (opus_len=%u, seq=%lu, pri=%d)",
-                 (unsigned)opus_len, (unsigned long)ntohl(packet->sequence), incoming_priority);
+        ESP_LOGI(TAG, "RX audio starting (pcm_len=%u, seq=%lu, pri=%d)",
+                 (unsigned)pcm_len, (unsigned long)ntohl(packet->sequence), incoming_priority);
         audio_output_start();
         audio_playing = true;
         button_set_led_state(LED_STATE_RECEIVING);
@@ -333,54 +318,33 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
 
     uint32_t seq = ntohl(packet->sequence);
 
-    // Detect packet loss and apply PLC/FEC before decoding current packet
+    // Sequence tracking (log gaps, no PLC/FEC needed with raw PCM)
     if (sequence_initialized) {
         int32_t gap = (int32_t)(seq - last_sequence - 1);
         if (gap > 4) {
-            ESP_LOGW(TAG, "RX sequence jump: last=%lu cur=%lu gap=%ld (too large for PLC)",
+            ESP_LOGW(TAG, "RX sequence jump: last=%lu cur=%lu gap=%ld",
                      (unsigned long)last_sequence, (unsigned long)seq, (long)gap);
-        }
-        if (gap > 0 && gap <= 4) {
-            if (gap == 1) {
-                // Single packet lost — try FEC recovery using current packet's embedded FEC
-                int fec_samples = codec_decode_fec(packet->opus_data, opus_len, rx_pcm_buffer);
-                if (fec_samples > 0) {
-                    audio_output_write(rx_pcm_buffer, fec_samples, 20);
-                }
-            } else {
-                // Multiple packets lost — PLC for each (up to 4)
-                for (int i = 0; i < gap; i++) {
-                    int plc_samples = codec_decode_plc(rx_pcm_buffer);
-                    if (plc_samples > 0) {
-                        audio_output_write(rx_pcm_buffer, plc_samples, 20);
-                    }
-                }
-            }
         }
     }
     last_sequence = seq;
     sequence_initialized = true;
 
-    // Decode and play current packet (20ms timeout = one frame budget)
-    int samples = codec_decode(packet->opus_data, opus_len, rx_pcm_buffer);
-    if (samples > 0) {
-        int written = audio_output_write(rx_pcm_buffer, samples, 20);
+    // Play PCM directly
+    if (!is_silence_frame && audio_playing) {
+        int written = audio_output_write(pcm, samples, 20);
         if (written == 0 && audio_playing) {
-            ESP_LOGW(TAG, "RX write returned 0 while audio_playing=true — restarting I2S (seq=%lu)",
-                     (unsigned long)seq);
+            ESP_LOGW(TAG, "RX write returned 0 — restarting I2S (seq=%lu)", (unsigned long)seq);
             audio_output_stop();
             audio_output_start();
-            if (audio_output_write(rx_pcm_buffer, samples, 20) == 0) {
-                ESP_LOGE(TAG, "RX write still 0 after I2S restart — stopping playback (seq=%lu)",
-                         (unsigned long)seq);
+            if (audio_output_write(pcm, samples, 20) == 0) {
+                ESP_LOGE(TAG, "RX write still 0 after I2S restart — stopping (seq=%lu)", (unsigned long)seq);
                 audio_playing = false;
                 has_current_sender = false;
             }
         }
-    } else {
-        ESP_LOGW(TAG, "RX decode failed: samples=%d (opus_len=%u, seq=%lu)",
-                 samples, (unsigned)opus_len, (unsigned long)seq);
     }
+
+    rx_packet_count++;
 }
 
 /**
@@ -415,105 +379,62 @@ static void audio_tx_task(void *arg)
 {
     ESP_LOGI(TAG, "Audio TX task started");
 
-    // TX-local PCM buffer (separate from rx_pcm_buffer to prevent race conditions)
     int16_t tx_pcm_buffer[FRAME_SIZE];
 
     audio_packet_t *packet = (audio_packet_t *)tx_packet_buffer;
     memcpy(packet->device_id, device_id, DEVICE_ID_LENGTH);
-    // Priority is refreshed from settings each TX iteration (allows real-time HA updates)
     packet->priority = settings_get()->priority;
 
-    // Silence buffer for lead-in/trail-out
-    static int16_t silence_pcm[FRAME_SIZE] = {0};
-    static uint8_t silence_opus[MAX_PACKET_SIZE];
-    int silence_opus_len = 0;
-
-    // Pre-encode silence frame
-    silence_opus_len = codec_encode(silence_pcm, silence_opus, sizeof(silence_opus));
-    if (silence_opus_len <= 0) {
-        ESP_LOGE(TAG, "Failed to encode silence frame (ret=%d)", silence_opus_len);
-        silence_opus_len = 0;
-    } else {
-        ESP_LOGI(TAG, "Silence frame encoded: %d bytes", silence_opus_len);
-    }
+    // Silence frame: 640 bytes of zeros
+    static const int16_t silence_pcm[FRAME_SIZE] = {0};
 
     bool was_transmitting = false;
 
-    // AEC cleaned output accumulator. AEC processes 512-sample chunks; Opus uses
-    // 320-sample frames. We accumulate across iterations so each Opus frame is
-    // either all-cleaned or all-raw — never a mixed frame.
+    // AEC cleaned output accumulator
     static int16_t aec_cleaned[FRAME_SIZE];
     static int aec_cleaned_fill = 0;
 
     while (tx_task_running) {
-        // Refresh priority from settings each pass (allows real-time HA updates)
         packet->priority = settings_get()->priority;
 
-        // Detect start of transmission - send lead-in silence
+        // Start of transmission — send lead-in silence
         if (transmitting && !was_transmitting) {
             was_transmitting = true;
-
-            // Reset AGC state so stale gain from previous TX does not carry over
             agc_reset();
-
-            // Reset Opus encoder state at TX start.
-            //
-            // The encoder carries internal prediction history between sessions.
-            // Without a reset, the first encoded frames of a new session are
-            // predicted against the previous session's audio (e.g. prior
-            // silence frames or voice), which can cause decoder mis-prediction
-            // artifacts on the receiving end for the first 20-60ms.
-            //
-            // After resetting, re-encode the silence frame so the lead-in
-            // packets are consistent with the fresh encoder state.
-            // Reset both pipeline stages before any encoding happens
             aec_reset();
             aec_cleaned_fill = 0;
 
-            codec_reset_encoder();
-            silence_opus_len = codec_encode(silence_pcm, silence_opus, sizeof(silence_opus));
-            if (silence_opus_len <= 0) {
-                ESP_LOGE(TAG, "Failed to re-encode silence after encoder reset");
-                silence_opus_len = 0;
-            }
-
             ESP_LOGI(TAG, "TX started - sending lead-in silence");
 
-            // Send 15 frames of silence (300ms) to prime receiver jitter buffer
-            if (silence_opus_len > 0) {
-                for (int i = 0; i < 15; i++) {
-                    packet->sequence = htonl(tx_sequence++);
-                    memcpy(packet->opus_data, silence_opus, silence_opus_len);
+            for (int i = 0; i < 15; i++) {
+                packet->sequence = htonl(tx_sequence++);
+                memcpy(packet->pcm_data, silence_pcm, PCM_FRAME_BYTES);
 
-                    const char *target_ip = ha_mqtt_get_target_ip();
-                    if (target_ip) {
-                        network_send_unicast(packet, HEADER_LENGTH + silence_opus_len, target_ip);
-                    } else {
-                        network_send_multicast(packet, HEADER_LENGTH + silence_opus_len);
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(FRAME_DURATION_MS));
+                const char *target_ip = ha_mqtt_get_target_ip();
+                if (target_ip) {
+                    network_send_unicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES, target_ip);
+                } else {
+                    network_send_multicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES);
                 }
+                vTaskDelay(pdMS_TO_TICKS(FRAME_DURATION_MS));
             }
         }
 
-        // Detect end of transmission - send trail-out silence
+        // End of transmission — send trail-out silence
         if (!transmitting && was_transmitting) {
             ESP_LOGI(TAG, "TX ended - sending trail-out silence");
 
-            // Send 10 frames of silence (200ms) to flush receiver DMA buffers
-            if (silence_opus_len > 0) {
-                for (int i = 0; i < 10; i++) {
-                    packet->sequence = htonl(tx_sequence++);
-                    memcpy(packet->opus_data, silence_opus, silence_opus_len);
+            for (int i = 0; i < 10; i++) {
+                packet->sequence = htonl(tx_sequence++);
+                memcpy(packet->pcm_data, silence_pcm, PCM_FRAME_BYTES);
 
-                    const char *target_ip = ha_mqtt_get_target_ip();
-                    if (target_ip) {
-                        network_send_unicast(packet, HEADER_LENGTH + silence_opus_len, target_ip);
-                    } else {
-                        network_send_multicast(packet, HEADER_LENGTH + silence_opus_len);
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(FRAME_DURATION_MS));
+                const char *target_ip = ha_mqtt_get_target_ip();
+                if (target_ip) {
+                    network_send_unicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES, target_ip);
+                } else {
+                    network_send_multicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES);
                 }
+                vTaskDelay(pdMS_TO_TICKS(FRAME_DURATION_MS));
             }
 
             was_transmitting = false;
@@ -525,69 +446,51 @@ static void audio_tx_task(void *arg)
             continue;
         }
 
-        // Read audio from microphone (320 samples = 20ms at 16kHz)
+        // Read audio from microphone
         int samples = audio_input_read(tx_pcm_buffer, FRAME_SIZE, 50);
         if (samples != FRAME_SIZE) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
 
-        // AEC: push mic samples then accumulate cleaned output until a full
-        // FRAME_SIZE is ready. AEC processes 512-sample chunks while Opus uses
-        // 320-sample frames; accumulating avoids mixing raw and cleaned audio
-        // within the same encoded frame, which causes audible quality artifacts.
-        // Apply AGC to normalize microphone volume (before AEC and encode)
+        // AGC
         if (settings_get()->agc_enabled) {
             agc_process(tx_pcm_buffer, samples);
         }
 
-        const int16_t *encode_buf = tx_pcm_buffer;
+        // AEC
+        const int16_t *send_buf = tx_pcm_buffer;
         if (aec_is_ready()) {
             aec_push_mic(tx_pcm_buffer, samples);
             int got = aec_pop_cleaned(aec_cleaned + aec_cleaned_fill,
                                       FRAME_SIZE - aec_cleaned_fill);
             aec_cleaned_fill += got;
             if (aec_cleaned_fill >= FRAME_SIZE) {
-                encode_buf = aec_cleaned;
+                send_buf = aec_cleaned;
                 aec_cleaned_fill = 0;
             }
-            // If not enough cleaned yet, fall through with raw tx_pcm_buffer for
-            // this frame (happens during AEC priming, ~40ms at TX start)
         }
 
-        // Encode PCM to Opus
-        int opus_len = codec_encode(encode_buf, opus_buffer, sizeof(opus_buffer));
-        if (opus_len <= 0) {
-            continue;
-        }
-
-        // Build and send packet
+        // Pack raw PCM into packet and send
         packet->sequence = htonl(tx_sequence++);
-        memcpy(packet->opus_data, opus_buffer, opus_len);
+        memcpy(packet->pcm_data, send_buf, PCM_FRAME_BYTES);
 
-        // Send to target (unicast) or all rooms (multicast)
         const char *target_ip = ha_mqtt_get_target_ip();
         if (target_ip) {
-            network_send_unicast(packet, HEADER_LENGTH + opus_len, target_ip);
+            network_send_unicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES, target_ip);
         } else {
-            network_send_multicast(packet, HEADER_LENGTH + opus_len);
+            network_send_multicast(packet, HEADER_LENGTH + PCM_FRAME_BYTES);
         }
+
         tx_frame_count++;
         tx_frame_total++;
-
-        // Log every 50th TX packet (~1/sec during audio)
         tx_log_counter++;
         if ((tx_log_counter % 50) == 1) {
-            ESP_LOGD(TAG, "[TX] seq=%lu opus_len=%u target=%s",
-                     (unsigned long)(tx_sequence - 1),
-                     (unsigned)opus_len,
-                     target_ip ? target_ip : "multicast");
+            ESP_LOGD(TAG, "[TX] seq=%lu frames=%lu",
+                     (unsigned long)(tx_sequence - 1), (unsigned long)tx_frame_count);
         }
 
-        // Delay 1 tick (1ms at 1000Hz) to let IDLE task feed the watchdog.
-        // taskYIELD() was insufficient — it only yields to same-priority tasks,
-        // not the lower-priority IDLE task that resets the WDT.
-        vTaskDelay(1);
+        vTaskDelay(1);  // Yield for watchdog
     }
 
     ESP_LOGI(TAG, "Audio TX task stopped");
@@ -1073,8 +976,7 @@ void app_main(void)
         ESP_LOGW(TAG, "Display init failed: %s", esp_err_to_name(disp_ret));
     }
 
-    // Initialize audio codec and I/O
-    ESP_ERROR_CHECK(codec_init());
+    // Initialize audio I/O
     ESP_ERROR_CHECK(audio_input_init());
     ESP_ERROR_CHECK(audio_output_init());
 
