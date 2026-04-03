@@ -5,8 +5,6 @@ FROM ${BUILD_FROM}
 RUN apk add --no-cache \
     python3 \
     py3-pip \
-    opus \
-    opus-dev \
     ffmpeg \
     gcc \
     musl-dev \

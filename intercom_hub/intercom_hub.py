@@ -160,11 +160,7 @@ except ImportError:
     log.warning("aiohttp not available - web PTT disabled")
     web = None
 
-try:
-    import opuslib
-except ImportError:
-    log.warning("opuslib not available")
-    opuslib = None
+# opuslib removed — audio packets now carry raw 16-bit PCM
 
 # Configuration from environment
 MQTT_HOST = os.environ.get('MQTT_HOST', 'core-mosquitto')
@@ -183,7 +179,6 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 FRAME_DURATION_MS = 20
 FRAME_SIZE = SAMPLE_RATE * FRAME_DURATION_MS // 1000  # 320 samples
-OPUS_BITRATE = 32000  # Match ESP32 for consistent quality
 
 # Protocol v2.5.0+: packet header now 13 bytes (8 device_id + 4 seq + 1 priority)
 PACKET_HEADER_SIZE = 13  # Updated from 12 to include priority byte
@@ -267,7 +262,6 @@ web_client_topics = {}  # Map client_id -> {"info": topic, "status": topic}
 web_ptt_active = False  # Is a web client transmitting
 last_web_ptt_frame_time = 0.0  # monotonic timestamp of last Web PTT audio frame
 WEB_PTT_IDLE_TIMEOUT = 5.0  # seconds with no audio frames before auto-resetting stuck PTT state
-web_ptt_encoder = None  # Opus encoder for web PTT
 web_event_loop = None  # Event loop for async web operations
 web_tx_lock = None  # Async lock to serialize web PTT transmissions (created at runtime)
 INGRESS_PORT = int(os.environ.get('INGRESS_PORT', '8099'))
@@ -292,7 +286,6 @@ esp32_targets = {}  # Map device_id -> target_room
 current_audio_sender = None  # The device_id hex string of current transmitter
 
 # Reusable Opus encoder for TTS/media broadcast (lazily initialized)
-tts_encoder = None
 
 # Voice pipeline manager (initialized at startup)
 voice_pipeline: Optional[VoicePipelineManager] = None
@@ -512,7 +505,7 @@ class AudioCaptureBuffer:
             self._frames.clear()
 
     def record(self, direction, device_id_hex, sequence, priority,
-               opus_data, src_ip=None, target_ip=None):
+               audio_data, src_ip=None, target_ip=None):
         if not self._enabled:
             return
         frame = {
@@ -521,8 +514,8 @@ class AudioCaptureBuffer:
             "dev": device_id_hex,
             "seq": sequence,
             "pri": priority,
-            "opus_b64": base64.b64encode(opus_data).decode('ascii'),
-            "opus_len": len(opus_data),
+            "audio_b64": base64.b64encode(audio_data).decode('ascii'),
+            "audio_len": len(audio_data),
         }
         if src_ip:
             frame["src_ip"] = src_ip
@@ -894,11 +887,11 @@ def create_rx_socket():
     return sock
 
 
-def send_audio_packet(opus_data, target_ip=None, priority=None):
+def send_audio_packet(pcm_data, target_ip=None, priority=None):
     """Send an audio packet via multicast or unicast.
 
     Args:
-        opus_data: Opus encoded audio frame
+        pcm_data: Raw 16-bit PCM audio frame (640 bytes)
         target_ip: If None, send multicast. Otherwise unicast to target_ip.
         priority: PRIORITY_NORMAL/HIGH/EMERGENCY — defaults to current_tx_priority.
     """
@@ -913,7 +906,7 @@ def send_audio_packet(opus_data, target_ip=None, priority=None):
     # Header: device_id (8) + sequence (4) + priority (1) = 13 bytes
     header = DEVICE_ID + struct.pack('>IB', sequence_num, priority)
     sequence_num += 1
-    packet = header + opus_data
+    packet = header + pcm_data
 
     try:
         if target_ip:
@@ -922,7 +915,7 @@ def send_audio_packet(opus_data, target_ip=None, priority=None):
             tx_socket.sendto(packet, (MULTICAST_GROUP, MULTICAST_PORT))
         mcast_metrics.record_tx(success=True)
         audio_capture.record("tx", DEVICE_ID_STR, sequence_num - 1, priority,
-                            opus_data, target_ip=target_ip or MULTICAST_GROUP)
+                            pcm_data, target_ip=target_ip or MULTICAST_GROUP)
     except Exception as e:
         mcast_metrics.record_tx(success=False)
         mode = f"unicast to {target_ip}" if target_ip else "multicast"
@@ -1058,19 +1051,6 @@ def receive_thread():
 
     log.debug("Receive thread started")
 
-    # Create Opus decoder for forwarding to web clients
-    rx_decoder = None
-    if opuslib:
-        try:
-            rx_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
-            log.debug("RX decoder created for web client forwarding")
-        except Exception as e:
-            log.error(f"Failed to create RX decoder: {e}")
-
-    # Sequence tracking for PLC/FEC
-    rx_last_seq = None
-    rx_last_sender = None
-
     while True:
         try:
             data, addr = rx_socket.recvfrom(1024)
@@ -1098,27 +1078,24 @@ def receive_thread():
                 incoming_priority = data[12]
                 if incoming_priority > PRIORITY_VOICE_ASSIST:
                     incoming_priority = PRIORITY_NORMAL  # Clamp unknown values
-                opus_frame = data[PACKET_HEADER_SIZE:]  # 13-byte header
+                pcm_frame = data[PACKET_HEADER_SIZE:]  # Raw 16-bit PCM
             else:
                 incoming_priority = PRIORITY_NORMAL
-                opus_frame = data[12:]  # Old 12-byte header (legacy)
+                pcm_frame = data[12:]  # Old 12-byte header (legacy)
 
             # Record per-sender RX stats (before DND filter — counts all arriving packets)
             audio_rx_stats.record(sender_id_str, sequence, incoming_priority)
             audio_capture.record("rx", sender_id_str, sequence, incoming_priority,
-                                opus_frame, src_ip=addr[0])
+                                pcm_frame, src_ip=addr[0])
 
             # Route PRIORITY_VOICE_ASSIST to voice pipeline instead of intercoms
             if incoming_priority == PRIORITY_VOICE_ASSIST:
-                if voice_pipeline and rx_decoder and len(opus_frame) > 0:
+                if voice_pipeline and len(pcm_frame) > 0:
                     try:
-                        pcm = rx_decoder.decode(opus_frame, FRAME_SIZE)
-                        if pcm:
-                            # Use MQTT-style device ID to match session key
-                            sender_mqtt_id = f"intercom_{sender_id_str[-8:]}"
-                            voice_pipeline.feed_audio(sender_mqtt_id, pcm)
+                        sender_mqtt_id = f"intercom_{sender_id_str[-8:]}"
+                        voice_pipeline.feed_audio(sender_mqtt_id, pcm_frame)
                     except Exception as e:
-                        log.debug(f"Voice assist decode error: {e}")
+                        log.debug(f"Voice assist feed error: {e}")
                 continue  # Don't process as normal intercom audio
 
             # Hub DND check: only EMERGENCY plays through
@@ -1159,50 +1136,9 @@ def receive_thread():
                     notify_web_clients_state(state="receiving", source="hub")
                     log.info(f"Receiving broadcast audio from {sender_mqtt_id}")
 
-            # Decode and forward to web clients (with PLC/FEC for packet loss recovery)
-            if rx_decoder and web_clients and len(opus_frame) > 0:
-                try:
-                    # Reset tracking when sender changes (new transmission)
-                    if sender_id_str != rx_last_sender:
-                        rx_last_sender = sender_id_str
-                        rx_last_seq = None
-                        # Reset decoder so stale prediction state doesn't produce
-                        # ghost audio in the first frames of the new stream
-                        try:
-                            rx_decoder.reset_state()
-                        except Exception:
-                            rx_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
-
-                    # Gap detection for PLC/FEC
-                    if rx_last_seq is not None:
-                        gap = (sequence - rx_last_seq - 1) & 0xFFFFFFFF
-                        if 0 < gap <= 4:
-                            if gap == 1:
-                                # FEC: recover missing frame using data embedded in next packet
-                                try:
-                                    fec_pcm = rx_decoder.decode(opus_frame, FRAME_SIZE, decode_fec=True)
-                                    if fec_pcm:
-                                        forward_audio_to_web_clients(fec_pcm)
-                                except Exception:
-                                    pass
-                            else:
-                                # PLC: generate concealment audio for each missing frame
-                                for _ in range(gap):
-                                    try:
-                                        plc_pcm = rx_decoder.decode(None, FRAME_SIZE)
-                                        if plc_pcm:
-                                            forward_audio_to_web_clients(plc_pcm)
-                                    except Exception:
-                                        break
-
-                    rx_last_seq = sequence
-
-                    # Decode current frame normally
-                    pcm = rx_decoder.decode(opus_frame, FRAME_SIZE)
-                    if pcm:
-                        forward_audio_to_web_clients(pcm, priority=incoming_priority)
-                except Exception as e:
-                    pass  # Ignore decode errors
+            # Forward raw PCM to web clients
+            if web_clients and len(pcm_frame) > 0:
+                forward_audio_to_web_clients(pcm_frame, priority=incoming_priority)
 
         except socket.timeout:
             # Check if we should go back to idle
@@ -1344,27 +1280,7 @@ def fetch_and_convert_audio(url):
         return None
 
 
-def get_tts_encoder():
-    """Get or create the reusable Opus encoder for TTS/media broadcast.
-
-    Lazily initializes on first call. Reuses the same encoder across calls
-    to avoid the overhead of creating a new opuslib.Encoder each time.
-    Caller should call encoder.reset_state() before each use to clear
-    stale prediction data between broadcasts.
-    """
-    global tts_encoder
-
-    if tts_encoder is None and opuslib:
-        tts_encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
-        tts_encoder.bitrate = OPUS_BITRATE
-        try:
-            tts_encoder.inband_fec = 1
-            tts_encoder.packet_loss_perc = 10
-        except (TypeError, AttributeError):
-            pass  # opuslib version may have broken ctl_set property setters
-        log.info("TTS Opus encoder initialized")
-
-    return tts_encoder
+    # get_tts_encoder() removed — raw PCM, no encoding needed
 
 
 def _convert_wav_to_16k_mono_pcm(raw: bytes, nchannels: int, sampwidth: int, framerate: int) -> bytes:
@@ -1456,22 +1372,13 @@ def _convert_wav_to_16k_mono_pcm(raw: bytes, nchannels: int, sampwidth: int, fra
 
 
 def load_chime(filepath: Path) -> list:
-    """Load a WAV file and pre-encode it as a list of Opus frames.
+    """Load a WAV file and pre-chunk into raw PCM frames.
 
-    Converts the WAV to 16kHz mono 16-bit PCM, then encodes each 20ms
-    frame (320 samples = 640 bytes) using a dedicated Opus encoder.
-    Returns a list of encoded bytes objects (one per 20ms frame).
-
-    A dedicated encoder is used (not tts_encoder) so chime state does not
-    contaminate the TTS encoder's prediction history.
-
-    Returns an empty list if opuslib is unavailable or the file is unreadable.
+    Converts the WAV to 16kHz mono 16-bit PCM, then splits into 20ms
+    frames (320 samples = 640 bytes each).
+    Returns a list of bytes objects (one per 20ms frame).
     """
     import wave as _wave
-
-    if not opuslib:
-        log.warning(f"opuslib not available — chime '{filepath.name}' will not be encoded")
-        return []
 
     try:
         with _wave.open(str(filepath), 'rb') as wf:
@@ -1495,41 +1402,18 @@ def load_chime(filepath: Path) -> list:
         log.error(f"WAV conversion failed for '{filepath.name}': {e}")
         return []
 
-    log.info(
-        f"Chime '{filepath.name}' converted: {len(pcm)} bytes PCM at 16kHz mono "
-        f"({len(pcm)//(FRAME_SIZE*2)} frames)"
-    )
-
-    # Dedicated encoder — isolated from TTS encoder to avoid state pollution
-    try:
-        enc = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
-        enc.bitrate = OPUS_BITRATE
-        try:
-            enc.inband_fec = 1
-            enc.packet_loss_perc = 10
-        except (TypeError, AttributeError):
-            pass  # Some opuslib builds have broken ctl_set property setters
-    except Exception as e:
-        log.error(f"Failed to create Opus encoder for chime: {e}")
-        return []
-
-    frame_bytes = FRAME_SIZE * 2  # 640 bytes per 20ms frame
+    # Chunk into 20ms frames (640 bytes each)
+    frame_bytes = FRAME_SIZE * 2
     frames = []
     offset = 0
     while offset < len(pcm):
         chunk = pcm[offset:offset + frame_bytes]
         if len(chunk) < frame_bytes:
-            # Pad last frame to a full 20ms with silence
             chunk = chunk + b'\x00' * (frame_bytes - len(chunk))
-        try:
-            encoded = enc.encode(chunk, FRAME_SIZE)
-            frames.append(encoded)
-        except Exception as e:
-            log.warning(f"Opus encode failed at frame {len(frames)}: {e}")
-            break
+        frames.append(chunk)
         offset += frame_bytes
 
-    log.info(f"Chime '{filepath.name}' encoded: {len(frames)} Opus frames")
+    log.info(f"Chime '{filepath.name}' loaded: {len(frames)} PCM frames")
     return frames
 
 
@@ -1609,8 +1493,8 @@ def _stream_chime_blocking(target_ip: Optional[str], frames: list, chime_name: s
         consecutive_errors = 0
         first_frame_sent = False
 
-        for i, opus_frame in enumerate(frames):
-            packet = DEVICE_ID + struct.pack('>IB', chime_seq, PRIORITY_HIGH) + opus_frame
+        for i, pcm_frame in enumerate(frames):
+            packet = DEVICE_ID + struct.pack('>IB', chime_seq, PRIORITY_HIGH) + pcm_frame
             chime_seq += 1
 
             try:
@@ -1625,7 +1509,7 @@ def _stream_chime_blocking(target_ip: Optional[str], frames: list, chime_name: s
                     )
                 mcast_metrics.record_tx(success=True)
                 audio_capture.record("tx", DEVICE_ID_STR, chime_seq - 1, PRIORITY_HIGH,
-                                    opus_frame, target_ip=target_ip or MULTICAST_GROUP)
+                                    pcm_frame, target_ip=target_ip or MULTICAST_GROUP)
                 consecutive_errors = 0
             except Exception as e:
                 mcast_metrics.record_tx(success=False)
@@ -1740,10 +1624,10 @@ def publish_chime() -> None:
 
 
 def encode_and_broadcast(pcm_data):
-    """Encode PCM to Opus and send via multicast or unicast based on target.
+    """Broadcast raw PCM audio in 20ms frames.
 
     Uses two-phase approach for consistent timing:
-    1. Pre-encode all frames (variable time, doesn't affect playback)
+    1. Pre-chunk all frames (fast — just slicing)
     2. Send with precise timing (busy-wait for accuracy)
 
     Also forwards raw PCM to web clients.
@@ -1752,14 +1636,6 @@ def encode_and_broadcast(pcm_data):
 
     if len(pcm_data) == 0:
         return
-
-    # Prepare raw PCM frames for web clients (need to send from async context)
-    frame_bytes = FRAME_SIZE * 2
-    pcm_frames = []
-    offset = 0
-    while offset + frame_bytes <= len(pcm_data):
-        pcm_frames.append(pcm_data[offset:offset + frame_bytes])
-        offset += frame_bytes
 
     # Prevent concurrent transmissions
     if not tx_lock.acquire(blocking=False):
@@ -1770,103 +1646,76 @@ def encode_and_broadcast(pcm_data):
         # Wait for channel to be free (first-to-talk collision avoidance)
         wait_for_channel()
 
-        # Mark as transmitting BEFORE encoding to prevent collisions during encode phase
         with state_lock:
             current_state = "transmitting"
         publish_state(state="transmitting")
 
-        # Get target IP (None = multicast to all)
         target_ip = get_target_ip()
         target_desc = f"to {current_target}" if target_ip else "to all rooms"
 
-        frame_bytes = FRAME_SIZE * 2  # 16-bit samples = 640 bytes per frame
-        audio_frames = len(pcm_data) // frame_bytes
-        audio_duration = audio_frames * FRAME_DURATION_MS / 1000.0
-        log.info(f"Broadcasting: {audio_frames} audio frames ({audio_duration:.2f}s) + 15 lead-in + 30 trail-out = {audio_frames+45} total frames")
-
-        # === PHASE 1: PRE-ENCODE ALL FRAMES ===
-        # This separates encoding time from transmission timing
-        encoder = get_tts_encoder()
-        if encoder is None:
-            log.error("No Opus encoder available for broadcast")
-            return
-
-        # Reset encoder state to prevent stale prediction data between broadcasts
-        try:
-            encoder.reset_state()
-        except (AttributeError, Exception):
-            log.debug("Opus encoder reset_state not available — skipping")
-
-        encoded_frames = []
+        frame_bytes = FRAME_SIZE * 2  # 640 bytes per frame
         silence_pcm = bytes(frame_bytes)
 
-        # Lead-in silence (300ms = 15 frames) - lets ESP32 jitter buffer prime
-        # Encode each frame fresh to maintain encoder state continuity
-        for _ in range(15):
-            silence_opus = encoder.encode(silence_pcm, FRAME_SIZE)
-            encoded_frames.append(silence_opus)
+        # Pre-chunk all frames: lead-in + audio + trail-out
+        all_frames = []
 
-        # Encode actual audio frames
+        # Lead-in silence (300ms = 15 frames)
+        for _ in range(15):
+            all_frames.append(silence_pcm)
+
+        # Audio frames
+        audio_frame_count = 0
         offset = 0
         while offset + frame_bytes <= len(pcm_data):
-            frame = pcm_data[offset:offset + frame_bytes]
-            opus_data = encoder.encode(frame, FRAME_SIZE)
-            encoded_frames.append(opus_data)
+            all_frames.append(pcm_data[offset:offset + frame_bytes])
+            audio_frame_count += 1
             offset += frame_bytes
+        # Pad last partial frame if any
+        if offset < len(pcm_data):
+            last = pcm_data[offset:]
+            all_frames.append(last + b'\x00' * (frame_bytes - len(last)))
+            audio_frame_count += 1
 
-        # Trail-out silence (600ms = 30 frames) - flush ESP32 buffers
-        # Must encode fresh to maintain decoder state continuity
+        # Trail-out silence (600ms = 30 frames)
         for _ in range(30):
-            silence_opus = encoder.encode(silence_pcm, FRAME_SIZE)
-            encoded_frames.append(silence_opus)
+            all_frames.append(silence_pcm)
 
-        # === PHASE 2: SEND WITH PRECISE TIMING ===
-        log.debug(f"Sending {len(encoded_frames)} frames {target_desc}...")
+        audio_duration = audio_frame_count * FRAME_DURATION_MS / 1000.0
+        log.info(f"Broadcasting: {audio_frame_count} audio frames ({audio_duration:.2f}s) + 15 lead-in + 30 trail-out = {len(all_frames)} total frames")
 
-        frame_interval = FRAME_DURATION_MS / 1000.0  # 0.02 seconds
+        # Send with precise timing
+        frame_interval = FRAME_DURATION_MS / 1000.0
         start_time = time.monotonic()
 
-        # PCM frame index for web client forwarding (skip lead-in silence)
-        pcm_frame_idx = 0
+        for i, frame in enumerate(all_frames):
+            send_audio_packet(frame, target_ip)
 
-        for i, opus_data in enumerate(encoded_frames):
-            # Send packet to ESP32s
-            send_audio_packet(opus_data, target_ip)
-
-            # Forward PCM to web clients (skip lead-in/trail-out silence)
-            # Lead-in is first 15 frames, actual audio is next len(pcm_frames), trail-out is last 30
-            if 15 <= i < 15 + len(pcm_frames) and web_clients and web_event_loop:
-                pcm_frame = pcm_frames[pcm_frame_idx]
-                pcm_frame_idx += 1
+            # Forward audio frames (not silence) to web clients
+            if 15 <= i < 15 + audio_frame_count and web_clients and web_event_loop:
                 try:
                     asyncio.run_coroutine_threadsafe(
-                        broadcast_to_web_clients(pcm_frame),
+                        broadcast_to_web_clients(frame),
                         web_event_loop
                     )
                 except Exception:
                     pass
 
-            # Calculate target time for next frame
+            # Precise timing: coarse sleep + busy-wait
             next_frame_time = start_time + ((i + 1) * frame_interval)
-
-            # Coarse sleep (to within 3ms of target)
             now = time.monotonic()
             sleep_time = next_frame_time - now - 0.003
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
-            # Fine-grained busy-wait for precise timing
-            # This burns CPU but gives <1ms accuracy
             while time.monotonic() < next_frame_time:
                 pass
 
         elapsed = time.monotonic() - start_time
-        expected = len(encoded_frames) * frame_interval
+        expected = len(all_frames) * frame_interval
         drift_ms = (elapsed - expected) * 1000
-        log.info(f"Broadcast complete: {len(encoded_frames)} frames in {elapsed:.2f}s (expected {expected:.2f}s, drift: {drift_ms:+.1f}ms)")
+        log.info(f"Broadcast complete: {len(all_frames)} frames in {elapsed:.2f}s (expected {expected:.2f}s, drift: {drift_ms:+.1f}ms)")
 
     except Exception as e:
-        log.error(f"encoding/sending audio: {e}")
+        log.error(f"sending audio: {e}")
         import traceback
         traceback.print_exc()
 
@@ -2633,7 +2482,7 @@ def on_mqtt_disconnect(client, userdata, disconnect_flags, reason_code, properti
 
 async def websocket_handler(request):
     """Handle WebSocket connections for web PTT."""
-    global web_ptt_active, web_ptt_encoder, current_state, current_chime, last_web_ptt_frame_time
+    global web_ptt_active, current_state, current_chime, last_web_ptt_frame_time
 
     log.debug(f"WebSocket connection request from {request.remote}")
     ws = web.WebSocketResponse()
@@ -2642,10 +2491,6 @@ async def websocket_handler(request):
 
     web_clients.add(ws)
     log.info(f"Web PTT client connected ({len(web_clients)} total)")
-
-    # Note: encoder is created fresh at ptt_start, not here.
-    # Creating it here caused crashes when opuslib's FEC property setter fails
-    # (opuslib 3.x has a broken ctl_set implementation in some builds).
 
     # Check if this is a mobile app connection (for auto-naming)
     user_agent = request.headers.get('User-Agent', '')
@@ -2694,19 +2539,17 @@ async def websocket_handler(request):
         async for msg in ws:
             if msg.type == web.WSMsgType.BINARY:
                 # PCM audio data from browser (640 bytes = 320 samples * 2 bytes)
-                if ptt_active and web_ptt_encoder and len(msg.data) == FRAME_SIZE * 2:
+                if ptt_active and len(msg.data) == FRAME_SIZE * 2:
                     # Send lead-in silence on first frame
                     if not lead_in_sent:
                         silence_pcm = bytes(FRAME_SIZE * 2)
-                        silence_opus = web_ptt_encoder.encode(silence_pcm, FRAME_SIZE)
                         for _ in range(15):  # 300ms lead-in
-                            send_audio_packet(silence_opus, ptt_target, priority=ptt_priority)
+                            send_audio_packet(silence_pcm, ptt_target, priority=ptt_priority)
                             await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
                         lead_in_sent = True
 
-                    # Encode and send to ESP32s
-                    opus_data = web_ptt_encoder.encode(msg.data, FRAME_SIZE)
-                    send_audio_packet(opus_data, ptt_target, priority=ptt_priority)
+                    # Send raw PCM directly to ESP32s
+                    send_audio_packet(msg.data, ptt_target, priority=ptt_priority)
                     frame_count += 1
                     last_web_ptt_frame_time = time.monotonic()
 
@@ -2755,17 +2598,6 @@ async def websocket_handler(request):
                             lead_in_sent = False
                             frame_count = 0
 
-                            # Create FRESH encoder for this PTT session
-                            # (critical: encoder state must not carry over between sessions)
-                            if opuslib:
-                                web_ptt_encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, opuslib.APPLICATION_VOIP)
-                                web_ptt_encoder.bitrate = OPUS_BITRATE
-                                try:
-                                    web_ptt_encoder.inband_fec = 1
-                                    web_ptt_encoder.packet_loss_perc = 10
-                                except (TypeError, AttributeError):
-                                    pass  # opuslib version may have broken ctl_set property setters
-
                             # Get target IP (no automatic notifications - use Call button)
                             raw_target = data.get('target', 'all')
                             target_room = sanitize_room_name(raw_target) if raw_target != 'all' else 'all'
@@ -2800,21 +2632,17 @@ async def websocket_handler(request):
 
                     elif msg_type == 'ptt_stop':
                         if ptt_active:
-                            # Send trail-out silence - encode FRESH each frame
-                            # (keeps codec state flowing naturally to end)
-                            if web_ptt_encoder and lead_in_sent:
+                            # Send trail-out silence
+                            if lead_in_sent:
                                 silence_pcm = bytes(FRAME_SIZE * 2)
                                 for _ in range(30):  # 600ms trail-out
-                                    silence_opus = web_ptt_encoder.encode(silence_pcm, FRAME_SIZE)
-                                    send_audio_packet(silence_opus, ptt_target, priority=ptt_priority)
+                                    send_audio_packet(silence_pcm, ptt_target, priority=ptt_priority)
                                     await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
 
                             ptt_active = False
                             with state_lock:
                                 web_ptt_active = False
                                 current_state = "idle"
-                            # Reset encoder - prevents state carryover to next session
-                            web_ptt_encoder = None
                             publish_state(state="idle", notify_web=False)  # MQTT only - we handle web clients below
                             log.info(f"Web PTT stopped ({frame_count} frames)")
 
