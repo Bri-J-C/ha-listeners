@@ -133,10 +133,20 @@ void audio_output_start(void)
         esp_err_t ret = i2s_channel_enable(tx_handle);
         if (ret == ESP_OK) {
             is_active = true;
-            // No silence pre-fill needed: auto_clear=true outputs silence on
-            // underrun, and the TX lead-in sends 15 silence frames that prime
-            // the DMA. Removing pre-fill avoids blocking the play task for 40ms
-            // during which incoming packets would overflow the RX queue.
+
+            // Pre-fill DMA with 4 frames of silence (80ms jitter buffer).
+            // With raw PCM (no decode overhead), the play task processes frames
+            // instantly — without pre-fill, only 1 DMA descriptor is ever occupied
+            // and any scheduling jitter causes audible underrun gaps (chattering).
+            // Writing to an EMPTY DMA chain is non-blocking (descriptors accept
+            // data immediately), so this doesn't stall the play task.
+            static const int16_t silence[FRAME_SIZE * 2] = {0};
+            size_t written;
+            for (int i = 0; i < 4; i++) {
+                i2s_channel_write(tx_handle, silence, sizeof(silence),
+                                  &written, pdMS_TO_TICKS(10));
+            }
+
             ESP_LOGI(TAG, "[I2S] output_start (vol=%d%%, muted=%d)",
                      current_volume, is_muted);
         } else {
