@@ -240,15 +240,20 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
         incoming_priority = 0;
     }
 
-    // Extract PCM payload
+    // Extract PCM payload into aligned buffer.
+    // packet->pcm_data is at byte offset 13 in the packed struct (odd address),
+    // so casting directly to int16_t* produces misaligned reads. memcpy to an
+    // aligned buffer first.
     size_t pcm_len = (total_len > HEADER_LENGTH) ? total_len - HEADER_LENGTH : 0;
     if (pcm_len == 0 || pcm_len > PCM_FRAME_BYTES) {
         return;  // Malformed packet
     }
 
-    // Silence detection: check if all PCM samples are zero
+    static int16_t rx_pcm_aligned[FRAME_SIZE];
+    memcpy(rx_pcm_aligned, packet->pcm_data, pcm_len);
+
     size_t samples = pcm_len / sizeof(int16_t);
-    const int16_t *pcm = (const int16_t *)packet->pcm_data;
+    const int16_t *pcm = rx_pcm_aligned;
     bool is_silence_frame = true;
     for (size_t i = 0; i < samples; i++) {
         if (pcm[i] != 0) {

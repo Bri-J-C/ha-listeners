@@ -133,20 +133,10 @@ void audio_output_start(void)
         esp_err_t ret = i2s_channel_enable(tx_handle);
         if (ret == ESP_OK) {
             is_active = true;
-
-            /*
-             * Pre-fill 2 DMA descriptors with silence to overwrite stale data
-             * from a prior session (i2s_channel_disable doesn't zero buffers).
-             * Only 2 needed: remaining descriptors use auto_clear=true which
-             * outputs silence on underrun. Reduces start latency from ~160ms to ~40ms.
-             */
-            static const int16_t silence[FRAME_SIZE * 2] = {0};
-            size_t written;
-            for (int i = 0; i < 2; i++) {
-                i2s_channel_write(tx_handle, silence, sizeof(silence),
-                                  &written, pdMS_TO_TICKS(25));
-            }
-
+            // No silence pre-fill needed: auto_clear=true outputs silence on
+            // underrun, and the TX lead-in sends 15 silence frames that prime
+            // the DMA. Removing pre-fill avoids blocking the play task for 40ms
+            // during which incoming packets would overflow the RX queue.
             ESP_LOGI(TAG, "[I2S] output_start (vol=%d%%, muted=%d)",
                      current_volume, is_muted);
         } else {
