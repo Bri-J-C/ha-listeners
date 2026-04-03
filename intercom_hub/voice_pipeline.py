@@ -6,7 +6,7 @@ Manages per-device voice assist sessions:
 2. Hub opens Wyoming connection to HA's Assist pipeline
 3. Hub forwards decoded PCM from ESP32 (PRIORITY_VOICE_ASSIST packets) to Wyoming
 4. Wyoming returns STT transcript + TTS audio
-5. Hub encodes TTS audio as Opus and sends back to ESP32 via unicast UDP
+5. Hub sends TTS audio as raw PCM back to ESP32 via unicast UDP
 """
 
 import asyncio

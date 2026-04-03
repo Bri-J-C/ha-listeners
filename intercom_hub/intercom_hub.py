@@ -160,7 +160,7 @@ except ImportError:
     log.warning("aiohttp not available - web PTT disabled")
     web = None
 
-# opuslib removed — audio packets now carry raw 16-bit PCM
+# Audio packets carry raw 16-bit PCM (no codec)
 
 # Configuration from environment
 MQTT_HOST = os.environ.get('MQTT_HOST', 'core-mosquitto')
@@ -285,8 +285,6 @@ esp32_targets = {}  # Map device_id -> target_room
 # Track current audio sender (for routing to correct web client)
 current_audio_sender = None  # The device_id hex string of current transmitter
 
-# Reusable Opus encoder for TTS/media broadcast (lazily initialized)
-
 # Voice pipeline manager (initialized at startup)
 voice_pipeline: Optional[VoicePipelineManager] = None
 
@@ -356,7 +354,7 @@ mcast_metrics = MulticastMetrics()
 class AudioRxStats:
     """Per-sender UDP packet statistics for the hub's audio receive path.
 
-    Records metadata for every Opus packet received from an ESP32 UDP sender,
+    Records metadata for every audio packet received from an ESP32 UDP sender,
     keyed by the sender's 8-byte device_id in hex.  Only tracks packets from
     receive_thread() (UDP multicast); web PTT audio arrives via WebSocket and
     is not counted here.  Designed to be called from receive_thread() (a
@@ -474,7 +472,7 @@ audio_rx_stats = AudioRxStats()
 
 
 class AudioCaptureBuffer:
-    """Ring buffer storing recent Opus frames for QA audio analysis.
+    """Ring buffer storing recent audio frames for QA audio analysis.
 
     Captures frames from both RX (receive_thread) and TX (send_audio_packet,
     _stream_chime_blocking) paths. Disabled by default — QA enables via
@@ -541,8 +539,8 @@ class AudioCaptureBuffer:
 audio_capture = AudioCaptureBuffer()
 
 
-# Chime state: pre-encoded chime frames, keyed by chime name (e.g. "doorbell")
-# Loaded at startup; each entry is a list of Opus-encoded bytes objects.
+# Chime state: pre-loaded chime frames, keyed by chime name (e.g. "doorbell")
+# Loaded at startup; each entry is a list of raw PCM bytes objects (640 bytes each).
 loaded_chimes: Dict[str, list] = {}
 
 # Selected chime name (controlled via HA select entity)
@@ -1280,8 +1278,6 @@ def fetch_and_convert_audio(url):
         return None
 
 
-    # get_tts_encoder() removed — raw PCM, no encoding needed
-
 
 def _convert_wav_to_16k_mono_pcm(raw: bytes, nchannels: int, sampwidth: int, framerate: int) -> bytes:
     """Convert raw WAV PCM bytes to 16kHz mono 16-bit signed little-endian PCM.
@@ -1431,7 +1427,7 @@ def _seed_persistent_chimes() -> None:
 
 
 def load_all_chimes() -> None:
-    """Scan the chimes directory and pre-encode all WAV files into memory.
+    """Scan the chimes directory and pre-load all WAV files as PCM frames into memory.
 
     The chime name is the filename stem (e.g., 'doorbell' for 'doorbell.wav').
     Results are stored in the module-level `loaded_chimes` dict.
@@ -1549,7 +1545,7 @@ def _stream_chime_blocking(target_ip: Optional[str], frames: list, chime_name: s
 
 
 async def stream_chime_to_target(target_ip: Optional[str], chime_name: str = "") -> None:
-    """Stream pre-encoded chime frames to a target device (or multicast).
+    """Stream chime PCM frames to a target device (or multicast).
 
     Delegates to _stream_chime_blocking() in a thread for precise timing
     (coarse-sleep + busy-wait, same pattern as encode_and_broadcast).
@@ -2917,7 +2913,9 @@ async def index_handler(request):
 async def static_handler(request):
     """Serve static files."""
     filename = request.match_info.get('filename', 'index.html')
-    filepath = WWW_PATH / filename
+    filepath = (WWW_PATH / filename).resolve()
+    if not filepath.is_relative_to(WWW_PATH.resolve()):
+        return web.Response(status=403)
     log.debug(f"Static request: {request.path} -> {filepath}")
 
     if filepath.exists() and filepath.is_file():
@@ -2997,7 +2995,7 @@ async def chimes_upload_handler(request):
     dest.write_bytes(bytes(data))
     log.info(f"Chime uploaded: '{chime_name}' ({len(data)} bytes) -> {dest}")
 
-    # Encode to Opus frames
+    # Convert to PCM frames
     frames = load_chime(dest)
     if not frames:
         dest.unlink(missing_ok=True)
@@ -3302,7 +3300,7 @@ def main():
     log.info(f"Log level: {LOG_LEVEL}")
     log.info("=" * 50)
 
-    # Pre-encode chime audio files for zero-latency streaming
+    # Pre-load chime audio files for zero-latency streaming
     global current_chime
     load_all_chimes()
     # Set initial chime to first available if the default ('doorbell') isn't loaded

@@ -52,9 +52,6 @@ profile intercom_hub flags=(attach_disconnected,mediate_deleted) {
   /usr/bin/ffmpeg rix,
   /usr/bin/ffprobe rix,
 
-  # Opus codec library
-  /usr/lib/libopus* mr,
-
   # System libraries needed by Python packages
   /lib/** mr,
   /usr/lib/** mr,

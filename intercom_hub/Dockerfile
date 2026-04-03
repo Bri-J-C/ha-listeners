@@ -5,10 +5,7 @@ FROM ${BUILD_FROM}
 RUN apk add --no-cache \
     python3 \
     py3-pip \
-    ffmpeg \
-    gcc \
-    musl-dev \
-    python3-dev
+    ffmpeg
 
 # Install Python packages
 COPY requirements.txt /
