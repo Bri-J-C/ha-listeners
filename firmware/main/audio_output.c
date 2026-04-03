@@ -97,11 +97,13 @@ esp_err_t audio_output_init(void)
         return ret;
     }
 
-    // Allocate stereo conversion buffer - prefer PSRAM
+    // Allocate stereo conversion buffer in internal RAM.
+    // PSRAM goes through the data cache which shares MMU with flash mmap;
+    // internal RAM is DMA-safe and avoids any cache contention.
     size_t buf_size = FRAME_SIZE * 2 * sizeof(int16_t);
-    stereo_buffer = (int16_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    stereo_buffer = (int16_t *)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!stereo_buffer) {
-        stereo_buffer = (int16_t *)heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        stereo_buffer = (int16_t *)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (!stereo_buffer) {
         ESP_LOGE(TAG, "Failed to allocate stereo buffer");
