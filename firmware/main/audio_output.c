@@ -51,7 +51,7 @@ esp_err_t audio_output_init(void)
     // I2S channel configuration
     //
     // DMA buffer depth: 8 descriptors x FRAME_SIZE (320) samples = 2560 samples = 160ms at 16kHz.
-    // This provides 8 Opus frames of headroom, which absorbs typical WiFi retransmission
+    // This provides 8 audio frames of headroom, which absorbs typical WiFi retransmission
     // latency (50-100ms) while keeping end-to-end audio latency low (~80ms average).
     // ESP-IDF default is 6x240=90ms; previous config was 12x640=480ms (excessive for voice).
     // Memory: 8 x 320 x 2ch x 2B = ~10KB DMA (vs ~30KB at old settings).

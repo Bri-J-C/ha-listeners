@@ -39,7 +39,7 @@ esp_err_t audio_input_init(void)
     // Research: Fewer, smaller DMA buffers = lower latency but less jitter tolerance
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 6;           // Reduced from 8 for lower latency
-    chan_cfg.dma_frame_num = FRAME_SIZE; // Match codec frame size exactly
+    chan_cfg.dma_frame_num = FRAME_SIZE; // Match audio frame size exactly
 
     esp_err_t ret = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
     if (ret != ESP_OK) {

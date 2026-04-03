@@ -3,7 +3,7 @@
  *
  * Uses espressif/esp-sr's esp_aec API.
  *
- * The AEC library requires 512-sample (32ms) frames while the Opus codec
+ * The AEC library requires 512-sample (32ms) frames while the audio path
  * uses 320-sample (20ms) frames. This module bridges the gap:
  *
  *   audio_input_read()  → mic_accum[] → (when 512 samples) → aec_process()
@@ -12,10 +12,10 @@
  *                                                              ↓
  *                                              out_ring[] ← cleaned
  *                                                              ↓
- *                                         aec_pop_cleaned() → codec_encode()
+ *                                         aec_pop_cleaned() → TX send
  *
  * After pipeline priming (~40ms / 2 mic frames), one cleaned frame
- * is available roughly every 20ms, matching the Opus encode rate.
+ * is available roughly every 20ms, matching the PCM frame rate.
  */
 
 #include "aec.h"
@@ -42,7 +42,7 @@
 static const char *TAG = "aec";
 
 /* AEC frame size is fixed at 512 samples (32ms @ 16kHz) by the library.    */
-/* Our Opus frame is 320 samples (20ms). The accumulation and output rings   */
+/* Our audio frame is 320 samples (20ms). The accumulation and output rings  */
 /* smooth this out. After the first AEC run (~40ms), throughput matches.     */
 #define AEC_CHUNK_SAMPLES   512
 #define MIC_ACCUM_SIZE      (AEC_CHUNK_SAMPLES * 2)  // 2 chunks max in flight

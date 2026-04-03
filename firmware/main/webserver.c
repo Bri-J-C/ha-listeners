@@ -57,9 +57,12 @@ extern void sustained_tx_stop_task(void *arg);
 // Test tone concurrency guard — prevents overlapping test_tone runs
 static volatile bool test_tone_active = false;
 
-// Test tone task stack in PSRAM (Opus encoding requires ~30KB stack,
-// HTTP server task has only 12KB — must run in a separate task)
-static EXT_RAM_BSS_ATTR StackType_t test_tone_stack[32768 / sizeof(StackType_t)];
+// Test tone task stack in PSRAM (raw PCM needs ~8KB stack,
+// HTTP server task has only 12KB — must run in a separate task).
+// Allocated via heap_caps_malloc(MALLOC_CAP_SPIRAM) for consistency
+// with other task stacks (avoids mmap conflict with WakeNet).
+#define TEST_TONE_STACK_SIZE 8192
+static StackType_t *test_tone_stack = NULL;
 static StaticTask_t test_tone_tcb;
 
 // Get client IP address from HTTP request (for logging)
@@ -982,10 +985,10 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 }
 
 // ---------------------------------------------------------------------------
-// Test tone task — generates sine wave, Opus-encodes, sends via multicast.
+// Test tone task — generates sine wave, packs raw PCM, sends via multicast.
 //
-// Runs in a dedicated FreeRTOS task with a 32KB PSRAM stack because Opus
-// encoding requires ~30KB of stack (the HTTP server task has only 12KB).
+// Runs in a dedicated FreeRTOS task with an 8KB PSRAM stack
+// (the HTTP server task has only 12KB and cannot block on network sends).
 // ---------------------------------------------------------------------------
 static void test_tone_task(void *arg)
 {
@@ -1203,7 +1206,7 @@ static esp_err_t api_test_handler(httpd_req_t *req)
 
         TaskHandle_t task = xTaskCreateStatic(
             test_tone_task, "test_tone",
-            sizeof(test_tone_stack) / sizeof(StackType_t),
+            TEST_TONE_STACK_SIZE / sizeof(StackType_t),
             targ, 5, test_tone_stack, &test_tone_tcb);
 
         if (!task) {
@@ -1230,7 +1233,7 @@ static esp_err_t api_test_handler(httpd_req_t *req)
             httpd_resp_send(req, resp, strlen(resp));
         } else {
             // Short tone: wait synchronously with generous timeout.
-            // Nominal duration = frames * 20ms; add 1s buffer for encode overhead.
+            // Nominal duration = frames * 20ms; add 1s buffer for scheduling overhead.
             TickType_t timeout_ms = (TickType_t)(duration_frames * FRAME_DURATION_MS) + 1000;
             bool completed = (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE);
 
@@ -1268,7 +1271,7 @@ static esp_err_t api_test_handler(httpd_req_t *req)
     }
 
     // ---- action: sustained_tx ----
-    // Activates the real TX pipeline (mic → encode → UDP send) for a specified
+    // Activates the real TX pipeline (mic → UDP send) for a specified
     // duration, simulating a PTT press. Uses the existing audio_tx_task by
     // setting transmitting=true. A lightweight timer task clears it after the
     // requested duration.
@@ -1283,7 +1286,7 @@ static esp_err_t api_test_handler(httpd_req_t *req)
         }
         cJSON_Delete(root);
 
-        // Check preconditions: Opus encoder can only be used by one thing at a time
+        // Check preconditions: TX pipeline can only be used by one thing at a time
         if (transmitting) {
             ESP_LOGW(TAG, "API: /api/test sustained_tx rejected — PTT active");
             httpd_resp_set_status(req, "409 Conflict");
@@ -1322,7 +1325,7 @@ static esp_err_t api_test_handler(httpd_req_t *req)
         *dur_ms_ptr = (uint32_t)(dur_sec * 1000.0);
 
         // Claim slot and activate TX — the existing audio_tx_task sees
-        // transmitting=true and starts mic capture → encode → send.
+        // transmitting=true and starts mic capture → UDP send.
         sustained_tx_active = true;
         transmitting = true;
 
@@ -1392,6 +1395,14 @@ esp_err_t webserver_start(void)
     if (server) {
         ESP_LOGW(TAG, "Server already running");
         return ESP_OK;
+    }
+
+    // Allocate test tone task stack from PSRAM heap (if not already allocated)
+    if (!test_tone_stack) {
+        test_tone_stack = heap_caps_malloc(TEST_TONE_STACK_SIZE, MALLOC_CAP_SPIRAM);
+        if (!test_tone_stack) {
+            ESP_LOGW(TAG, "Failed to allocate test tone stack in PSRAM");
+        }
     }
 
     // Generate CSRF token once at startup (stable for entire session)

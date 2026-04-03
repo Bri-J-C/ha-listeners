@@ -183,7 +183,7 @@ static void start_ap_mode(void)
     // Set AP IP as local_ip so webserver works
     local_ip.addr = esp_ip4addr_aton("192.168.4.1");
 
-    ESP_LOGI(TAG, "AP mode started: SSID='%s' (WPA2), Password='%s', IP=192.168.4.1", ap_ssid, ap_password);
+    ESP_LOGI(TAG, "AP mode started: SSID='%s' (WPA2), Password='****' (len=%d), IP=192.168.4.1", ap_ssid, (int)strlen(ap_password));
     ESP_LOGI(TAG, "Connect to this network and go to http://192.168.4.1 to configure");
 
     // Show AP credentials on OLED for easy setup
@@ -397,9 +397,9 @@ esp_err_t network_start_rx(void)
     int rcvbuf = 32768;
     setsockopt(rx_socket, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
-    // Start RX task - needs larger stack for Opus decoding
+    // Start RX task
     rx_running = true;
-    xTaskCreate(rx_task, "network_rx", 16384, NULL, 5, &rx_task_handle);
+    xTaskCreate(rx_task, "network_rx", 8192, NULL, 5, &rx_task_handle);
 
     // Start periodic IGMP rejoin timer (prevents group membership expiry)
     if (!igmp_rejoin_timer) {

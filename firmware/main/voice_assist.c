@@ -13,7 +13,7 @@
  *   1. Play chime (~300ms, blocks)
  *   2. Set LED to LED_STATE_VOICE_ASSIST, OLED to DISPLAY_STATE_VOICE_ASSIST
  *   3. Publish MQTT voice_assist_start
- *   4. Enter VA_STATE_ACTIVE: encode mic → unicast UDP with PRIORITY_VOICE_ASSIST
+ *   4. Enter VA_STATE_ACTIVE: stream mic → unicast UDP with PRIORITY_VOICE_ASSIST
  *   5. Stop on: silence timeout (5s), max session (30s), PTT cancel, MQTT end
  *
  * WakeNet notes:
@@ -173,8 +173,8 @@ static esp_err_t send_va_packet(const int16_t *pcm, uint32_t seq, const char *de
  * Loops continuously:
  *   - VA_STATE_IDLE:   capture one FRAME_SIZE chunk and feed to WakeNet.
  *                      On detection → chime, MQTT, enter ACTIVE.
- *   - VA_STATE_ACTIVE: capture, encode, unicast.  Monitor silence + timeout.
- *   - VA_STATE_TTS_PLAYBACK: yield; audio_playing handles RX decode.
+ *   - VA_STATE_ACTIVE: capture, unicast.  Monitor silence + timeout.
+ *   - VA_STATE_TTS_PLAYBACK: yield; audio_playing handles RX playback.
  *   - VA_STATE_DISABLED: yield 50ms.
  */
 static void voice_assist_task(void *arg)
@@ -356,7 +356,7 @@ esp_err_t voice_assist_init(void)
     ESP_LOGI(TAG, "Initialising voice assist module");
 
     // Allocate audio buffers from PSRAM
-    // Allocate for max of FRAME_SIZE (320, Opus encode) and WakeNet chunk (512)
+    // Allocate for max of FRAME_SIZE (320, PCM frame) and WakeNet chunk (512)
     size_t pcm_samples = (FRAME_SIZE > 512) ? FRAME_SIZE : 512;
     s_pcm_buf    = (int16_t *)heap_caps_malloc(pcm_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_packet_buf = (uint8_t *)heap_caps_malloc(MAX_PACKET_SIZE,               MALLOC_CAP_SPIRAM);

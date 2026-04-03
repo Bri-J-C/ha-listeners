@@ -88,12 +88,12 @@ static uint32_t tx_frame_count = 0;       // Total frames sent in current PTT se
 static uint32_t tx_start_tick = 0;        // Tick when PTT started (for duration calc)
 
 // Cumulative counters since boot (non-static: exposed to webserver.c via extern)
-uint32_t tx_frame_total = 0;              // Total Opus frames sent since boot (never resets)
+uint32_t tx_frame_total = 0;              // Total PCM frames sent since boot (never resets)
 
 // Sustained TX state (non-static: accessed by webserver.c via extern)
 volatile bool sustained_tx_active = false; // True while API-initiated sustained_tx is running
 
-// Sequence tracking for PLC/FEC
+// Sequence tracking for gap detection
 static volatile uint32_t last_sequence = 0;
 static volatile bool sequence_initialized = false;
 
@@ -104,7 +104,7 @@ static volatile uint8_t current_rx_priority = 0;  // Priority of current sender 
 #define SENDER_TIMEOUT_MS 500  // Release channel after 500ms silence
 
 /**
- * Get current RX audio queue depth (items waiting to be decoded/played).
+ * Get current RX audio queue depth (items waiting to be played).
  * Returns 0 if queue not yet created.
  */
 UBaseType_t get_rx_queue_depth(void)
@@ -163,7 +163,7 @@ static bool is_channel_busy(void)
 /**
  * Network RX callback — lightweight enqueue only.
  *
- * Runs in the network_rx task. Must NOT block (no Opus decode, no I2S write).
+ * Runs in the network_rx task. Must NOT block (no I2S write).
  * Performs only cheap checks (own packet, transmitting, DND) then copies the
  * raw packet into the audio queue for the play task to handle.
  */
@@ -216,12 +216,12 @@ static void on_audio_received(const audio_packet_t *packet, size_t total_len)
             rx_log_counter++;
             if ((rx_log_counter % 50) == 1) {
                 uint32_t seq = ntohl(packet->sequence);
-                size_t opus_len = (total_len > HEADER_LENGTH) ? total_len - HEADER_LENGTH : 0;
-                ESP_LOGD(TAG, "[RX] src=%02x%02x%02x%02x seq=%lu pri=%d opus_len=%u q_depth=%u",
+                size_t payload_len = (total_len > HEADER_LENGTH) ? total_len - HEADER_LENGTH : 0;
+                ESP_LOGD(TAG, "[RX] src=%02x%02x%02x%02x seq=%lu pri=%d payload_len=%u q_depth=%u",
                          packet->device_id[0], packet->device_id[1],
                          packet->device_id[2], packet->device_id[3],
                          (unsigned long)seq, incoming_priority,
-                         (unsigned)opus_len, (unsigned)(q_depth + 1));
+                         (unsigned)payload_len, (unsigned)(q_depth + 1));
             }
         }
     }
@@ -323,7 +323,7 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
 
     uint32_t seq = ntohl(packet->sequence);
 
-    // Sequence tracking (log gaps, no PLC/FEC needed with raw PCM)
+    // Sequence tracking (log gaps for diagnostics)
     if (sequence_initialized) {
         int32_t gap = (int32_t)(seq - last_sequence - 1);
         if (gap > 4) {
@@ -350,11 +350,10 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
         }
     }
 
-    rx_packet_count++;
 }
 
 /**
- * Audio play task — dequeues packets and decodes/plays them.
+ * Audio play task — dequeues packets and plays them.
  *
  * Decoupled from the network RX task so that blocking I2S writes don't
  * cause incoming UDP packets to pile up in the socket buffer.
@@ -375,8 +374,7 @@ static void audio_play_task(void *arg)
 }
 
 /**
- * Audio transmit task - requires 32KB stack for Opus encoding.
- * Research: ESP32 Opus encoding needs 30KB+ stack.
+ * Audio transmit task - 8KB stack for raw PCM.
  *
  * Sends lead-in silence (300ms) before mic audio and trail-out silence
  * (600ms) after to ensure clean playback on receivers.
@@ -551,7 +549,7 @@ void sustained_tx_stop_task(void *arg)
 /**
  * Generate a short fallback beep (800 Hz, ~500ms) for call notification.
  *
- * The hub streams the real chime over UDP/Opus. This beep is played
+ * The hub streams the real chime over UDP. This beep is played
  * immediately on call arrival so the user gets instant feedback even
  * if the hub chime audio hasn't arrived yet (e.g., hub unreachable).
  * It is intentionally short to not overlap with incoming hub audio.
@@ -582,7 +580,7 @@ void play_fallback_beep(void)
         audio_output_stop();
         audio_playing = false;
         has_current_sender = false;
-        sequence_initialized = false;  // Prevent stale sequence triggering false PLC
+        sequence_initialized = false;  // Reset sequence tracking
     } else {
         ESP_LOGI(TAG, "Beep: no active RX audio to stop");
     }
@@ -1128,7 +1126,7 @@ void app_main(void)
     }
 
     // Initialize voice assistant AFTER all intercom PSRAM allocations (RX queue, task stacks,
-    // Opus codec). WakeNet mmap consumes PSRAM address space and must not starve intercom buffers.
+    // audio buffers). WakeNet mmap consumes PSRAM address space and must not starve intercom buffers.
     esp_err_t va_ret = voice_assist_init();
     if (va_ret == ESP_OK) {
         ESP_LOGI(TAG, "Voice assistant initialized");

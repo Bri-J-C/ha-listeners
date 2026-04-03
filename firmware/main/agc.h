@@ -1,7 +1,7 @@
 /**
  * Automatic Gain Control (AGC) Module
  *
- * Peak-tracking AGC to normalize microphone volume before Opus encoding.
+ * Peak-tracking AGC to normalize microphone volume before transmission.
  * Speakers at varying distances produce consistent loudness at the receiver.
  *
  * Algorithm: sliding-window peak tracker with asymmetric attack/release gain

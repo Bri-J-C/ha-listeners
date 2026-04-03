@@ -7,9 +7,9 @@
  *   - Reference signal (what's playing on speaker) is pushed from audio_output_write()
  *   - Mic signal is pushed from the TX task after each I2S read
  *   - AEC processes in 512-sample (32ms) chunks internally
- *   - Cleaned audio is read back in 320-sample (20ms) Opus frames
+ *   - Cleaned audio is read back in 320-sample (20ms) PCM frames
  *
- * Frame size mismatch (AEC=512, Opus=320) is handled internally with
+ * Frame size mismatch (AEC=512, PCM=320) is handled internally with
  * an accumulation buffer and output ring buffer — callers don't see it.
  *
  * Thread safety:
@@ -59,7 +59,7 @@ void aec_push_reference(const int16_t *ref, int samples);
 int aec_push_mic(const int16_t *mic, int samples);
 
 /**
- * Read echo-cancelled audio for Opus encoding.
+ * Read echo-cancelled audio for transmission.
  * Call from TX task after aec_push_mic().
  * NOT thread-safe — call from a single task only.
  *
