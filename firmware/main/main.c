@@ -329,14 +329,15 @@ static void process_rx_packet(const audio_packet_t *packet, size_t total_len)
     last_sequence = seq;
     sequence_initialized = true;
 
-    // Play PCM directly
+    // Play PCM directly (100ms timeout — DMA drain is exactly 20ms per frame,
+    // so 20ms timeout causes spurious failures; 100ms gives 5 frames of headroom)
     if (!is_silence_frame && audio_playing) {
-        int written = audio_output_write(pcm, samples, 20);
+        int written = audio_output_write(pcm, samples, 100);
         if (written == 0 && audio_playing) {
             ESP_LOGW(TAG, "RX write returned 0 — restarting I2S (seq=%lu)", (unsigned long)seq);
             audio_output_stop();
             audio_output_start();
-            if (audio_output_write(pcm, samples, 20) == 0) {
+            if (audio_output_write(pcm, samples, 100) == 0) {
                 ESP_LOGE(TAG, "RX write still 0 after I2S restart — stopping (seq=%lu)", (unsigned long)seq);
                 audio_playing = false;
                 has_current_sender = false;
