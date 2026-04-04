@@ -26,3 +26,9 @@ configuration:
   piper_port:
     name: Piper TTS Port
     description: Port number for Piper TTS (default 10200)
+  whisper_host:
+    name: Whisper STT Host
+    description: Hostname or IP of the Whisper speech-to-text server (default "core-whisper"). Set to a remote machine's IP for faster transcription.
+  whisper_port:
+    name: Whisper STT Port
+    description: Port number for Whisper STT (default 10300)

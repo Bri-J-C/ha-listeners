@@ -56,7 +56,7 @@ static const char *TAG = "voice_assist";
 
 // ─── Tuning constants ──────────────────────────────────────────────────────
 
-#define VA_SILENCE_TIMEOUT_MS   3000   // Stop streaming after 3s of silence
+#define VA_SILENCE_TIMEOUT_MS   1500   // Stop streaming after 1.5s of silence
 #define VA_MAX_SESSION_MS       10000  // Hard cap: 10s per session
 #define VA_SILENCE_RMS_THRESH   1500   // RMS below this = silence (high due to mic_gain=100 amplification)
 

@@ -1,6 +1,6 @@
 name: "Intercom Hub"
 description: "Multicast intercom hub for HA - enables TTS announcements to ESP32 intercoms"
-version: "2.1.0"
+version: "2.2.0"
 slug: "intercom_hub"
 url: "https://github.com/Bri-J-C/ha-intercom"
 arch:
@@ -25,6 +25,8 @@ options:
   multicast_port: 5005
   piper_host: "core-piper"
   piper_port: 10200
+  whisper_host: "core-whisper"
+  whisper_port: 10300
   log_level: "info"
   mobile_devices: []
 schema:
@@ -37,6 +39,8 @@ schema:
   multicast_port: int
   piper_host: str
   piper_port: int
+  whisper_host: str
+  whisper_port: int
   log_level: list(debug|info|warning|error)?
   mobile_devices:
     - name: str

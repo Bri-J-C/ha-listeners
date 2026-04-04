@@ -39,6 +39,10 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 SAMPLE_WIDTH = 2  # 16-bit
 
+# Hub-side silence detection (backup — firmware has its own)
+HUB_SILENCE_TIMEOUT_S = 1.5
+HUB_SILENCE_RMS_THRESH = 300
+
 
 def compute_rms(pcm_bytes: bytes) -> float:
     """Compute RMS of 16-bit signed LE PCM data."""
@@ -69,6 +73,8 @@ class VoiceSession:
         self._task: Optional[asyncio.Task] = None
         self._chunks_sent = 0
         self._initial_audio = initial_audio or []
+        self._silence_start: Optional[float] = None
+        self._got_speech = False
 
     async def start(self):
         """Start the Wyoming session."""
@@ -106,7 +112,7 @@ class VoiceSession:
             while self.active:
                 try:
                     pcm_data = await asyncio.wait_for(
-                        self.audio_queue.get(), timeout=1.0
+                        self.audio_queue.get(), timeout=0.2
                     )
                     if pcm_data is None:
                         break
@@ -121,6 +127,19 @@ class VoiceSession:
                     self._chunks_sent += 1
                     if self._chunks_sent == len(self._initial_audio) + 1:
                         log.info(f"[{self.room}] First live audio chunk sent to Wyoming ({len(pcm_data)} bytes)")
+
+                    # Hub-side silence detection
+                    rms = compute_rms(pcm_data)
+                    if rms >= HUB_SILENCE_RMS_THRESH:
+                        self._got_speech = True
+                        self._silence_start = None
+                    elif self._got_speech:
+                        now = time.time()
+                        if self._silence_start is None:
+                            self._silence_start = now
+                        elif now - self._silence_start >= HUB_SILENCE_TIMEOUT_S:
+                            log.info(f"[{self.room}] Hub-side silence cutoff after {self._chunks_sent} chunks")
+                            break
                 except asyncio.TimeoutError:
                     if not self.active:
                         break
@@ -228,7 +247,7 @@ class VoicePipelineManager:
     average RMS (closest to the speaker) wins the session.
     """
 
-    SELECTION_WINDOW_S = 0.5  # 500ms to collect candidates
+    SELECTION_WINDOW_S = 0.25  # 250ms to collect candidates
 
     def __init__(self, send_mqtt_done: Callable,
                  event_loop: asyncio.AbstractEventLoop,
@@ -243,6 +262,10 @@ class VoicePipelineManager:
         self._candidates: Dict[str, _Candidate] = {}
         self._selection_timer: Optional[asyncio.TimerHandle] = None
         self._selecting = False
+
+        # Pre-buffer for audio arriving before MQTT start
+        self._pre_buffer: Dict[str, List[bytes]] = {}
+        self._pre_buffer_max = 50  # ~1s of audio at 20ms frames
 
         # Active session lock (prevents new selections while session is running)
         self._active_session_id: Optional[str] = None
@@ -260,7 +283,17 @@ class VoicePipelineManager:
             return
 
         # Add to candidates
-        self._candidates[device_id] = _Candidate(device_id, room, source_ip)
+        candidate = _Candidate(device_id, room, source_ip)
+
+        # Feed any pre-buffered audio that arrived before MQTT start
+        if device_id in self._pre_buffer:
+            pre = self._pre_buffer.pop(device_id)
+            for chunk in pre:
+                candidate.feed(chunk)
+            if pre:
+                log.info(f"Voice candidate: {room} — fed {len(pre)} pre-buffered chunks")
+
+        self._candidates[device_id] = candidate
         log.info(f"Voice candidate: {room} ({device_id}) — {len(self._candidates)} candidate(s)")
 
         # Start selection timer on first candidate
@@ -313,6 +346,7 @@ class VoicePipelineManager:
         log.info(f"Voice session started for {winner.room} ({winner.device_id})")
 
         self._candidates.clear()
+        self._pre_buffer.clear()
 
     def _on_session_done(self, device_id: str):
         """Called when a session completes — clears active lock."""
@@ -343,11 +377,19 @@ class VoicePipelineManager:
             log.info(f"Voice candidate cancelled: {device_id}")
 
     def feed_audio(self, device_id: str, pcm_data: bytes):
-        """Feed PCM to active session or candidate buffer."""
+        """Feed PCM to active session, candidate buffer, or pre-buffer."""
         if device_id in self.sessions:
             self.sessions[device_id].feed_audio(pcm_data, self.event_loop)
         elif device_id in self._candidates:
             self._candidates[device_id].feed(pcm_data)
+        else:
+            # Pre-buffer audio arriving before MQTT start
+            if device_id not in self._pre_buffer:
+                self._pre_buffer[device_id] = []
+            buf = self._pre_buffer[device_id]
+            buf.append(pcm_data)
+            if len(buf) > self._pre_buffer_max:
+                buf.pop(0)
 
     def cleanup_stale(self, max_age_s: float = 60.0):
         """Remove sessions older than max_age_s."""

@@ -22,6 +22,18 @@ else
   export PIPER_PORT="10200"
 fi
 
+# Whisper settings with defaults
+if bashio::config.exists 'whisper_host'; then
+  export WHISPER_HOST=$(bashio::config 'whisper_host')
+else
+  export WHISPER_HOST="core-whisper"
+fi
+if bashio::config.exists 'whisper_port'; then
+  export WHISPER_PORT=$(bashio::config 'whisper_port')
+else
+  export WHISPER_PORT="10300"
+fi
+
 # Log level
 if bashio::config.exists 'log_level'; then
   export LOG_LEVEL=$(bashio::config 'log_level')

@@ -22,6 +22,8 @@ multicast_group: "224.0.0.100" # Must match ESP32 firmware
 multicast_port: 5005           # Must match ESP32 firmware
 piper_host: "core-piper"       # Piper TTS hostname
 piper_port: 10200              # Piper TTS port
+whisper_host: "core-whisper"   # Whisper STT hostname (or remote IP)
+whisper_port: 10300            # Whisper STT port
 ```
 
 ## Usage
@@ -77,6 +79,7 @@ mode: single
 - ESP32 intercoms on the same network subnet
 - Mosquitto broker (or compatible MQTT broker)
 - Piper TTS add-on (for text-to-speech)
+- Whisper STT (local add-on or remote Wyoming server for voice assistant pipeline)
 
 ## ESP32 Intercom Devices
 
