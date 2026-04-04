@@ -383,9 +383,13 @@ class IntercomPTT {
             const getStateMsg = { type: 'get_state' };
             this.websocket.send(JSON.stringify(getStateMsg));
             console.log('[WS] tx: type=%s', getStateMsg.type);
+
+            // Start keepalive ping every 30s to prevent HA ingress proxy timeout
+            this.startKeepalive();
         };
 
         this.websocket.onclose = (event) => {
+            this.stopKeepalive();
             // --- QA Logging: WebSocket disconnected ---
             console.warn('[WS] disconnected: code=%d reason=%s', event.code, event.reason || '(none)');
             this.isConnected = false;
@@ -843,6 +847,22 @@ class IntercomPTT {
         }
     }
 
+    startKeepalive() {
+        this.stopKeepalive();
+        this.keepaliveTimer = setInterval(() => {
+            if (this.websocket && this.websocket.readyState === WebSocket.OPEN) {
+                this.websocket.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 30000);  // Every 30s — HA ingress kills idle WS after ~2 min
+    }
+
+    stopKeepalive() {
+        if (this.keepaliveTimer) {
+            clearInterval(this.keepaliveTimer);
+            this.keepaliveTimer = null;
+        }
+    }
+
     suspend() {
         if (!this.isInitialized) return;
 
@@ -855,6 +875,9 @@ class IntercomPTT {
 
         // Release microphone
         this.releaseMic();
+
+        // Stop keepalive
+        this.stopKeepalive();
 
         // Cancel any pending reconnect timer
         if (this.reconnectTimer) {
