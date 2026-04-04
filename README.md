@@ -14,15 +14,15 @@ ESP32-S3-based multi-room intercom system with Home Assistant integration.
 - **Priority levels** (Normal, High, Emergency) with preemption
 - **Do Not Disturb** mode with emergency override
 - **Call notifications** with chime and LED flash
-- **Opus codec** at 32kbps VBR with PLC/FEC for packet loss recovery
+- **Raw 16-bit PCM audio** (zero-latency, no codec overhead)
+- **Voice assistant** with wake word detection, HA Assist integration, and loudness-based multi-device dedup
 - **AGC** (Automatic Gain Control) for consistent mic levels
-- **AEC** (Acoustic Echo Cancellation) via ESP-SR
 - **Configurable mic gain** (0–100 scale, persisted in NVS)
 - **AES-256-GCM encryption** for stored credentials (WiFi, MQTT, web passwords)
 - **OTA firmware updates** via web interface
 - **Reliable mDNS** with automatic re-enable on WiFi reconnect and 60-second periodic re-announcement
 - **DHCP hostname** registration so routers display the correct device name
-- **Audio reliability** improvements: decoupled RX receive/decode pipeline (15-deep queue + dedicated play task), reduced playback start latency (~40ms vs ~160ms), eliminated TX/RX buffer race conditions, silence-gated trail-out (200ms channel release vs 600ms), queue flush on PTT press to discard stale audio before transmitting, and thread-safe I2S state management via FreeRTOS mutex
+- **Audio reliability** improvements: decoupled RX receive/play pipeline (15-deep queue + dedicated play task), reduced playback start latency (~40ms vs ~160ms), eliminated TX/RX buffer race conditions, silence-gated trail-out (200ms channel release vs 600ms), queue flush on PTT press to discard stale audio before transmitting, and thread-safe I2S state management via FreeRTOS mutex
 - **Mobile device** auto-discovery and notification routing
 - **TTS announcements** via Piper text-to-speech
 - **Home Assistant integration** with MQTT auto-discovery, services, and automations
@@ -77,24 +77,23 @@ flowchart LR
         I2S_IN["I2S Bus 0"]
         CONV["32→16 bit"]
         AGC_B["AGC"]
-        AEC_B["AEC"]
-        ENC["Opus Encoder<br/>32kbps VBR<br/>(internal RAM)"]
+        PACK["Pack PCM"]
         UDP_TX["UDP TX<br/>port 5005"]
 
-        MIC --> I2S_IN --> CONV --> AGC_B --> AEC_B --> ENC --> UDP_TX
+        MIC --> I2S_IN --> CONV --> AGC_B --> PACK --> UDP_TX
     end
 
     subgraph RX["RX Path (Receive)"]
         direction LR
         UDP_RX["UDP RX<br/>port 5005"]
         QUEUE["RX Queue<br/>(15-deep)<br/>decouples tasks"]
-        DEC["Opus Decoder<br/>PLC + FEC<br/>(PSRAM)"]
+        UNPACK["Unpack PCM"]
         VOL["Volume<br/>Mute"]
         STEREO["Mono→Stereo"]
         I2S_OUT["I2S Bus 1"]
         SPK["MAX98357A<br/>Speaker"]
 
-        UDP_RX --> QUEUE --> DEC --> VOL --> STEREO --> I2S_OUT --> SPK
+        UDP_RX --> QUEUE --> UNPACK --> VOL --> STEREO --> I2S_OUT --> SPK
     end
 ```
 
@@ -105,10 +104,10 @@ packet-beta
   0-63: "device_id (8 bytes)"
   64-95: "sequence (4 bytes)"
   96-103: "priority (1 byte)"
-  104-167: "opus_frame (~40–80 bytes, variable)"
+  104-5327: "pcm_data (640 bytes, fixed)"
 ```
 
-**Header is always 13 bytes.** Priority values: `0` = Normal, `1` = High, `2` = Emergency.
+**Header is always 13 bytes; total packet is 653 bytes (13-byte header + 640 bytes PCM).** Each frame is 320 samples = 20ms at 16kHz. Priority values: `0` = Normal, `1` = High, `2` = Emergency.
 
 ## Components
 
@@ -183,12 +182,12 @@ Access the Web PTT interface through the **Intercom** panel in Home Assistant's 
 
 | Property | Value |
 |----------|-------|
-| Codec | Opus VBR, voice mode, complexity 5 |
-| Bitrate | 32 kbps |
+| Format | Raw 16-bit signed little-endian PCM |
 | Sample rate | 16000 Hz |
 | Channels | 1 (mono) |
 | Frame duration | 20 ms (320 samples) |
-| Error recovery | PLC (Packet Loss Concealment) + FEC (Forward Error Correction) |
+| Frame size | 640 bytes per frame |
+| Packet size | 653 bytes (13-byte header + 640 bytes PCM) |
 
 ### Control Plane
 
@@ -366,7 +365,7 @@ Chimes are stored persistently in `/data/chimes/` on the HA host. Bundled defaul
 GET /ws                        WebSocket endpoint for Web PTT clients
 ```
 
-Clients send JSON control messages and binary 640-byte PCM frames (320 samples × 16-bit). The hub Opus-encodes and forwards to ESP32 nodes via UDP.
+Clients send JSON control messages and binary 640-byte PCM frames (320 samples x 16-bit). The hub forwards raw PCM to ESP32 nodes via UDP.
 
 ## Firmware HTTP API
 
@@ -414,7 +413,7 @@ Content-Type: application/json
 | Action | Description | Extra fields |
 |--------|-------------|--------------|
 | `beep` | Play a short local beep | — |
-| `test_tone` | Generate a 440 Hz sine wave, Opus-encode, and transmit via UDP. For durations ≤ 3s (150 frames): synchronous response. For longer durations: returns immediately, poll `/api/status` for `sustained_tx_active=false`. | `"duration_frames"` (default 150, min 1, max 600) |
+| `test_tone` | Generate a 440 Hz sine wave and transmit via UDP as raw PCM. For durations ≤ 3s (150 frames): synchronous response. For longer durations: returns immediately, poll `/api/status` for `sustained_tx_active=false`. | `"duration_frames"` (default 150, min 1, max 600) |
 | `sustained_tx` | Transmit real microphone audio via UDP for a fixed duration. Returns immediately; poll `/api/status` for `transmitting=false`. | `"duration"` (seconds, float) |
 | `reboot` | Restart the device | — |
 

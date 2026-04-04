@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0] - 2026-04-02
+
+### Changed
+- **Opus to raw PCM**: Replaced Opus codec with raw 16-bit signed little-endian PCM at 16kHz mono. Packets are now a fixed 653 bytes (13-byte header + 640 bytes PCM). Eliminates codec overhead, PLC/FEC complexity, and frees ~183KB flash and ~25KB internal RAM on ESP32.
+- TX task stack reduced from 32KB to 8KB (no longer needs codec memory)
+- AEC (Acoustic Echo Cancellation) currently disabled due to esp-sr chunk size mismatch
+
+### Added
+- **Voice assistant pipeline**: wake word detection (WakeNet9 Alexa) -> Whisper STT -> HA conversation API -> Piper TTS -> unicast response
+- **Loudness-based multi-device wake word dedup**: 500ms selection window, highest RMS wins
+
 ## [1.3.8] - 2026-01-27
 
 ### Added
@@ -82,7 +93,7 @@
 - Initial release
 - Notify entity for Home Assistant
 - UDP multicast broadcasting to ESP32 intercoms
-- Opus audio encoding (16kHz mono, 12kbps)
+- Audio encoding (16kHz mono, originally Opus 12kbps; now raw PCM as of v3.0.0)
 - MQTT discovery for automatic entity creation
 - Volume and mute controls
 - Piper TTS integration

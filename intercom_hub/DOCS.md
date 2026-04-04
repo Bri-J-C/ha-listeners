@@ -93,5 +93,5 @@ This add-on works with ESP32-S3 based intercom satellites. Each device acts as a
 ## Technical Details
 
 - Uses UDP multicast (224.0.0.100:5005) to broadcast audio
-- Audio encoded as Opus at 16kHz mono, 12kbps (matches ESP32 firmware)
+- Audio format: raw 16-bit signed little-endian PCM at 16kHz mono (matches ESP32 firmware)
 - Host networking required for multicast to work

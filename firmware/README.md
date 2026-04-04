@@ -5,7 +5,7 @@ PlatformIO-based firmware for the intercom satellite nodes.
 ## Features
 
 - Push-to-talk via BOOT button with first-to-talk collision avoidance
-- Opus codec (32kbps VBR, complexity 5) with PLC + FEC for packet loss recovery
+- Raw 16-bit PCM audio (16kHz mono, zero-latency, no codec overhead)
 - OLED room selector with cycle button (short press = next room, long press = call)
 - OLED settings page (AGC, AEC, volume, DND, display brightness)
 - Priority levels: Normal, High, Emergency (with preemption)
@@ -19,15 +19,15 @@ PlatformIO-based firmware for the intercom satellite nodes.
 - WiFi AP fallback mode for initial setup
 - Availability tracking (online/offline per device via MQTT LWT)
 - Mobile device detection in room list
-- PSRAM support (decoder + audio buffers in PSRAM when available)
+- PSRAM support (audio buffers in PSRAM when available)
 - Lead-in/trail-out silence frames for clean audio start/stop
 - mDNS reliability fixes: initialized before WiFi connect, re-enabled on reconnect via `MDNS_EVENT_ENABLE_IP4`, disabled on disconnect, 60-second periodic re-announcement as safety net
 - DHCP hostname registration via `esp_netif_set_hostname()` so routers display the correct device name
 - Separate TX/RX PCM buffers to eliminate shared-buffer race condition between TX and RX tasks
-- RX audio queue (15-deep FreeRTOS queue) with dedicated `audio_play_task` on PSRAM stack — decouples network receive from Opus decode/I2S write
+- RX audio queue (15-deep FreeRTOS queue) with dedicated `audio_play_task` on PSRAM stack — decouples network receive from I2S write
 - Reduced DMA pre-fill on audio start: 2 descriptors (~40ms latency) instead of 8 (~160ms)
 - I2S write timeout capped at 20ms (one frame budget) to prevent RX task stalls
-- Silence gate: Opus frames smaller than 10 bytes are treated as trail-out silence and do not acquire the audio channel or trigger RECEIVING state
+- Silence gate: frames detected as silence do not acquire the audio channel or trigger RECEIVING state
 - Trail-out silence reduced from 30 frames (600ms) to 10 frames (200ms) for faster channel release after transmission ends
 - RX audio queue flushed via `xQueueReset()` on PTT press (both normal and preemption paths) to discard stale queued audio before transmitting
 - LED spinlock (`portMUX_TYPE`) in `button.c` makes `button_set_led_state()` safe to call from multiple tasks concurrently
