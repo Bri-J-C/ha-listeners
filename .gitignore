@@ -81,6 +81,7 @@ $RECYCLE.BIN/
 
 # ===== Project-specific Private Files =====
 CLAUDE.md
+docs/superpowers/
 .claude/
 automations/
 tools/
