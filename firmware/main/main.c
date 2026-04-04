@@ -67,7 +67,7 @@ static bool play_task_running = false;
 // Task stacks allocated dynamically from PSRAM heap (not EXT_RAM_BSS_ATTR).
 // EXT_RAM_BSS_ATTR uses fixed .ext_ram.bss addresses that conflict with
 // esp_partition_mmap() used by WakeNet model loading.
-#define TX_TASK_STACK_SIZE   8192
+#define TX_TASK_STACK_SIZE   8192   // Raw PCM + AGC (no AEC, no Opus encoding)
 #define PLAY_TASK_STACK_SIZE 16384
 static StackType_t *tx_task_stack = NULL;
 static StaticTask_t tx_task_tcb;
@@ -462,9 +462,11 @@ static void audio_tx_task(void *arg)
             agc_process(tx_pcm_buffer, samples);
         }
 
-        // AEC
+        // AEC disabled: esp-sr's AEC returns chunk_size=256 instead of expected
+        // 512, and crashes in dios_ssp_aec_process_api (LoadProhibited at
+        // 0x000d1000). Needs investigation — possibly esp-sr version mismatch.
         const int16_t *send_buf = tx_pcm_buffer;
-        if (aec_is_ready()) {
+        if (false /* aec_is_ready() */) {
             aec_push_mic(tx_pcm_buffer, samples);
             int got = aec_pop_cleaned(aec_cleaned + aec_cleaned_fill,
                                       FRAME_SIZE - aec_cleaned_fill);
