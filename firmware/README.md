@@ -61,7 +61,9 @@ PlatformIO-based firmware for the intercom satellite nodes.
 | SCK     | GPIO4    |
 | WS      | GPIO5    |
 | SD      | GPIO6    |
-| L/R     | GND (left channel) |
+| L/R     | **GND** (left channel select — **required**, see note) |
+
+> **L/R pin must be connected to GND.** The firmware reads the left I2S channel only. If L/R is floating or tied to VIN, the mic outputs on the right channel and the device will appear to have no microphone input — no wake word detection, no PTT audio, no sound at all.
 
 ### MAX98357A Amplifier
 | MAX98357A | ESP32-S3 |
@@ -179,7 +181,8 @@ Navigate to `http://<device-ip>/` to configure WiFi, MQTT, device name, and othe
 - Check volume setting (default 80%)
 
 ### Microphone not working
-- Verify INMP441 wiring (especially L/R to GND)
+- **INMP441 L/R pin must be wired to GND** — this is the most common issue. If L/R is floating or tied high, the mic outputs on the wrong I2S channel and the firmware gets silence. No wake word, no PTT audio.
+- Verify all INMP441 wiring (VDD, GND, SCK, WS, SD)
 - Check I2S pins match configuration
 
 ### WiFi not connecting
