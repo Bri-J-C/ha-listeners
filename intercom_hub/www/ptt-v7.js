@@ -109,7 +109,7 @@ class IntercomPTT {
         this.initButton.addEventListener('click', () => this.initialize());
         this.callButton.addEventListener('click', () => this.sendCall());
 
-        // PTT button - use pointer events for unified touch/mouse handling
+        // PTT button - use pointer events with capture for reliable touch handling
         this.pttButton.addEventListener('pointerdown', (e) => {
             e.preventDefault();
             this.pttButton.setPointerCapture(e.pointerId);
@@ -123,12 +123,8 @@ class IntercomPTT {
             e.preventDefault();
             this.stopTransmit(e);
         });
-        this.pttButton.addEventListener('pointerleave', (e) => {
-            // Only stop if we don't have capture (prevents stopping when finger moves)
-            if (!this.pttButton.hasPointerCapture(e.pointerId)) {
-                this.stopTransmit(e);
-            }
-        });
+        // Prevent context menu on long press (mobile)
+        this.pttButton.addEventListener('contextmenu', (e) => e.preventDefault());
 
         // Target selection
         this.targetSelect.addEventListener('change', () => this.sendTargetChange());
@@ -140,7 +136,7 @@ class IntercomPTT {
 
         // DND toggle
         if (this.dndToggle) {
-            this.dndToggle.addEventListener('change', () => this.onDndChange());
+            this.dndToggle.addEventListener('click', () => this.onDndChange());
         }
 
         // Chime selection
@@ -792,7 +788,8 @@ class IntercomPTT {
     }
 
     onDndChange() {
-        this.dndEnabled = this.dndToggle.checked;
+        this.dndEnabled = !this.dndEnabled;
+        this.dndToggle.classList.toggle('active', this.dndEnabled);
         console.log('DND', this.dndEnabled ? 'enabled' : 'disabled');
         // --- QA Logging: DND toggle ---
         console.log('[STATE] dnd=%s', this.dndEnabled ? 'enabled' : 'disabled');
