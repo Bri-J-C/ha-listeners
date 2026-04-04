@@ -41,13 +41,16 @@ class VoiceSession:
     """A single voice assist session for one ESP32 device."""
 
     def __init__(self, device_id: str, room: str, source_ip: str,
-                 send_mqtt_done: Callable):
+                 send_mqtt_done: Callable,
+                 process_response: Optional[Callable] = None):
         self.device_id = device_id
         self.room = room
         self.source_ip = source_ip
         self.send_mqtt_done = send_mqtt_done
+        self.process_response = process_response  # callback(transcript, source_ip, room)
         self.audio_queue: asyncio.Queue = asyncio.Queue(maxsize=200)
         self.active = True
+        self._cancelled = False
         self.created_at = time.time()
         self._task: Optional[asyncio.Task] = None
         self._chunks_sent = 0
@@ -118,16 +121,25 @@ class VoiceSession:
             writer.close()
             await writer.wait_closed()
 
-            if not self.active:
-                log.info(f"[{self.room}] Session cancelled — no TTS")
+            # Note: self.active is False here (ESP32 silence timeout already fired).
+            # That's normal — audio streaming stopped but we still process the transcript.
+            # Only skip if the session was explicitly cancelled (PTT pressed).
+            if self._cancelled:
+                log.info(f"[{self.room}] Session cancelled by user — no TTS")
+                self.send_mqtt_done(self.device_id)
                 return
 
-            if transcript_text:
+            if transcript_text and transcript_text.strip():
                 log.info(f"[{self.room}] Transcript: '{transcript_text}'")
+                # Process through HA conversation API → TTS → unicast back
+                if self.process_response:
+                    try:
+                        self.process_response(transcript_text.strip(), self.source_ip, self.room)
+                    except Exception as e:
+                        log.error(f"[{self.room}] Response processing error: {e}")
             else:
-                log.warning(f"[{self.room}] Empty transcript")
+                log.warning(f"[{self.room}] Empty transcript — no action")
 
-            # Signal ESP32 that voice assist is complete
             self.send_mqtt_done(self.device_id)
 
         except ConnectionRefusedError:
@@ -161,6 +173,7 @@ class VoiceSession:
     def cancel(self):
         """Cancel session immediately (PTT pressed)."""
         self.active = False
+        self._cancelled = True
         if self._task:
             self._task.cancel()
 
@@ -169,31 +182,60 @@ class VoicePipelineManager:
     """Manages voice assist sessions for all ESP32 devices."""
 
     def __init__(self, send_mqtt_done: Callable,
-                 event_loop: asyncio.AbstractEventLoop):
+                 event_loop: asyncio.AbstractEventLoop,
+                 process_response: Optional[Callable] = None):
         self.sessions: Dict[str, VoiceSession] = {}
         self.send_mqtt_done = send_mqtt_done
+        self.process_response = process_response
         self.event_loop = event_loop
         self.enabled = HAS_WYOMING
+        self._active_session_id: Optional[str] = None
+        self._active_session_time: float = 0
+        self._dedup_window_s: float = 10.0  # Ignore other devices for 10s
 
     def on_voice_assist_start(self, device_id: str, room: str, source_ip: str):
-        """Handle voice_assist start event from ESP32."""
+        """Handle voice_assist start event from ESP32.
+
+        Only one voice session at a time — first device wins. Other devices
+        that detect the wake word within the dedup window are ignored.
+        """
         if not self.enabled:
             log.warning("Voice pipeline not available (missing wyoming package)")
+            return
+
+        now = time.time()
+
+        # Dedup: reject if another device has an active session
+        if (self._active_session_id and
+                self._active_session_id != device_id and
+                now - self._active_session_time < self._dedup_window_s):
+            active_room = self.sessions.get(self._active_session_id)
+            active_name = active_room.room if active_room else self._active_session_id
+            log.info(f"Voice dedup: ignoring {room} — {active_name} already active")
             return
 
         # Cancel existing session for this device
         if device_id in self.sessions:
             self.sessions[device_id].cancel()
 
+        self._active_session_id = device_id
+        self._active_session_time = now
+
         session = VoiceSession(
             device_id=device_id,
             room=room,
             source_ip=source_ip,
-            send_mqtt_done=self.send_mqtt_done,
+            send_mqtt_done=self._on_session_done,
+            process_response=self.process_response,
         )
         self.sessions[device_id] = session
         asyncio.run_coroutine_threadsafe(session.start(), self.event_loop)
         log.info(f"Voice session started for {room} ({device_id})")
+
+    def _on_session_done(self, device_id: str):
+        """Called when a session completes — clears dedup lock."""
+        self._active_session_id = None
+        self.send_mqtt_done(device_id)
 
     def on_voice_assist_stop(self, device_id: str):
         """Handle voice_assist stop event (silence timeout)."""

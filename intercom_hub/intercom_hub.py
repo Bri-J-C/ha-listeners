@@ -1619,8 +1619,8 @@ def publish_chime() -> None:
         mqtt_client.publish(CHIME_STATE_TOPIC, current_chime, retain=True)
 
 
-def encode_and_broadcast(pcm_data):
-    """Broadcast raw PCM audio in 20ms frames.
+def encode_and_broadcast(pcm_data, target_ip=None):
+    """Broadcast (or unicast) raw PCM audio in 20ms frames.
 
     Uses two-phase approach for consistent timing:
     1. Pre-chunk all frames (fast — just slicing)
@@ -1646,8 +1646,9 @@ def encode_and_broadcast(pcm_data):
             current_state = "transmitting"
         publish_state(state="transmitting")
 
-        target_ip = get_target_ip()
-        target_desc = f"to {current_target}" if target_ip else "to all rooms"
+        if target_ip is None:
+            target_ip = get_target_ip()
+        target_desc = f"unicast to {target_ip}" if target_ip else "to all rooms"
 
         frame_bytes = FRAME_SIZE * 2  # 640 bytes per frame
         silence_pcm = bytes(frame_bytes)
@@ -1759,6 +1760,66 @@ def announce(message):
             encode_and_broadcast(pcm_data)
 
     thread = threading.Thread(target=_announce)
+    thread.start()
+
+
+def process_voice_response(transcript: str, source_ip: str, room: str):
+    """Process a voice assistant transcript: send to HA conversation API, TTS the response, unicast back.
+
+    Called from voice_pipeline after Whisper returns a transcript.
+    Runs in a background thread to avoid blocking the async event loop.
+    """
+    def _process():
+        import urllib.request
+        import json
+
+        supervisor_token = os.environ.get('SUPERVISOR_TOKEN')
+        if not supervisor_token:
+            log.error("No SUPERVISOR_TOKEN — cannot call HA conversation API")
+            return
+
+        # Step 1: Send transcript to HA conversation API
+        log.info(f"[{room}] Sending to HA: '{transcript}'")
+        try:
+            url = "http://supervisor/core/api/conversation/process"
+            payload = json.dumps({
+                "text": transcript,
+                "language": "en",
+            }).encode()
+            req = urllib.request.Request(url, data=payload, method='POST')
+            req.add_header("Authorization", f"Bearer {supervisor_token}")
+            req.add_header("Content-Type", "application/json")
+
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read())
+
+            # Extract response text from conversation result
+            response_text = (result.get("response", {})
+                                   .get("speech", {})
+                                   .get("plain", {})
+                                   .get("speech", ""))
+
+            if not response_text:
+                log.warning(f"[{room}] HA returned no speech response: {json.dumps(result)[:200]}")
+                return
+
+            log.info(f"[{room}] HA response: '{response_text}'")
+
+        except Exception as e:
+            log.error(f"[{room}] HA conversation API error: {e}")
+            return
+
+        # Step 2: Convert response to TTS audio
+        pcm_data = text_to_speech(response_text)
+        if not pcm_data:
+            log.warning(f"[{room}] TTS failed for response")
+            return
+
+        # Step 3: Send audio back to the requesting device via unicast
+        log.info(f"[{room}] Sending TTS response to {source_ip} ({len(pcm_data)} bytes)")
+        encode_and_broadcast(pcm_data, target_ip=source_ip)
+
+    thread = threading.Thread(target=_process, daemon=True)
     thread.start()
 
 
@@ -3268,6 +3329,7 @@ async def run_web_server():
         voice_pipeline = VoicePipelineManager(
             send_mqtt_done=publish_voice_assist_done,
             event_loop=web_event_loop,
+            process_response=process_voice_response,
         )
         log.info("Voice pipeline manager initialized")
 
